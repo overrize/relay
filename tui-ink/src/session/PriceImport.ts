@@ -3,7 +3,7 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {SessionJournal} from './Journal.js';
 import {backgroundAuditReport} from './BackgroundAudit.js';
-import {priceEndpoint,validatePrice,type PriceDefinition} from './Pricing.js';
+import {priceEndpoint,validatePrice,type PriceDefinition,type PriceRevision} from './Pricing.js';
 const sha=(v:string|Buffer)=>createHash('sha256').update(v).digest('hex');
 const fail=(reason:string):never=>{throw Error(`PRICE_IMPORT_${reason}`);};
 const keys=['source','issuer','provider','model','baseUrl','currency','unit','inputRate','outputRate','effectiveFrom','effectiveTo','document','documentSha256','usdPerUnit','fxSource','fxDate'];
@@ -68,7 +68,7 @@ export function trustPriceTable(root:string,file:string,issuer:string){
   return {digest:table.digest,issuer:table.issuer,rows:table.prices.length,trust:'local-review-not-vendor-signature'};
 }
 function conflicts(prices:PriceDefinition[]){
-  const scopes=new Map<string,PriceDefinition[]>();for(const p of prices){if(p.origin==='official')continue;const key=JSON.stringify([p.provider,p.model,p.endpoint]);const list=scopes.get(key)??[];list.push(p);scopes.set(key,list);}
+  const scopes=new Map<string,PriceDefinition[]>();for(const p of prices){if(p.origin==='official'||p.retired)continue;const key=JSON.stringify([p.provider,p.model,p.endpoint]);const list=scopes.get(key)??[];list.push(p);scopes.set(key,list);}
   for(const list of scopes.values()){
     list.sort((a,b)=>a.since-b.since);let end=-1,previous:PriceDefinition|undefined;
     for(const p of list){if(p.since<end&&(p.origin==='contract'||previous?.origin==='contract'))fail('INTERVAL_CONFLICT');if((p.expiresAt??Infinity)>end){end=p.expiresAt??Infinity;previous=p;}}
@@ -77,6 +77,7 @@ function conflicts(prices:PriceDefinition[]){
 export async function importPriceTable(root:string,file:string,options:{apply?:boolean;expect?:string}={}){
   const table=readPriceTable(file),j=new SessionJournal(root),pricingRevision=j.priceRevision(),report=await backgroundAuditReport(root,{limit:1});
   const existing=report.priceDefinitions,imported=existing.filter(p=>p.origin==='contract'&&p.version?.startsWith(`${table.digest}:`));
+  if(imported.some(p=>p.retired))fail('RETIRED_BATCH');
   if(imported.length===table.prices.length)return {state:'already-imported',digest:table.digest,rows:imported.length};
   conflicts([...existing,...table.prices]);
   const preview=sha(JSON.stringify([table.digest,pricingRevision]));
@@ -86,4 +87,41 @@ export async function importPriceTable(root:string,file:string,options:{apply?:b
   if(options.apply)j.append('pricing.imported','pm','user',0,{digest:table.digest,issuer:table.issuer,preview,prices:table.prices},guard);
   else guard({pricingRevision:j.priceRevision(),priceTrust:{[table.digest]:j.trustedPriceTable(table.digest)}});
   return {state:options.apply?'imported':'preview',digest:table.digest,preview,issuer:table.issuer,rows:table.prices.length,prices:table.prices};
+}
+
+/** Explicit batch correction; never edits request reservations or settlements. */
+export async function revisePriceTable(root:string,target:string,options:{reason:string;file?:string;apply?:boolean;expect?:string}){
+  if(!/^[a-f0-9]{64}$/.test(target))fail('TARGET_DIGEST');
+  const reason=options.reason?.trim();if(!reason||reason.length>240||/[\x00-\x1f\x7f]/.test(reason))fail('REVISION_REASON');
+  if(options.file!==undefined&&(typeof options.file!=='string'||!options.file))fail('REPLACEMENT_FILE');
+  const table=options.file!==undefined?readPriceTable(options.file):undefined,action=table?'replace':'revoke';
+  if(table?.digest===target)fail('REPLACE_SAME_BATCH');
+  const j=new SessionJournal(root),pricingRevision=j.priceRevision(),report=await backgroundAuditReport(root,{limit:1});
+  const previous=report.priceDefinitions.filter(p=>p.origin==='contract'&&p.importDigest===target);
+  if(!previous.length)fail('TARGET_NOT_FOUND');
+  const retired=previous.find(p=>p.retired)?.retired;
+  if(retired){
+    if(previous.every(p=>p.retired?.id===retired.id)&&retired.action===action&&retired.reason===reason&&retired.replacementDigest===table?.digest)return {state:action==='revoke'?'already-revoked':'already-replaced',target,revision:retired.id};
+    fail('TARGET_RETIRED');
+  }
+  if(table){
+    if(report.priceDefinitions.some(p=>p.origin==='contract'&&p.importDigest===table.digest))fail('REPLACEMENT_ALREADY_KNOWN');
+    const scope=(p:PriceDefinition)=>JSON.stringify([p.provider,p.model,p.endpoint]),scopes=(prices:PriceDefinition[])=>JSON.stringify([...new Set(prices.map(scope))].sort());
+    if(scopes(previous)!==scopes(table.prices))fail('REPLACEMENT_SCOPE');
+    if([...new Set(previous.map(p=>p.issuer))].sort().join(',')!==table.issuer)fail('ISSUER_MISMATCH');
+    conflicts([...report.priceDefinitions.filter(p=>p.importDigest!==target),...table.prices]);
+  }
+  const preview=sha(JSON.stringify([action,target,table?.digest,reason,pricingRevision]));
+  if(options.expect&&options.expect!==preview)fail('PREVIEW_STALE');
+  const guard=(state:any)=>{
+    if((state.pricingRevision??0)!==pricingRevision)fail('CONCURRENT_CHANGE_RETRY');
+    if(table&&state.priceTrust?.[table.digest]!==table.issuer)fail('SOURCE_UNTRUSTED');
+    if(!state.contractPrices?.some((p:PriceDefinition)=>p.importDigest===target&&!p.retired))fail('TARGET_RETIRED');
+  };
+  const prices=table?.prices.map(p=>({...p,replacesDigest:target}))??[];
+  const data:PriceRevision={action,target,reason,replacementDigest:table?.digest,prices,preview};
+  // Validate current trust/state again inside the same durable writer lock.
+  const event=options.apply?j.append('pricing.revised','pm','user',0,data,guard):undefined;
+  if(!options.apply){if(j.priceRevision()!==pricingRevision)fail('CONCURRENT_CHANGE_RETRY');if(table&&j.trustedPriceTable(table.digest)!==table.issuer)fail('SOURCE_UNTRUSTED');}
+  return {state:event?(action==='revoke'?'revoked':'replaced'):'preview',revision:event?.id,...data,affectedRows:previous.length,replacementRows:prices.length,before:previous,note:'Existing request snapshots and spent budget are immutable; only future quotes and separate historical supplements change.'};
 }

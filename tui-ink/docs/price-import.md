@@ -70,7 +70,7 @@ contract-2026-A,Agency,openai,exact-model-id,https://proxy.example/v1,USD,per-mi
 ## 优先级与账本
 
 - 显式配置的模型单价优先。未配置单价的新请求依次使用有效合同价、精确官方端点的自动价格。代理地址不会套用官方地址的报价。
-- 导入价与已有合同价、手工历史价在相同模型/端点上重叠时拒绝；合同价可以覆盖同一区间的自动官方报价。暂不支持撤销或替换已导入的重叠合同；修订应先准备无重叠的明确区间。
+- 导入价与已有合同价、手工历史价在相同模型/端点上重叠时拒绝；合同价可以覆盖同一区间的自动官方报价。撤销和替换通过下述修订命令完成；不会隐式覆盖其他活动批次。
 - 相同文件重复提交是无操作。整批来源、版本、文档摘要、生效时间和调用时价格快照保存在受保护历史里，随备份恢复，不依赖可丢弃的审计索引。
 - 有实测用量但缺价的历史调用，在适用区间内显示独立的后补估算。原账本费用和已消费预算不变；缺少实测用量不编造费用。
 - `PRICE_IMPORT_SOURCE_UNTRUSTED` 表示文件未审核或审核后有改动；`INTERVAL_CONFLICT` 表示时间重叠；`PREVIEW_STALE` 表示预览后价格版本改变；`CONCURRENT_CHANGE_RETRY` 表示校验期间有其他价格写入，应重新预览；`DOCUMENT_HASH` 表示来源文档变动。
@@ -86,3 +86,49 @@ node scripts/verify-round14.mjs
 ```
 
 最后一条需要现有真实 API 配置：在独立临时工作区启动真实 PM/Worker，Worker 通过本机转发代理访问原上游；导入明确标注的测试合同价格；验证持续 PM 对话、执行期间导入历史价、独立文件验收、费用快照、冲突拒绝、清理和备份恢复。测试价格不是实际厂商账单。不会更改用户模型配置，也不会探测 Claude；Copilot 仍待用户登录后验证。
+
+
+## 撤销、替换与修订追溯
+
+使用原导入结果的完整 64 位 `digest` 指定批次。`/prices history` 的 `importDigest`、`retired` 和 `revisions` 字段可追溯所有批次及修订。修订必须填写原因；默认只预览，`--apply` 才追加一个持久事件。
+
+撤销（示例中的 `<批次摘要>` 必须替换为完整摘要）：
+
+```text
+/prices revoke <批次摘要> reason="核对后发现报价错误"
+/prices revoke <批次摘要> reason="核对后发现报价错误" --apply
+```
+
+替换时先审核新文件，再预览和提交：
+
+```text
+/prices trust "E:\contracts\corrected.json" issuer=Agency
+/prices replace <旧批次摘要> "E:\contracts\corrected.json" reason="修正输入单价和生效日期"
+/prices replace <旧批次摘要> "E:\contracts\corrected.json" reason="修正输入单价和生效日期" --apply
+```
+
+两种修订均可加 `expect=预览摘要`。令牌绑定操作、目标批次、新文件摘要、原因和价格修订序号；普通 PM 对话不会使它失效。替换在同一个事件中停用旧批次并启用新批次，校验或写入前并发检查失败时两者都不改变。预览展示旧表、新表和影响行数；TUI 每表最多展示 20 行，CLI 返回完整内容。
+
+CLI 等价命令：
+
+```powershell
+node scripts/import-prices.mjs revoke <DIGEST> --reason "报价不正确" --root E:\spawn-work\tui-ink
+node scripts/import-prices.mjs revoke <DIGEST> --reason "报价不正确" --root E:\spawn-work\tui-ink --apply
+node scripts/import-prices.mjs replace <DIGEST> "E:\contracts\corrected.json" --reason "核对合同后更正" --root E:\spawn-work\tui-ink --apply
+```
+
+规则和边界：
+
+- 整批撤销/替换立即改变当前价目表选择。新文件中的合同生效区间仍按请求时间匹配；如果新表留有时间空档，该空档没有合同报价，预览时应核对。
+- 替换必须保留相同的机构集合及协议供应商/模型/端点集合，可以修正单价、汇率和时间区间，也可以将原区间拆为多个不重叠区间。不能借替换悄悄丢掉模型或改为另一家代理。
+- 新表仍必须通过文件审核、文档摘要和所有区间冲突检查。与目标批次以外的活动合同或手工历史价重叠会拒绝整批修订。
+- 每次修订记录唯一 ID、事件序号、时间、原因、旧批次及后继批次。旧价格不删除；`retired` 说明其已撤销或被替换，新版本的 `replacesDigest` 指向前驱。
+- 相同修订重复提交是无操作。已停用的文件不能通过普通 `import` 复活，也不能用旧摘要构造回滚环。确需恢复旧费率时，应准备并审核一个新的明确版本，而不是修改日志。
+- **已经预留、已经结算或结果不确定的调用，保留原价格快照和预算金额。** 即便在 HTTP 请求执行期间修订，结算仍按预留时单价。后续请求重新选价；选择与预留之间遇到修订会在发出请求前有界重试。
+- 缺价历史调用的后补估算会按当前有效的修订表重新计算，并保持“后补”标记；撤销后缺少有效报价则恢复为缺价。不会把后补差额写入原费用或已消费预算。
+- 撤销后可回落到同一精确官方端点的有效官方报价，或原有显式手工单价；代理端点不会使用其他地址的官方价格。没有有效价格且启用了 USD 预算上限时，新调用明确停止，不把未知费用当免费。
+- 目前操作粒度为完整导入批次，不支持只撤销其中一行、跨机构/端点的原子迁移或厂商数字签名认证；不会自动创建退款或账单调整记录。
+
+新增错误码：`TARGET_DIGEST`（不是完整摘要）、`TARGET_NOT_FOUND`、`TARGET_RETIRED`、`RETIRED_BATCH`、`REVISION_REASON`、`REPLACEMENT_FILE`、`REPLACE_SAME_BATCH`、`REPLACEMENT_ALREADY_KNOWN`、`REPLACEMENT_SCOPE`。既有来源、区间冲突和预览失效错误码继续适用。
+
+真实端到端验证：`npm run build` 后运行 `node scripts/verify-round15.mjs`。在独立工作区使用真实 Kimi PM 和 DeepSeek Worker；本机转发代理在第一条 Worker 请求尚未返回时等待 PM 真实进度回复并替换价格，在第二条请求进行中撤销更正表。校验两次调用分别保留原始/更正价格快照、任务通过独立验收、停用表不复活，以及清理和新进程备份恢复后的修订链与费用。测试费率明确是本地验证数据，不是厂商账单；不改动用户配置，不探测 Claude，Copilot 仍待登录验证。

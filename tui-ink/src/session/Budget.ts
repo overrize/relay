@@ -36,8 +36,15 @@ function ensure(agent: string,catalogPriced=false) {
   return { j, b, budget: j.budget()! };
 }
 export function reserveSessionRequest(agent: string, input: number, output: number, communication = false, selection: BillingSelection = {}) {
-  const mode = selection.billing?.mode ?? "api",journal=sessionJournal();
-  const quote=mode==="api"&&selection.billing?.inputUsdPerMillion===undefined&&selection.billing?.outputUsdPerMillion===undefined?priceFor({provider:selection.provider,model:selection.model,endpoint:priceEndpoint(selection.provider,selection.baseUrl),at:Date.now()} as any,journal.effectivePrices()):undefined;
+  for(let attempt=0;attempt<3;attempt++){
+    try{return reservePricedRequest(agent,input,output,communication,selection);}
+    catch(error:any){if(error.message!=="PRICE_QUOTE_CHANGED_RETRY")throw error;}
+  }
+  throw Error("SESSION_BUDGET_EXHAUSTED: prices changed repeatedly before reservation; retry after price corrections finish");
+}
+function reservePricedRequest(agent: string, input: number, output: number, communication: boolean, selection: BillingSelection) {
+  const mode = selection.billing?.mode ?? "api",journal=sessionJournal(),book=journal.priceBook();
+  const quote=mode==="api"&&selection.billing?.inputUsdPerMillion===undefined&&selection.billing?.outputUsdPerMillion===undefined?priceFor({provider:selection.provider,model:selection.model,endpoint:priceEndpoint(selection.provider,selection.baseUrl),at:Date.now()} as any,book.prices):undefined;
   const scope = ensure(agent,!!quote); if (!scope) return undefined;
   const { j, b, budget } = scope, { limits: l, used: u } = budget;
   const inputRate = mode === "subscription" ? 0 : selection.billing?.inputUsdPerMillion ?? quote?.inputRate ?? l.inputRate;
@@ -56,7 +63,11 @@ export function reserveSessionRequest(agent: string, input: number, output: numb
   if (monetaryCap && u.microUsd + microUsd > costLimit) throw new Error("SESSION_BUDGET_EXHAUSTED: configured cost estimate cap reached");
   const communicationOnly = u.requests >= l.requests - l.communicationRequests || u.tokens + input + cap > l.tokens - l.communicationTokens || !!(monetaryCap && u.microUsd + microUsd > l.microUsd - l.communicationMicroUsd);
   const id = randomUUID(), reservation = { priceQuote:quote, priceSource:selection.billing?.priceSource??quote?.source??(pricingKnown?"call-time-config":undefined),priceRecordedAt:selection.billing?.priceRecordedAt??quote?.recordedAt, endpoint:priceEndpoint(selection.provider,selection.baseUrl), agent, role: b.parent ? b.role : "PM", conversation:b.conversation, revision:b.revision, taskId:b.workId, transport:selection.transport??"http", communication:canTalk, input, output: cap, tokens: input + cap, microUsd, billingMode: mode, pricingKnown, model: selection.model?.slice(0,160), provider: selection.provider?.slice(0,80), inputRate, outputRate };
-  j.append("budget.reserved", b.conversation, agent, b.revision, { id, reservation });
+  j.append("budget.reserved", b.conversation, agent, b.revision, { id, reservation },state=>{
+    if(mode!=="api"||selection.billing?.inputUsdPerMillion!==undefined||selection.billing?.outputUsdPerMillion!==undefined)return;
+    const current=priceFor({provider:selection.provider,model:selection.model,endpoint:reservation.endpoint,at:Date.now()} as any,[...Object.values(state.officialPrices??{}),...(state.contractPrices??[])]);
+    if((state.pricingRevision??0)!==book.revision||current?.version!==quote?.version)throw Error("PRICE_QUOTE_CHANGED_RETRY");
+  });
   persistFloor();
   return { id, maxOutput: cap, maxInput: input, communicationOnly };
 }

@@ -8,7 +8,7 @@ import { cleanCompletedProcesses } from "./completedProcesses.js";
 import { createBackup, type BackupFile } from "./Backup.js";
 import { reduceTask, type WorkItem } from "./Tasks.js";
 import { reduceBudget, type SessionBudget } from "./Budget.js";
-import type {PriceDefinition} from "./Pricing.js";
+import {applyPriceRevision,type PriceDefinition} from "./Pricing.js";
 import type {PriceSyncStatus} from "./PriceSync.js";
 
 export interface Entry {
@@ -258,6 +258,7 @@ export class SessionJournal {
   priceRevision(){this.refresh();return this.state.pricingRevision??0;}
   trustedPriceTable(digest:string){this.refresh();return this.state.priceTrust?.[digest];}
   effectivePrices(){this.refresh();return structuredClone([...Object.values(this.state.officialPrices??{}),...(this.state.contractPrices??[])]);}
+  priceBook(){this.refresh();return {revision:this.state.pricingRevision??0,prices:structuredClone([...Object.values(this.state.officialPrices??{}),...(this.state.contractPrices??[])])};}
   priceStatus(){this.refresh();return structuredClone(Object.values(this.state.priceSync??{}));}
   sequence() { this.refresh(); return { seq: this.state.seq, lastHash: this.state.lastHash }; }
   /** Source metadata for validating a disposable audit checkpoint. */
@@ -563,6 +564,7 @@ function reduce(p: Projection, e: Entry) {
   reduceBudget(p, e);
   if(e.kind.startsWith("pricing."))p.pricingRevision=e.seq;
   if(e.kind==="pricing.source_trusted"){p.priceTrust??={};p.priceTrust[e.data.digest]=e.data.issuer;}
+  if(e.kind==="pricing.revised"){p.contractPrices??=[];applyPriceRevision(p.contractPrices,e.data,e);}
   if(e.kind==="pricing.imported"){p.contractPrices??=[];p.contractPrices.push(...e.data.prices);}
   if(e.kind==="pricing.defined"&&e.data.origin==="official"){
     p.officialPrices??={};p.officialPrices[JSON.stringify([e.data.provider,e.data.model,e.data.endpoint])]=e.data;

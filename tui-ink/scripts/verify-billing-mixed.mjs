@@ -12,7 +12,24 @@ if(!process.argv[2] || ['--codex','--copilot','--configured'].includes(process.a
    const http=await import('node:http'),https=await import('node:https');const upstream=new URL(worker.baseUrl??'https://api.openai.com');
    proxy=http.createServer((req,res)=>{
      const target=new URL(upstream.href);target.pathname=upstream.pathname.replace(/\/$/,'').replace(/\/v1$/,'')+req.url;
-     const request=https.request(target,{method:req.method,headers:{...req.headers,host:upstream.host}},reply=>{res.writeHead(reply.statusCode??502,reply.headers);reply.pipe(res);});
+     const request=https.request(target,{method:req.method,headers:{...req.headers,host:upstream.host}},reply=>{
+       void (async()=>{
+         if(process.env.SPAWN_VERIFICATION_PRICE_REVISIONS==='1'&&reply.statusCode===200){
+           const {SessionJournal}=await import('../dist/session/Journal.js');const {readPriceTable,trustPriceTable,revisePriceTable}=await import('../dist/session/PriceImport.js');
+           const traceFile=path.join(root,'price-revisions.json'),trace=fs.existsSync(traceFile)?JSON.parse(fs.readFileSync(traceFile,'utf8')):{count:0};trace.count++;
+           const j=new SessionJournal(root),pending=()=>Object.entries(j.budget().reservations).find(([,r])=>r.model===worker.model&&!r.settled);
+           if(trace.count===1){
+             const deadline=Date.now()+120000;while(!fs.existsSync(path.join(root,'pm-progress-marker'))){if(Date.now()>deadline)throw Error('PM progress timed out while worker was in flight');await new Promise(resolve=>setTimeout(resolve,20));}
+             const [id,reservation]=pending();trace.first={id,reservation};const data=JSON.parse(fs.readFileSync(path.join(root,'contract.json'),'utf8'));data.prices=data.prices.map(p=>({...p,inputRate:3,outputRate:6}));
+             const file=path.join(root,'corrected-contract.json');fs.writeFileSync(file,JSON.stringify(data));trustPriceTable(root,file,'LocalVerification');const result=await revisePriceTable(root,readPriceTable(path.join(root,'contract.json')).digest,{file,reason:'live-inflight-price-correction',apply:true});trace.replacement=result.revision;assert.deepEqual(j.budget().reservations[id],reservation);
+           }else if(trace.count===2){
+             const [id,reservation]=pending();trace.second={id,reservation};const result=await revisePriceTable(root,readPriceTable(path.join(root,'corrected-contract.json')).digest,{reason:'live-inflight-price-withdrawal',apply:true});trace.revocation=result.revision;assert.deepEqual(j.budget().reservations[id],reservation);
+           }
+           fs.writeFileSync(traceFile,JSON.stringify(trace,null,2));
+         }
+         res.writeHead(reply.statusCode??502,reply.headers);reply.pipe(res);
+       })().catch(error=>{console.error('Live price revision failed:',error.message);reply.destroy();if(!res.headersSent)res.writeHead(502);res.end();});
+     });
      request.on('error',()=>{if(!res.headersSent)res.writeHead(502);res.end();});res.on('close',()=>request.destroy());req.pipe(request);
    });await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));worker.baseUrl=`http://127.0.0.1:${proxy.address().port}`;
    const {trustPriceTable,importPriceTable}=await import('../dist/session/PriceImport.js');const table=path.join(root,'contract.json');
@@ -41,7 +58,7 @@ const dispatch={background:'subscription PM and API Worker acceptance test',cons
 const event={v:1,type:'spawn',agent:'pm',parent:'pm',child:'mixed-worker',role:'Worker',goal,dispatch};
 configureAgentHandlers({...r,MODEL:'fixture',DEMO:false,buildSystemPrompt:(role,id)=>`You are ${role}. Emit only newline-delimited compact JSON events with v:1,agent:${JSON.stringify(id)}. No Markdown. `+(role==='Worker'?`First emit exactly ${JSON.stringify({v:1,type:'tool.call',agent:id,id:'write',name:'Write',args:{path:'result.txt',content:'MIXED_OK'}})}. Wait for actual host tool_result then emit exactly ${JSON.stringify({v:1,type:'agent.done',agent:id,success:true,reason:'written',evidence:['result.txt']})}.`:`On initial user START emit exactly ${JSON.stringify(event)}, followed by ${JSON.stringify({v:1,type:'message',agent:id,to:'user',text:'MIXED_STARTED'})}. Never spawn on system notices. On user PROGRESS? emit exactly ${JSON.stringify({v:1,type:'message',agent:id,to:'user',text:'MIXED_PROGRESS'})}. On all other system notices reply message to=user text=MIXED_ACK. No tools. Never emit agent.done for PM; stop_conditions belongs only to the Worker.`),killAgent:id=>{r.killedAgents.add(id);r.agents.get(id)?.kill();}});
 const until=async f=>{const end=Date.now()+180000;while(!f()){if(Date.now()>end)throw Error('mixed E2E timeout '+JSON.stringify(workItems()));await new Promise(r=>setTimeout(r,20));}};
-try{ensureAgent({id:'pm',name:'PM',role:'Leader',state:'idle'});startLeaderAgent({id:'pm',firstMessage:'START',conversationMode:true,replyHook:t=>replies.push(t)});await until(()=>workItems().length===1);const auditPending=process.env.SPAWN_VERIFICATION_BACKGROUND_AUDIT==='1'?(await import('../dist/session/BackgroundAudit.js')).backgroundAuditReport(root,{rebuild:true}):Promise.resolve();r.agents.get('pm').receiveUserInput('PROGRESS?');
+try{ensureAgent({id:'pm',name:'PM',role:'Leader',state:'idle'});startLeaderAgent({id:'pm',firstMessage:'START',conversationMode:true,replyHook:t=>{replies.push(t);if(process.env.SPAWN_VERIFICATION_PRICE_REVISIONS==='1'&&t==='MIXED_PROGRESS'){assert.notEqual(workItems()[0]?.status,'accepted');fs.writeFileSync('pm-progress-marker','PM replied while Worker request was in flight');}}});await until(()=>workItems().length===1);const auditPending=process.env.SPAWN_VERIFICATION_BACKGROUND_AUDIT==='1'?(await import('../dist/session/BackgroundAudit.js')).backgroundAuditReport(root,{rebuild:true}):Promise.resolve();r.agents.get('pm').receiveUserInput('PROGRESS?');
 if(process.env.SPAWN_VERIFICATION_CONTRACT_PRICES==='1'){
  const {trustPriceTable,importPriceTable}=await import('../dist/session/PriceImport.js');const history=JSON.parse(fs.readFileSync('contract.json','utf8'));history.prices=[{...history.prices[0],model:'unused-history-verification'}];fs.writeFileSync('history-while-active.json',JSON.stringify(history));trustPriceTable(root,'history-while-active.json','LocalVerification');await importPriceTable(root,'history-while-active.json',{apply:true});
 }

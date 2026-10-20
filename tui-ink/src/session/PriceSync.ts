@@ -108,7 +108,8 @@ export function formatPriceStatus(models:PriceModel[],root=process.cwd()){
     if(m.billing?.mode==="subscription"||(m.transport&&m.transport!=="http"))return `${m.model} · 订阅，API 单价不适用`;
     const contract=priceFor({provider:m.provider,model:m.model,endpoint:priceEndpoint(m.provider,m.baseUrl),at:Date.now()} as any,prices);
     if(contract?.origin==="contract")return `${m.model} · 合同估价 $${contract.inputRate}/$${contract.outputRate} USD/M；来源 ${contract.source}；版本 ${contract.version}；生效 ${new Date(contract.since).toISOString()} 至 ${contract.expiresAt===undefined?"无固定终止":new Date(contract.expiresAt).toISOString()}；显式模型手工价仍优先`;
-    const source=priceSourceFor(m);if(!source)return `${m.model} · 未支持/代理端点，保留手工价格`;
+    const retired=prices.filter(p=>p.origin==="contract"&&p.provider===m.provider&&p.model===m.model&&p.endpoint===priceEndpoint(m.provider,m.baseUrl)&&p.retired).sort((a,b)=>b.retired!.at-a.retired!.at)[0];
+    const source=priceSourceFor(m);if(!source)return `${m.model} · ${retired?`当前无有效合同价；最近修订 ${retired.retired!.action}：${retired.retired!.reason}；批次 ${retired.importDigest}；/prices history 可追溯`:"未支持/代理端点，保留手工价格"}`;
     const status=statuses.find(s=>s.source===priceSources[source]),price=priceFor({provider:m.provider,model:m.model,endpoint:priceEndpoint(m.provider,m.baseUrl),at:Date.now()} as any,prices);
     const manual=m.billing?.inputUsdPerMillion!==undefined&&m.billing.outputUsdPerMillion!==undefined?`手工价 $${m.billing.inputUsdPerMillion}/$${m.billing.outputUsdPerMillion} 优先；官方候选：`:"";
     const state=price?`$${price.inputRate.toFixed(6)}/$${price.outputRate.toFixed(6)} 每百万输入/输出；${price.basis==="catalog-estimate"?"目录估价":"保守估算"}；到期 ${new Date(price.expiresAt!).toISOString()}`:status?.models&&!status.models.includes(m.model)?"官方目录没有可用的此精确模型单价（缺项或计费方式未支持），未猜测价格":"没有有效自动价格";

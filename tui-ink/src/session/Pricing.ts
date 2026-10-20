@@ -10,9 +10,12 @@ export function priceEndpoint(provider?:string,baseUrl?:string){
   const identity=`${url.protocol}//${url.host}${url.pathname.replace(/\/+$/,"").replace(/\/v1$/,"")}`;
   return createHash("sha256").update(identity).digest("hex");
 }
+export interface PriceRetirement {id:string;at:number;action:"revoke"|"replace";reason:string;replacementDigest?:string}
+export interface PriceRevision {target:string;action:"revoke"|"replace";reason:string;replacementDigest?:string;prices:PriceDefinition[];preview:string}
 export interface PriceDefinition{
   provider:string;model:string;endpoint:string;inputRate:number;outputRate:number;
   source:string;since:number;recordedAt:number;legacy:boolean;
+  retired?:PriceRetirement;replacesDigest?:string;
   origin?:"official"|"contract";version?:string;previousVersion?:string;expiresAt?:number;
   sourceDocumentHash?:string;parserVersion?:string;issuer?:string;importDigest?:string;
   basis?:"upper-bound"|"catalog-estimate"|"contract-estimate";currency?:"USD"|"CNY";
@@ -27,10 +30,16 @@ export function validatePrice(value:PriceDefinition){
 }
 export function recordPrice(journal:SessionJournal,model:{provider:string;model:string;baseUrl?:string},inputRate:number,outputRate:number,options:{source:string;since?:number;legacy?:boolean}){
   const price=validatePrice({provider:model.provider,model:model.model,endpoint:priceEndpoint(model.provider,model.baseUrl),inputRate,outputRate,source:options.source,since:options.since??0,recordedAt:Date.now(),legacy:options.legacy??false});
-  journal.append("pricing.defined","pm","user",0,price,state=>{if(state.contractPrices?.some(p=>p.provider===price.provider&&p.model===price.model&&p.endpoint===price.endpoint&&(p.expiresAt??Infinity)>price.since))throw Error("PRICE_IMPORT_INTERVAL_CONFLICT");});return price;
+  journal.append("pricing.defined","pm","user",0,price,state=>{if(state.contractPrices?.some(p=>!p.retired&&p.provider===price.provider&&p.model===price.model&&p.endpoint===price.endpoint&&(p.expiresAt??Infinity)>price.since))throw Error("PRICE_IMPORT_INTERVAL_CONFLICT");});return price;
 }
 type PriceBucket={manual:PriceDefinition[];contract:PriceDefinition[];official:PriceDefinition[]};
 const lookups=new WeakMap<PriceDefinition[],{length:number;scopes:Map<string,PriceBucket>}>();
+/** Retain all versions; lifecycle metadata changes only the current price book. */
+export function applyPriceRevision(prices:PriceDefinition[],data:PriceRevision,event:{id:string;ts:number}){
+  const retirement:PriceRetirement={id:event.id,at:event.ts,action:data.action,reason:data.reason,...(data.replacementDigest?{replacementDigest:data.replacementDigest}:{})};
+  for(let i=0;i<prices.length;i++){const p=prices[i]!;if(p.origin==="contract"&&p.importDigest===data.target&&!p.retired)prices[i]={...p,retired:retirement};}
+  prices.push(...structuredClone(data.prices));lookups.delete(prices);
+}
 export function priceFor(row:AuditRow,prices:PriceDefinition[]){
   let lookup=lookups.get(prices);
   if(!lookup||lookup.length!==prices.length){
@@ -43,7 +52,7 @@ export function priceFor(row:AuditRow,prices:PriceDefinition[]){
   }
   const at=row.requestedAt??row.at,bucket=lookup.scopes.get(JSON.stringify([row.provider,row.model,row.endpoint??null]));
   if(!bucket)return;
-  const choose=(list:PriceDefinition[])=>{let low=0,high=list.length;while(low<high){const middle=(low+high)>>>1;if(list[middle]!.since<=at)low=middle+1;else high=middle;}for(let i=low-1;i>=0;i--){const p=list[i]!;if(p.expiresAt===undefined||p.expiresAt>at)return p;}};
+  const choose=(list:PriceDefinition[])=>{let low=0,high=list.length;while(low<high){const middle=(low+high)>>>1;if(list[middle]!.since<=at)low=middle+1;else high=middle;}for(let i=low-1;i>=0;i--){const p=list[i]!;if(!p.retired&&(p.expiresAt===undefined||p.expiresAt>at))return p;}};
   return choose(bucket.manual)??choose(bucket.contract)??choose(bucket.official);
 }
 export function supplementPrice(row:AuditRow,prices:PriceDefinition[]){
