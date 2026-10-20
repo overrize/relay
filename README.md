@@ -1,4 +1,6 @@
-# spawn
+# Relay · 接力
+
+启动：`E:\spawn-work\relay.cmd`。旧 `spawn.cmd` 继续兼容；会话与配置仍沿用 `.spawn`，无需迁移密钥和账本。
 
 ## 运行模式与第一轮可靠性修复
 

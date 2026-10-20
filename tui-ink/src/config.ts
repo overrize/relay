@@ -307,7 +307,9 @@ export function saveAgentModel(role: AgentConfigRole, modelName: string): boolea
     if (!existing.models[modelName]) return false;
     fs.mkdirSync(configDirectory(), { recursive: true });
     existing.agents[role] = { ...existing.agents[role], model: modelName };
-    fs.writeFileSync(configPath(), JSON.stringify(existing, null, 2));
+    const profile=role==="leader"?"pm":role==="worker"?"implement":"secretary";
+    existing.routing={...existing.routing,profiles:{...existing.routing?.profiles,[profile]:[modelName]}};
+    writeSnapshot(configPath(), JSON.stringify(existing, null, 2));
     return true;
   } catch {
     return false;

@@ -1,3 +1,4 @@
+import {uiPreferences,toggleFavorite,PRODUCT_NAME} from "./tui/interaction.js";
 // V1 三栏 inbox 的 Ink 移植。
 // agents | conversation (+todo sidebar) | input + status bar
 // 配色:paper 主题用 Ink 默认终端色;状态点用文字字形。
@@ -117,7 +118,7 @@ function TitleBar({ tabs = ["[Tab]switch", "[P]ause", "[F]ork", "[C]onfig", "[q]
          justifyContent="space-between">
       <Box>
         <Text dimColor>● ● ● </Text>
-        <Text bold>multi-agent · inbox</Text>
+        <Text bold>{PRODUCT_NAME} · 接力</Text>
         <Text dimColor>  {VERSION_LABEL}</Text>
         {pending.length > 0 && (
           <Text color={p.warn} bold>
@@ -469,7 +470,7 @@ function ScrollBar({ total, visible, offset }: { total: number; visible: number;
 }
 
 // ── 中栏:conversation ──────────────────────────────────────────────────────
-export function ConvPane({ scrollOffset = 0, completionRows = 0 }: { scrollOffset?: number; completionRows?: number }) {
+export function ConvPane({ scrollOffset = 0, completionRows = 0,showTools=true,showThinking=true }: { scrollOffset?: number; completionRows?: number;showTools?:boolean;showThinking?:boolean }) {
   const p = usePalette();
   const sel = useStore((s) => s.selectedAgent);
   const a = useStore((s) => s.agents.get(s.selectedAgent));
@@ -511,7 +512,7 @@ export function ConvPane({ scrollOffset = 0, completionRows = 0 }: { scrollOffse
 
   const LEVEL_RANK: Record<string, number> = { debug: 0, info: 1, warn: 2, error: 3 };
   const filtered = messages.filter((m) =>
-    (LEVEL_RANK[m.level ?? "info"] ?? 1) >= (LEVEL_RANK[minLevel] ?? 1)
+    (showTools||m.kind!=="tool_result") && (LEVEL_RANK[m.level ?? "info"] ?? 1) >= (LEVEL_RANK[minLevel] ?? 1)
   );
 
   // Flatten all messages into individual display lines
@@ -615,7 +616,7 @@ export function ConvPane({ scrollOffset = 0, completionRows = 0 }: { scrollOffse
             <Text color={p.dim} bold>{a?.name ?? sel}</Text>
             <Text dimColor>  {isPending && !isRunning ? "waiting in queue…" : "思考中 · thinking…"} {SPINNER[spinIdx]}</Text>
           </Box>
-          {isRunning && step && (
+          {showThinking && isRunning && step && (
             <Text dimColor wrap="truncate-end">{`    ${step}`}</Text>
           )}
         </Box>
@@ -876,8 +877,8 @@ export function EffortBar({
   const [sel, setSel] = useState<number>(EFFORT_LEVELS.indexOf(current));
 
   useInput((_ch, key) => {
-    if (key.leftArrow)  { setSel((s) => Math.max(0, s - 1)); return; }
-    if (key.rightArrow) { setSel((s) => Math.min(EFFORT_LEVELS.length - 1, s + 1)); return; }
+    if (key.leftArrow||key.upArrow)  { setSel((s) => Math.max(0, s - 1)); return; }
+    if (key.rightArrow||key.downArrow) { setSel((s) => Math.min(EFFORT_LEVELS.length - 1, s + 1)); return; }
     if (key.return)     { onConfirm(EFFORT_LEVELS[sel]!); return; }
     if (key.escape)     { onCancel(); return; }
   });
@@ -888,7 +889,7 @@ export function EffortBar({
          borderLeft={false} borderRight={false} paddingX={1}>
       {/* selector row */}
       <Box>
-        <Text dimColor>effort  </Text>
+        <Text dimColor>分工策略（不是模型推理）  </Text>
         <Text dimColor>◀  </Text>
         {EFFORT_LEVELS.map((e, i) => (
           <Text key={e}
@@ -943,72 +944,26 @@ export function ModelBar({
   onConfirm: (role: AgentConfigRole, model: string) => void;
   onCancel: () => void;
 }) {
-  const p = usePalette();
-  const choices = modelChoices && modelChoices.length > 0 ? modelChoices : MODEL_CHOICES;
-  const [roleIdx, setRoleIdx] = useState<number>(Math.max(0, MODEL_ROLES.indexOf(currentRole)));
-  const role = MODEL_ROLES[roleIdx]!;
-  const currentModel = currentModelByRole[role];
-  const initialModelIdx = choices.indexOf(currentModel);
-  const [modelIdxByRole, setModelIdxByRole] = useState<Record<AgentConfigRole, number>>({
-    leader: Math.max(0, choices.indexOf(currentModelByRole.leader)),
-    worker: Math.max(0, choices.indexOf(currentModelByRole.worker)),
-    secretary: Math.max(0, choices.indexOf(currentModelByRole.secretary)),
+  const [roleIndex,setRoleIndex]=useState(Math.max(0,MODEL_ROLES.indexOf(currentRole))),[search,setSearch]=useState(""),[selected,setSelected]=useState(0),[favorites,setFavorites]=useState<string[]>(uiPreferences().favorites);
+  const role=MODEL_ROLES[roleIndex]!,choices=[...(modelChoices??MODEL_CHOICES)].filter(name=>(name+" "+(modelDescriptions?.[name]??"")).toLowerCase().includes(search.toLowerCase())),index=Math.min(selected,Math.max(0,choices.length-1)),start=Math.max(0,index-3);
+  useInput((char,key)=>{
+    if(key.escape||key.ctrl&&char==="c"){onCancel();return;}
+    if(key.tab){setRoleIndex(n=>(n+1)%MODEL_ROLES.length);setSelected(0);return;}
+    if(key.upArrow){setSelected(n=>choices.length?(n+choices.length-1)%choices.length:0);return;}
+    if(key.downArrow){setSelected(n=>choices.length?(n+1)%choices.length:0);return;}
+    if(key.ctrl&&char==="f"&&choices[index]){setFavorites(toggleFavorite(choices[index]!));return;}
+    if(key.return){if(choices[index])onConfirm(role,choices[index]!);return;}
+    if(key.backspace||key.delete){setSearch(v=>Array.from(v).slice(0,-1).join(""));setSelected(0);return;}
+    if(char&&!key.ctrl&&!key.meta&&!key.tab&&!key.upArrow&&!key.downArrow&&!key.leftArrow&&!key.rightArrow){setSearch(v=>v+char.replace(/[\x00-\x1f\x7f]/g,""));setSelected(0);}
   });
-  const modelIdx = modelIdxByRole[role] ?? Math.max(0, initialModelIdx);
-  const chosen = choices[modelIdx]!;
-
-  useInput((_ch, key) => {
-    if (key.upArrow) {
-      setRoleIdx((s) => (s <= 0 ? MODEL_ROLES.length - 1 : s - 1));
-      return;
-    }
-    if (key.downArrow) {
-      setRoleIdx((s) => (s >= MODEL_ROLES.length - 1 ? 0 : s + 1));
-      return;
-    }
-    if (key.leftArrow) {
-      setModelIdxByRole((prev) => ({
-        ...prev,
-        [role]: modelIdx <= 0 ? choices.length - 1 : modelIdx - 1,
-      }));
-      return;
-    }
-    if (key.rightArrow) {
-      setModelIdxByRole((prev) => ({
-        ...prev,
-        [role]: modelIdx >= choices.length - 1 ? 0 : modelIdx + 1,
-      }));
-      return;
-    }
-    if (key.return) { onConfirm(role, chosen); return; }
-    if (key.escape) { onCancel(); return; }
-  });
-
-  return (
-    <Box flexDirection="column" borderStyle="single" borderColor="gray"
-         borderLeft={false} borderRight={false} paddingX={1}>
-      <Box>
-        <Text dimColor>model  </Text>
-        {MODEL_ROLES.map((r, i) => (
-          <Text key={r} inverse={i === roleIdx} bold={i === roleIdx} color={i === roleIdx ? undefined : p.dim}>
-            {` ${r} `}
-          </Text>
-        ))}
-        <Text dimColor>  ↑↓ role  ←→ model  ↩ confirm  esc cancel</Text>
-      </Box>
-      <Box>
-        <Text dimColor>  </Text>
-        {choices.map((m, i) => (
-          <Text key={m} inverse={i === modelIdx} bold={i === modelIdx} color={i === modelIdx ? undefined : p.dim}>
-            {` ${m} `}
-          </Text>
-        ))}
-      </Box>
-      <Box>
-        <Text dimColor>  current: {currentModel}  →  {chosen} · {modelDescriptions?.[chosen] ?? MODEL_DESC[chosen] ?? ""}</Text>
-      </Box>
-    </Box>
-  );
+  return <Box flexDirection="column" borderStyle="single" borderColor="blue" borderLeft={false} borderRight={false} paddingX={1} paddingY={1}>
+    <Text bold color="magenta">Select model · {role=== "leader"?"PM":role}</Text>
+    <Text dimColor>仅显示已接入模型 · /login 添加供应商 · Tab 切换用途</Text>
+    <Box><Text>&gt; </Text><Text>{search||"搜索模型或供应商…"}▏</Text></Box>
+    {choices.slice(start,start+7).map((name,i)=><Text key={name} color={i+start===index?"magenta":undefined}>{i+start===index?"→ ":"  "}{favorites.includes(name)?"★ ":""}{modelDescriptions?.[name]??name}{name===currentModelByRole[role]?" · current":""}</Text>)}
+    {!choices.length?<Text dimColor>没有匹配的已接入模型；/login 添加</Text>:null}
+    <Text dimColor>({choices.length?index+1:0}/{choices.length}) ↑↓ navigate · Enter select · Ctrl+F favorite · Esc cancel</Text>
+  </Box>;
 }
 
 function fmtK(n: number): string {
@@ -1052,7 +1007,7 @@ export function StatusBar({ demo, exitConfirm, exitSecsLeft, effort }: {
         {pending > 0 && <Text color="cyan">↩ {pending} queued  </Text>}
         <Text dimColor>$ {cost.toFixed(2)}</Text>
         {tokenLabel ? <Text color={tokenColor}>  {tokenLabel}</Text> : null}
-        {effort && <Text dimColor>  effort:<Text color={p.accent}>{effort}</Text></Text>}
+        {effort && <Text dimColor>  分工策略:<Text color={p.accent}>{effort}</Text></Text>}
         {feishu.enabled && (
           <Text dimColor>
             {"  "}飞书:<Text color={feishu.connected ? p.success : p.error}>{feishu.connected ? "已连接" : "未连接"}</Text>
@@ -1067,7 +1022,7 @@ export function StatusBar({ demo, exitConfirm, exitSecsLeft, effort }: {
       </Box>
       <Box>
         {exitConfirm
-          ? <Text color="yellow" bold>再按一次 q / Ctrl+C 确认退出（{exitSecsLeft}s）</Text>
+          ? <Text color="yellow" bold>再按一次 Ctrl+C 确认退出（{exitSecsLeft}s）</Text>
           : (() => {
               // Keybind hints live in the input bar contextually (y/n approve, ESC
               // interrupt, etc.) — the status bar only keeps the log-level indicator so

@@ -10,7 +10,7 @@ export function preparedCatalog(provider:string,mode:string):ModelCatalog {
   const p=catalogSnapshot.providers,key=provider==="codex"?"openai":provider==="claude"?(mode==="subscription"?"anthropic-subscription":"anthropic"):provider==="copilot"?"github-copilot":provider==="kimi"?"moonshotai-cn":provider;
   const models=key in p?p[key as keyof typeof p]:Object.values(p).flat();return {models:choices([...models]),source:"prepared"};
 }
-async function jsonBounded(response:Response){
+export async function jsonBounded(response:Response){
   if(!response.body)throw new Error("invalid-model-response");const reader=response.body.getReader(),chunks:Uint8Array[]=[];let length=0;
   try{while(true){const item=await reader.read();if(item.done)break;length+=item.value.length;if(length>2*1024*1024)throw new Error("oversized-model-response");chunks.push(item.value);}return JSON.parse(Buffer.concat(chunks).toString());}finally{await reader.cancel().catch(()=>{});}
 }

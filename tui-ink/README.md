@@ -1,6 +1,8 @@
-# tui-ink — 开发者文档
+# Relay — 开发者文档
 
 多 agent TUI 的实现包。项目介绍和快速上手见 [../README.md](../README.md)。
+
+主交互与 OmO 对照见 [交互对照](docs/relay-interaction.md)。
 
 合同价与历史价目表导入见 [价格导入说明](docs/price-import.md)。
 

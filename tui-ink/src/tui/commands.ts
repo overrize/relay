@@ -74,6 +74,8 @@ export interface CommandCtx {
   switchWebProviderCommand: (name: string | undefined) => void;
   emitCommandMessage: (text: string) => void;
   startLogin?: () => void;
+  setViewMode?:(mode:"agents"|"chat"|"logs")=>void;
+  togglePlan?:()=>void;
 }
 
 function parseScheduleDelay(raw: string, now = Date.now()): number | null {
@@ -106,9 +108,14 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
   const feishuSessions = { size: feishuSessionCount() };
   const __dirname = path.dirname(new URL(import.meta.url).pathname);
   const COMMANDS: CmdDef[] = [
+    {name:"agents",desc:"/agents — Agent 列表（Ctrl+G）",handler:()=>ctx.setViewMode?.("agents")},
+    {name:"chat",desc:"/chat — 返回会话",handler:()=>ctx.setViewMode?.("chat")},
+    {name:"logs",desc:"/logs — 调试日志",handler:()=>ctx.setViewMode?.("logs")},
+    {name:"plan",desc:"/plan — 展开或收起计划",handler:()=>ctx.togglePlan?.()},
+    {name:"strategy",desc:"/strategy — 分工策略，独立于模型推理强度",handler:()=>setEffortSelecting(true)},
     {name:"login",desc:"/login — 选择供应商、订阅或 API Key，再配置模型和用途",handler:(args)=>{if(args.length){emitCommandMessage("请使用 /login 打开安全接入向导；不要把 API Key 写入命令参数。");return;}ctx.startLogin?.();}},
     { name: "pause",   desc: "kill the selected agent",     handler: () => { const sel = getState().selectedAgent; agents.get(sel)?.kill(); if (sessionJournal().binding(sel)?.parent) { killedAgents.add(sel); recordTaskCancellation(sel, "TUI pause"); } } },
-    { name: "effort",  desc: "/effort [min|mid|high|max] — set or open effort selector", handler: (args) => {
+    { name: "effort",  desc: "/effort [min|mid|high|max] — 旧分工策略命令；请使用 /strategy", handler: (args) => {
       const lvl = args[0] as Effort | undefined;
       if (lvl && (EFFORT_LEVELS as readonly string[]).includes(lvl)) {
         confirmEffort(lvl);

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {configuredModels,cycleModel,uiPreferences,nextReasoning} from "../tui/interaction.js";
 import {splitCommand} from "../tui/splitCommand.js";
 import {syncModelPrices} from "../session/PriceSync.js";
 import { sessionJournal } from "../session/Journal.js";
@@ -314,19 +315,21 @@ function App() {
   const completeTick    = useRef(0);
   const [slashSelectedIdx, setSlashSelectedIdx] = useState(-1);
   // M3-7c interaction: view mode (Agents tree ↔ chat) + Plan drawer toggle.
-  const [viewMode, setViewMode] = useState<"agents" | "chat" | "logs">("agents");
+  const [viewMode, setViewMode] = useState<"agents" | "chat" | "logs">("chat");
   const [planOpen, setPlanOpen] = useState(false);
+  const [showTools,setShowTools]=useState(false),[showThinking,setShowThinking]=useState(true),[reasoningLabel,setReasoningLabel]=useState("default");
+  const reasoningPending=useRef(false);
   // Ctrl+T / Ctrl+L are intercepted at the stdin layer (so the input field
   // never sees the char); register the React state toggles here.
   useEffect(() => {
-    cancelLoginFromSignal=loginSelecting?()=>setLoginSelecting(false):null;
+    cancelLoginFromSignal=loginSelecting?()=>setLoginSelecting(false):modelSelecting?()=>setModelSelecting(false):effortSelecting?()=>setEffortSelecting(false):null;
     return()=>{cancelLoginFromSignal=null;};
-  },[loginSelecting]);
+  },[loginSelecting,modelSelecting,effortSelecting]);
   useEffect(() => {
-    ctrlTHandler = () => setPlanOpen((v) => !v);
-    ctrlLHandler = () => setViewMode((m) => (m === "logs" ? "chat" : "logs"));
+    ctrlTHandler = () => {if(!loginSelecting&&!modelSelecting&&!effortSelecting)setShowThinking(v=>!v);};
+    ctrlLHandler = () => {if(!loginSelecting){setEffortSelecting(false);setModelSelecting(true);}};
     return () => { ctrlTHandler = null; ctrlLHandler = null; };
-  }, []);
+  }, [loginSelecting,modelSelecting,effortSelecting]);
 
   // ── 消息队列 (agent busy 时暂存输入) ─────────────────────────────────────
   const msgQueue = useRef(new Map<string, string[]>());
@@ -426,7 +429,7 @@ function App() {
     }
     if (role === "leader") refreshModelLabels();
     setModelSelecting(false);
-    emitCommandMessage(`${role} 模型已切换: ${model} -> ${modelCfg.model} ✓`);
+    emitCommandMessage(`${role} 默认用途 → ${modelCfg.model}；新启动/恢复生效，进行中任务保持原模型。`);
   };
 
   const showWebConfig = () => {
@@ -488,6 +491,7 @@ function App() {
     showModelConfig, switchModelCommand, registerModelCommand,
     showWebConfig, connectWebProviderCommand, switchWebProviderCommand,
     emitCommandMessage,
+    setViewMode,togglePlan:()=>setPlanOpen(v=>!v),
     startLogin:()=>{setModelSelecting(false);setEffortSelecting(false);setLoginSelecting(true);},
   });
 
@@ -808,11 +812,11 @@ function App() {
     }
   };
 
-  const requestExit = () => {
+  const requestExit = (immediate=false) => {
     const now = Date.now();
     if (now - lastExitRequestAt.current < 120) return;
     lastExitRequestAt.current = now;
-    if (exitConfirm) {
+    if (exitConfirm||immediate) {
       if (exitConfirmTimer.current) clearInterval(exitConfirmTimer.current);
       void shutdownRuntime().finally(() => {
         exit();
@@ -835,10 +839,9 @@ function App() {
   };
 
   useEffect(() => {
-    requestExitFromSignal = requestExit;
-    return () => {
-      if (requestExitFromSignal === requestExit) requestExitFromSignal = null;
-    };
+    const clearOrExit=()=>{if(input)setInput("");else requestExit();};
+    requestExitFromSignal = clearOrExit;
+    return () => {if(requestExitFromSignal===clearOrExit)requestExitFromSignal=null;};
   });
 
   useEffect(() => {
@@ -859,10 +862,40 @@ function App() {
   }, [sel, input.length, selectedPending.length, pending.length, modelSelecting, effortSelecting]);
 
   // 全局快捷键
+  useEffect(()=>{
+    controlKeyHandler=code=>{
+      if(loginSelecting||modelSelecting||effortSelecting||selectedPending.length)return;
+      if(code===0x04){if(!input)requestExit(true);return;}
+      if(code===0x07){setViewMode(v=>v==="agents"?"chat":"agents");return;}
+      if(code===0x0f){setShowTools(v=>!v);return;}
+      if(code===0x10){const cfg=loadConfig(),role=selectedConfigRole(),chosen=cycleModel(cfg.models,cfg.agents[role].model,1,uiPreferences().favorites);if(chosen)confirmModelChoice(role,chosen);else emitCommandMessage("暂无已接入模型，请 /login。");}
+    };
+    return()=>{controlKeyHandler=null;};
+  });
+
   useInput((char, key) => {
-    if(loginSelecting)return; // The credential widget owns its input, including q/Tab/Esc.
+    if(loginSelecting||modelSelecting||effortSelecting)return; // The active selector exclusively owns text, Tab and Esc.
     if (key.ctrl && char === "c") { requestExit(); return; }
-    if (char === "q" && !input) { requestExit(); return; }
+    if(key.ctrl&&char==="d"&&!input){requestExit(true);return;}
+    if(!modelSelecting&&!effortSelecting&&selectedPending.length===0){
+      if(key.ctrl&&char==="g"){setViewMode(v=>v==="agents"?"chat":"agents");return;}
+      if(key.ctrl&&char==="o"){setShowTools(v=>!v);return;}
+      if(key.ctrl&&char==="p"||key.meta&&char==="p"){
+        const cfg=loadConfig(),role=selectedConfigRole(),chosen=cycleModel(cfg.models,cfg.agents[role].model,key.meta?-1:1,uiPreferences().favorites);if(chosen)confirmModelChoice(role,chosen);else emitCommandMessage("暂无已接入模型，请 /login。");return;
+      }
+      if(key.tab&&key.shift){
+        if(reasoningPending.current)return;reasoningPending.current=true;
+        const cfg=loadConfig(),role=selectedConfigRole(),name=cfg.agents[role].model,model=cfg.models[name]!;
+        emitCommandMessage("正在读取当前模型的推理能力；PM 沟通继续。");
+        void nextReasoning(model).then(level=>{
+          if(!level){emitCommandMessage("此接入尚未声明可调推理级别；保持模型默认设置。分工策略使用 /strategy。");return;}
+          if(loadConfig().agents[role].model!==name){emitCommandMessage("模型已切换，未应用过期推理设置。");return;}
+          saveModelConfig(name,{...model,reasoningEffort:level});const active=agents.get(getState().selectedAgent),pc=active?.cfg.providerCfg;
+          if(pc&&pc.provider===model.provider&&pc.model===model.model&&pc.baseUrl===model.baseUrl&&pc.apiKey===model.apiKey)active!.cfg.providerCfg={...pc,reasoningEffort:level};
+          setReasoningLabel(level);emitCommandMessage(`推理强度 → ${level}；后续请求生效，进行中的调用不变。`);
+        }).catch(()=>emitCommandMessage("推理能力查询未完成，保持原设置；没有猜测或发送新推理参数。")).finally(()=>{reasoningPending.current=false;});return;
+      }
+    }
     // ── M3-7c view-mode keys (only when composing nothing) ──────────────────
     // Ctrl+T / Ctrl+L handled at the stdin layer (see filteredStdin) so the
     // input field doesn't receive the literal char.
@@ -880,12 +913,8 @@ function App() {
         navAgent(key.upArrow ? -1 : 1); return;
       }
       if (viewMode === "agents" && key.return) { setViewMode("chat"); return; }
-      // Shift+Tab: back to agents view — does NOT interrupt the agent and clears any
-      // stale input so Enter won't re-send the previous message. (ESC stays interrupt-only.)
-      if ((viewMode === "chat" || viewMode === "logs") && key.tab && key.shift) {
-        setViewMode("agents"); setInput(""); return;
-      }
     }
+
     if (key.tab && !input) {
       if (modelSelecting) setModelSelecting(false);
       if (effortSelecting) setEffortSelecting(false);
@@ -938,7 +967,7 @@ function App() {
     }
 
     // P/F/C/E/M shortcuts — only when not typing and no pending approvals
-    if (!input && selectedPending.length === 0) {
+    if (viewMode==="agents" && !input && selectedPending.length === 0) {
       // E — open effort selector (ESC/Enter handled inside EffortBar's own useInput)
       if (char === "E" && !effortSelecting) { setEffortSelecting(true); return; }
       if (key.escape && effortSelecting)    { setEffortSelecting(false); return; }
@@ -1055,20 +1084,20 @@ function App() {
               {/* Home banner: stable in the Agents view (not tied to the selected
                   agent's messages). It's gone once you Enter into a chat. */}
               <SpawnHeader model={displayedPmModel(loadConfig(),agents.get("pm")?.cfg.providerCfg)} />
-              <Box paddingLeft={1}><Text dimColor>↑/↓ select · Enter open · Tab switch · Ctrl+T plan · Ctrl+L logs</Text></Box>
+              <Box paddingLeft={1}><Text dimColor>↑/↓ select · Enter open · Ctrl+G chat · Ctrl+L models</Text></Box>
               <AgentsPane width={process.stdout.columns ?? 80} scroll={agentPaneScroll} />
             </>
           ) : viewMode === "logs" ? (
             <Box flexDirection="column" flexGrow={1} paddingX={1}>
-              <Text dimColor>logs · {getState().selectedAgent} · Shift+Tab back · Ctrl+L chat · Esc interrupt</Text>
+              <Text dimColor>logs · {getState().selectedAgent} · Ctrl+G agents · /chat · Esc interrupt</Text>
               {(getState().messagesByAgent.get(getState().selectedAgent) ?? []).slice(-60).map((m) => (
                 <Text key={m.id} dimColor wrap="truncate-end">[{m.kind}] {(m.text ?? "").split("\n")[0]}</Text>
               ))}
             </Box>
           ) : (
             <>
-              <Box paddingLeft={1}><Text dimColor>{getState().selectedAgent} · Shift+Tab back · [ ] scroll · Ctrl+T plan · Esc interrupt</Text></Box>
-              <ConvPane scrollOffset={scrollOffset} completionRows={slashPaneRows} />
+              <Box paddingLeft={1}><Text dimColor>{getState().selectedAgent} · Ctrl+G agents · Ctrl+L model · Shift+Tab reasoning · Esc interrupt</Text></Box>
+              <ConvPane scrollOffset={scrollOffset} completionRows={slashPaneRows} showTools={showTools} showThinking={showThinking} />
             </>
           )}
         </Box>
@@ -1078,7 +1107,7 @@ function App() {
           return (
             <Box flexDirection="column" flexShrink={0}>
               <Text dimColor>{rule}</Text>
-              <Box paddingX={1}><Text bold>Plan</Text><Text dimColor>  ({getState().selectedAgent})  Ctrl+T close</Text></Box>
+              <Box paddingX={1}><Text bold>Plan</Text><Text dimColor>  ({getState().selectedAgent})  /plan close</Text></Box>
               {todos.length === 0
                 ? <Box paddingX={1}><Text dimColor italic>no plan yet</Text></Box>
                 : todos.map((t, i) => (
@@ -1097,11 +1126,11 @@ function App() {
           : modelSelecting
           ? (() => {
               const cfg = loadConfig();
-              const modelChoices = Object.keys(cfg.models);
+              const modelChoices = configuredModels(cfg.models);
               const modelDescriptions = Object.fromEntries(
                 Object.entries(cfg.models).map(([name, modelCfg]) => [
                   name,
-                  `${modelCfg.provider} / ${modelCfg.model}${modelCfg.baseUrl ? ` ${modelCfg.baseUrl}` : ""}`,
+                  `${modelCfg.model} · ${modelCfg.provider} · ${modelCfg.billing?.mode??"api"} · ${name}`,
                 ]),
               );
               return <ModelBar
@@ -1191,6 +1220,7 @@ function App() {
               />
             </>
         }
+        {(()=>{const cols=Math.max(20,(process.stdout.columns??80)-2),cfg=loadConfig(),pc=agents.get(getState().selectedAgent)?.cfg.providerCfg??cfg.models[cfg.agents[selectedConfigRole()].model]!,right=`${pc.model} · ${pc.reasoningEffort??"default"}`,rightWidth=Math.min(Math.floor(cols*0.65),right.length),leftWidth=Math.max(3,cols-rightWidth-2);return <Box paddingX={1} justifyContent="space-between"><Text dimColor>{`Relay ${process.cwd().slice(-Math.max(1,leftWidth-6))}`}</Text><Text color="magenta">{right.slice(0,rightWidth)}</Text></Box>;})()}
         <StatusBar demo={DEMO} exitConfirm={exitConfirm} exitSecsLeft={exitSecsLeft} effort={effort} />
       </Box>
     </PaletteContext.Provider>
@@ -1243,7 +1273,7 @@ const banner = DEMO
   ? "running in --demo mode (no real claude subprocess; fake events on first message)"
   : `live mode — model=${getAgentProviderConfig(loadConfig(), "leader").model}, orchestration=${pm.getMode()}`;
 
-console.log(`\nmulti-agent TUI · ${banner}\n`);
+console.log(`\nRelay · 接力 · ${banner}\n`);
 
 // ── rg (ripgrep) probe — Grep/Glob tools require it ─────────────────────────
 // spawnSync accepts shell: boolean; execSync only accepts shell: string.
@@ -1271,7 +1301,8 @@ const filteredStdin = new Transform({
     if (buf.includes(0x03)) { if(cancelLoginFromSignal)cancelLoginFromSignal();else {const r = requestExitFromSignal; if (r) r(); else process.exit(130);} }
     if (buf.includes(0x14)) ctrlTHandler?.();
     if (buf.includes(0x0c)) ctrlLHandler?.();
-    const cleaned = Buffer.from(buf.filter((b) => b !== 0x03 && b !== 0x14 && b !== 0x0c));
+    for(const code of [0x04,0x07,0x0f,0x10])if(buf.includes(code))controlKeyHandler?.(code);
+    const cleaned = Buffer.from(buf.filter((b) => ![0x03,0x14,0x0c,0x04,0x07,0x0f,0x10].includes(b)));
     if (cleaned.length > 0) this.push(cleaned);
     callback();
   },
@@ -1298,6 +1329,7 @@ let requestExitFromSignal: (() => void) | null = null;
 let cancelLoginFromSignal:(()=>void)|null=null;
 // Control-shortcut handlers, registered by App; fired from filteredStdin so the
 // input field never receives the char (fixes Ctrl+T typing a literal 't').
+let controlKeyHandler:((code:number)=>void)|null=null;
 let ctrlTHandler: (() => void) | null = null;
 let ctrlLHandler: (() => void) | null = null;
 process.on("SIGINT", () => {

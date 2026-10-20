@@ -40,10 +40,10 @@ export function SpawnHeader({ model }: { model: string }): React.ReactElement {
       <Box paddingX={1}>
         <Mascot color={p.accent} />
         <Box flexDirection="column">
-          <Text><Text color={p.accent} bold>◆ spawn</Text><Text dimColor>  multi-agent · full-duplex</Text></Text>
+          <Text><Text color={p.accent} bold>◆ Relay · 接力</Text><Text dimColor>  multi-agent · full-duplex</Text></Text>
           <Text dimColor>model:     <Text color={p.text}>{model}</Text>   <Text color={p.accent}>/model</Text> to change</Text>
           <Text dimColor>directory: {cwd}</Text>
-          <Text dimColor>commands:  <Text color={p.accent}>Enter</Text> open · <Text color={p.accent}>Shift+Tab</Text> back · <Text color={p.accent}>/command</Text> · <Text color={p.accent}>Ctrl+T</Text> plan · <Text color={p.accent}>Ctrl+L</Text> logs</Text>
+          <Text dimColor>commands:  <Text color={p.accent}>Enter</Text> open · <Text color={p.accent}>Ctrl+G</Text> agents · <Text color={p.accent}>/command</Text> · <Text color={p.accent}>Shift+Tab</Text> thinking · <Text color={p.accent}>Ctrl+L</Text> models</Text>
         </Box>
       </Box>
       <Text dimColor>{rule}</Text>
