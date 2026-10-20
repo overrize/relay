@@ -1,3 +1,6 @@
+import { assertCodexBudgetCapability, codexInputBound } from "./codexBudget.js";
+import { callCopilotSubscription } from "./copilotSubscription.js";
+import { cachedUsage, usageExhausted, type UsageProvider } from "../subscriptions/usage.js";
 import { callCodexSubscription } from "./codexSubscription.js";
 import { routeCanFallback, type ModelCandidate } from "../models/routing.js";
 import { callClaudeSubscription } from "./claudeSubscription.js";
@@ -90,7 +93,9 @@ export class HttpConvAgent extends EventEmitter {
   private _activeInputId?: string;
   private _sessionOutput?: number;
   private _communicationOnly = false;
+  private _subscriptionBudgetStopped = false;
   private _compiled?: ReturnType<typeof compileSessionContext>;
+  private readonly _workspaceRoot = process.cwd();
   private _routeIndex = 0;
   private _loopIdx = 0;                               // 单调递增循环计数
 
@@ -109,6 +114,7 @@ export class HttpConvAgent extends EventEmitter {
     initialMessages?: Array<{ role: "user" | "assistant"; content: string }>;
   }) {
     super();
+    this._subscriptionBudgetStopped = !!(cfg.sessionManaged && sessionJournal().binding(cfg.id)?.lastError?.includes("SUBSCRIPTION_BUDGET"));
     // 如果 dispatch 携带 cachePrefix，初始化 _cachePrefix
     if (cfg.dispatch?.cachePrefix) {
       this._cachePrefix = cfg.dispatch.cachePrefix;
@@ -160,6 +166,7 @@ export class HttpConvAgent extends EventEmitter {
 
   /** Forward every "event" emission to the global bus (additive — existing listeners unaffected). */
   override emit(event: string, ...args: unknown[]): boolean {
+    if(this.cfg?.sessionManaged && process.cwd()!==this._workspaceRoot)return false;
     if (event === "event" && args.length === 1) {
       const type = (args[0] as TuiEvent).type;
       if (this._communicationOnly && !["message", "agent.state", "token.usage", "agent.error"].includes(type)) {
@@ -332,6 +339,7 @@ export class HttpConvAgent extends EventEmitter {
   }
 
   async send(text: string, inputId?: string, revision?: number): Promise<void> {
+    if(this.cfg.sessionManaged && process.cwd()!==this._workspaceRoot)return;
     // Bug B fix: busy → enqueue, never silently drop.
     if (this._busy) { this._queue.push({ text, inputId, revision }); return; }
     if (this.cfg.sessionManaged) {
@@ -412,6 +420,7 @@ export class HttpConvAgent extends EventEmitter {
     // bypassing the outer finally and leaving _busy=true forever.
     // Solution: break out of the loop and let the outer try/finally handle cleanup.
     let abortedDuringRetry = false;
+    let protocolRetried = false;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (this._abort?.signal.aborted || (this.cfg.sessionManaged && !sessionJournal().isCurrent(this.cfg.id, this._activeRevision))) { abortedDuringRetry = true; break; }
@@ -432,28 +441,36 @@ export class HttpConvAgent extends EventEmitter {
       let permit: ReturnType<typeof reserveSessionRequest>;
       try {
         validateBillingConfig(this.cfg.providerCfg);
+        if(this.cfg.providerCfg.transport==="codex-cli")assertCodexBudgetCapability();
+        const quotaProvider:UsageProvider|undefined=this.cfg.providerCfg.transport==="codex-cli"?"codex":this.cfg.providerCfg.transport==="claude-cli"?"claude":this.cfg.providerCfg.transport==="copilot-sdk"?"copilot":undefined;
+        if(quotaProvider&&usageExhausted(cachedUsage(quotaProvider),Date.now(),this.cfg.providerCfg.model))throw new Error("SUBSCRIPTION_QUOTA: fresh vendor quota is exhausted; waiting for reset");
         if (this.cfg.sessionManaged) {
           const j = sessionJournal(), b = j.binding(this.cfg.id)!;
           const input = inputId && j.current(b.conversation)?.inputs.find((i) => i.id === inputId);
-          let bound = Buffer.byteLength(JSON.stringify({ system: this._compiled?.system ?? this.cfg.systemPrompt, messages: this._trimmedHistory() }), "utf8") + (this.cfg.providerCfg.transport === "codex-cli" ? 16384 : 2048);
+          if(this._subscriptionBudgetStopped && !b.parent && input && ["continue","change"].includes(input.kind??"")) { this._subscriptionBudgetStopped=false;j.append("model.budget_resumed",b.conversation,this.cfg.id,b.revision,{reason:"explicit-user-input"}); }
+          if(this._subscriptionBudgetStopped && (!input||input.kind!=="query"))throw new Error("SUBSCRIPTION_BUDGET: execution remains paused until explicit user continuation");
+          let bound = this.cfg.providerCfg.transport === "codex-cli" ? codexInputBound(this._compiled?.system ?? this.cfg.systemPrompt ?? "",this._trimmedHistory()) : Buffer.byteLength(JSON.stringify({ system: this._compiled?.system ?? this.cfg.systemPrompt, messages: this._trimmedHistory() }), "utf8") + 2048;
           const budget = j.budget();
-          const compact = !!input && input.kind === "query" && !!budget && (budget.used.requests >= budget.limits.requests - budget.limits.communicationRequests || budget.used.tokens + bound + 4096 > budget.limits.tokens - budget.limits.communicationTokens);
+          const compact = !!input && input.kind === "query" && (this._subscriptionBudgetStopped || (!!budget && (budget.used.requests >= budget.limits.requests - budget.limits.communicationRequests || budget.used.tokens + bound + 4096 > budget.limits.tokens - budget.limits.communicationTokens)));
           if (compact) {
             this._compiled = { system: `You are the continuing PM. Execution budget is exhausted; answer status only using this state. Emit JSON Lines message(to=user), no tools/spawn. Budget: ${JSON.stringify(budgetReport())}. Current goal: ${j.current(b.conversation)?.goal.slice(0, 1000)}. Tasks: ${JSON.stringify(j.tasks(b.conversation).slice(-8).map((t) => ({ id: t.id, status: t.status, outcome: t.outcome?.reason })))}`, messages: [{ role: "user", content: text.slice(0, 4000) }], tokens: 0 };
-            bound = Buffer.byteLength(JSON.stringify(this._compiled), "utf8") + (this.cfg.providerCfg.transport === "codex-cli" ? 16384 : 2048);
+            bound = this.cfg.providerCfg.transport === "codex-cli" ? codexInputBound(this._compiled.system ?? "",this._trimmedHistory()) : Buffer.byteLength(JSON.stringify(this._compiled), "utf8") + 2048;
           }
           permit = reserveSessionRequest(this.cfg.id, bound, this.cfg.providerCfg.maxTokens ?? resolveMaxTokens(this.cfg.role, this.cfg.depth), !!input && input.kind === "query", this.cfg.providerCfg);
           this._sessionOutput = permit?.maxOutput; this._communicationOnly = compact || (permit?.communicationOnly ?? false);
         }
         const pc = this.cfg.providerCfg;
         if (this.cfg.sessionManaged) { const j = sessionJournal(), b = j.binding(this.cfg.id)!; j.append("model.selected",b.conversation,this.cfg.id,b.revision,{event:"model.selected",profile:this.cfg.routingProfile,model:pc.model,provider:pc.provider,transport:pc.transport??"http",billing:pc.billing?.mode??"api",candidate:this.cfg.modelCandidates?.[this._routeIndex]?.name}); }
-        const result = pc.transport === "codex-cli"
-          ? await callCodexSubscription(pc, this._compiled?.system ?? this.cfg.systemPrompt ?? "", this._trimmedHistory(), {agent:this.cfg.id,signal:this._abort?.signal})
+        const result = pc.transport === "copilot-sdk"
+          ? await callCopilotSubscription(pc,this._compiled?.system ?? this.cfg.systemPrompt ?? "",this._trimmedHistory(),{agent:this.cfg.id,maxOutput:this._sessionOutput??pc.maxTokens??resolveMaxTokens(this.cfg.role,this.cfg.depth),signal:this._abort?.signal})
+          : pc.transport === "codex-cli"
+          ? await callCodexSubscription(pc, this._compiled?.system ?? this.cfg.systemPrompt ?? "", this._trimmedHistory(), {agent:this.cfg.id,signal:this._abort?.signal,maxOutput:this._sessionOutput??pc.maxTokens??resolveMaxTokens(this.cfg.role,this.cfg.depth),maxInput:permit?.maxInput,hostProtocol:true})
           : pc.transport === "claude-cli"
           ? await callClaudeSubscription(pc, this._compiled?.system ?? this.cfg.systemPrompt ?? "", this._trimmedHistory(), { agent: this.cfg.id, maxOutput: this._sessionOutput ?? pc.maxTokens ?? resolveMaxTokens(this.cfg.role, this.cfg.depth), signal: this._abort?.signal })
           : pc.provider === "anthropic"
           ? await this._callAnthropic()
           : await this._callOpenAI();
+        if(this.cfg.sessionManaged && (process.cwd()!==this._workspaceRoot || !sessionJournal().binding(this.cfg.id))) { abortedDuringRetry=true; break; }
         fullText = result.text;
         promptTokens = result.promptTokens ?? 0;
         completionTokens = result.completionTokens ?? 0;
@@ -463,24 +480,29 @@ export class HttpConvAgent extends EventEmitter {
         lastErr = null;
         break; // success
       } catch (err: any) {
-        if (permit) settleSessionRequest(this.cfg.id, permit.id);
+        if(this.cfg.sessionManaged && (process.cwd()!==this._workspaceRoot || !sessionJournal().binding(this.cfg.id))) { abortedDuringRetry=true; break; }
+        if (permit) settleSessionRequest(this.cfg.id, permit.id,err.usage?.inputTokens,err.usage?.outputTokens);
         if (err.name === "AbortError") {
           abortedDuringRetry = true;
           break; // exit loop → outer finally clears _busy and drains queue
         }
         lastErr = err;
+        if(String(err.message).startsWith("SUBSCRIPTION_PROTOCOL") && !protocolRetried && attempt<MAX_RETRIES) {
+          protocolRetried=true;const correction={role:"user" as const,content:"[Host rejected protocol] No events or tools were executed from that response. Return strictly valid compact JSON Lines in the output string, one complete event per line, with correct matching braces. Keep the same agent identity and follow the last user request. Do not claim completion because a quoted dispatch stop_conditions mentions agent.done."};
+          if(this._compiled)this._compiled.messages.push(correction);else this.messages.push(correction);continue;
+        }
         const next = this.cfg.modelCandidates?.[this._routeIndex + 1];
         if (next && routeCanFallback(err) && attempt < MAX_RETRIES) {
           this._routeIndex++; this.cfg.providerCfg = next.config;
           if (this.cfg.sessionManaged) { const j=sessionJournal(), b=j.binding(this.cfg.id)!; j.append("model.fallback",b.conversation,this.cfg.id,b.revision,{event:"model.fallback",profile:this.cfg.routingProfile,to:next.name,reason:String(err.message).slice(0,200)}); }
           continue;
         }
-        if (this.cfg.providerCfg.transport === "codex-cli" || this.cfg.providerCfg.transport === "claude-cli" || !HttpConvAgent._isRetryable(err) || attempt >= MAX_RETRIES) break;
+        if (this.cfg.providerCfg.transport === "copilot-sdk" || this.cfg.providerCfg.transport === "codex-cli" || this.cfg.providerCfg.transport === "claude-cli" || !HttpConvAgent._isRetryable(err) || attempt >= MAX_RETRIES) break;
       }
     }
 
     try {
-      if (this.cfg.sessionManaged && !sessionJournal().isCurrent(this.cfg.id, this._activeRevision)) return;
+      if (this.cfg.sessionManaged && (process.cwd()!==this._workspaceRoot || !sessionJournal().isCurrent(this.cfg.id, this._activeRevision))) return;
       if (abortedDuringRetry) {
         // Emit idle so the UI returns to ready state — _busy is cleared in finally below.
         this.emit("event", {
@@ -527,12 +549,13 @@ export class HttpConvAgent extends EventEmitter {
     } catch (err: any) {
       if (err.name === "AbortError") return;
       const detail = err.message?.slice(0, 200) ?? "unknown error";
+      if(detail.startsWith("SUBSCRIPTION_BUDGET")) { this._subscriptionBudgetStopped=true;this._queue=this._queue.filter(item=>!!item.inputId); }
       process.stderr.write(`[${this.cfg.id}] HTTP error: ${detail}\n`);
       this.emit("event", {
         v: 1, type: "agent.error", agent: this.cfg.id,
         code: detail.includes("SESSION_BUDGET") ? "session_budget" : "http_error", detail,
       } as TuiEvent);
-      if (detail.startsWith("SUBSCRIPTION_") && !sessionJournal().binding(this.cfg.id)?.parent) this.emit("event", { v: 1, type: "message", agent: this.cfg.id, to: "user", text: "订阅连接已暂停；请在官方 CLI 检查登录、模型权限或套餐额度。没有自动切换到付费 API；任务和用量已保留。" });
+      if (detail.startsWith("SUBSCRIPTION_") && !sessionJournal().binding(this.cfg.id)?.parent) this.emit("event", { v: 1, type: "message", agent: this.cfg.id, to: "user", text: detail.startsWith("SUBSCRIPTION_PROTOCOL") ? "模型返回协议无效，已停止；该响应未执行派工或工具。最多一次纠正已计入预算，目标和记录保留，可继续沟通检查原因。" : detail.startsWith("SUBSCRIPTION_BUDGET") ? "订阅调用已触及预算约束，已停止本次执行并保留消耗。没有自动重试或转向 API。/budget 可离线查看；PM 沟通仍可使用预留额度。" : "订阅连接已暂停；请在官方 CLI 检查登录、模型权限或套餐额度。没有自动切换到付费 API；任务和用量已保留。" });
       if (detail.includes("SESSION_BUDGET") && !sessionJournal().binding(this.cfg.id)?.parent) {
         this.emit("event", { v: 1, type: "message", agent: this.cfg.id, to: "user", text: `会话预算已阻止继续执行。${JSON.stringify(budgetReport())}\n/budget 离线查看，/budget add requests=20 tokens=100000 tools=40 显式增加额度。` });
         this._queue = this._queue.filter((item) => item.inputId && sessionJournal().current(sessionJournal().binding(this.cfg.id)!.conversation)?.inputs.some((i) => i.id === item.inputId && i.kind === "query"));

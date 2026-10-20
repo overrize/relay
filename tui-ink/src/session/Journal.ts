@@ -538,6 +538,7 @@ function reduce(p: Projection, e: Entry) {
     const agent = p.agents[e.agent];
     if (agent && agent.status !== "superseded") agent.status = "running";
   }
+  if(e.kind === "model.budget_resumed") { const resumed=p.agents[e.agent];if(resumed?.revision===e.revision&&resumed.lastError?.includes("SUBSCRIPTION_BUDGET"))delete resumed.lastError; }
   reduceTask(s, e);
   if (e.kind === "task.acceptance.reconciled" && e.revision === s.revision) { const tool = s.tools[e.data.key]; if (tool?.status === "uncertain") { tool.status = "completed"; tool.ok = false; tool.output = `PM inspected interrupted acceptance; do not replay: ${e.data.reason}`; tool.completedSeq = e.seq; } }
   if (e.kind === "input.accepted") {

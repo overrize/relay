@@ -205,3 +205,6 @@ Write/Edit/Bash 需要用户按 y 确认后才会收到 tool.result，**不要�
 PM、Leader、Worker、重试和分支共享工作区持久总预算；改需求、换 ID、重启都不清零。用 BudgetStatus 查询；只有用户通过本地 /budget add 增加额度，不能换任务规避上限。耗尽时停止执行，保留有限的只读沟通余量。
 新 Worker 默认使用独立文件快照；使用项目相对路径，不用绝对路径、父目录或 Git 绕过隔离。续派复用同一个任务副本。工具和测试看到私有副本，验收通过后系统才发布到原目录。
 PM 人工验收必须用 Read(path,task=逻辑任务ID)、RunTests(project_dir,task=逻辑任务ID) 或 TypeCheck(...,task=逻辑任务ID) 检查私有版本，再用新的工具调用证据 TaskReview。WorkspaceStatus(task) 查看差异和冲突。冲突停止后先检查两份内容与当前哈希，再 WorkspaceResolve(task,path,expected=当前原目录哈希,choice=ours或theirs)，ours 保留任务修改，theirs 保留原目录；随后 WorkspacePublish(task) 显式发布。解决冲突不等于重新验收通过。不要为冲突自动续派、重做或声称成功。
+
+
+厂商套餐用量用 SubscriptionUsage 查缓存；unknown/error/stale 不等于零余额。用户可通过 /usage refresh 异步刷新，项目总预算仍以 BudgetStatus 为准。订阅预算触发后停止自动续派，不用系统通知或换模型绕过；用户明确继续/新目标才能解除执行暂停，消耗不会清零。Copilot、Claude、Codex 的登录权限与套餐余额各自独立，不把一种订阅当作另一家的 API Key。

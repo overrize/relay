@@ -606,7 +606,7 @@ OMO 源码核对基于 `code-yeongyu/oh-my-openagent@657a02ef48cc6653ba845f0bb8c
 | OpenAI/Anthropic/兼容 API | transport=http（默认），billing.mode=api（默认） | 对应 API Key 与接口 | 按该模型显式价格或环境变量兜底价格估算 |
 | 提供受支持 HTTP 接口的 Coding Plan | transport=http，billing.mode=subscription | 套餐专用 Key 和对应接口 | 按订阅用量记账，不套用逐 Token API 单价 |
 
-Claude/Codex OAuth 凭据由官方 CLI 保存和刷新，spawn 不读取或复制其令牌文件。每次使用前检查登录类型，拒绝 API-key 登录冒充订阅；子进程移除继承的 API Key、替代端点/云提供商配置。CLI 子进程由现有监督器管理，取消、强杀和孤儿清理使用同一恢复机制。CLI 会话不持续保存，spawn 仍负责长会话事件、当前状态及历史上下文。
+Claude/Codex 推理认证由官方 CLI 保存和刷新凭据，第八轮推理接入不读取或复制令牌文件；第九轮新增的 Claude 余量查询凭据读取方式见下文。每次使用前检查登录类型，拒绝 API-key 登录冒充订阅；子进程移除继承的 API Key、替代端点/云提供商配置。CLI 子进程由现有监督器管理，取消、强杀和孤儿清理使用同一恢复机制。CLI 会话不持续保存，spawn 仍负责长会话事件、当前状态及历史上下文。
 
 Claude 使用单轮、无内置工具、无 MCP、无用户/项目设置的 print 模式，并设置输出上限。Codex 使用临时会话、read-only、忽略用户配置、禁用 shell/并行 agent/插件/应用/浏览器等能力；只接收文本/推理和一个最终 turn，发现内部工具结果时拒绝当作有效完成。真正的工具执行都通过 spawn 的任务副本、预算和验收机制。
 
@@ -656,3 +656,91 @@ node scripts/verify-billing-mixed.mjs --codex <该账号支持的模型ID>
 ```
 
 这些命令消耗真实额度，需要已有官方 CLI 登录和 API Worker 配置，证据保留在项目 E 盘 `.test-tmp/live-*` 中，不随 Git 上传。
+
+
+## 第九轮：Copilot、厂商余量与 Codex 调用约束
+
+继续使用 OMO 风格的按定位候选链，不增加固定管理层级。保留 PM 直接派 Worker、执行期间追问、持久预算和隔离副本。
+
+### Copilot 订阅接入
+
+新增 `copilot-sdk` 通道和 `copilot-subscription` 注册方式。固定依赖 `@github/copilot-sdk@1.0.23`、`@github/copilot@1.0.100`，CLI 位于项目 node_modules 内；本轮安装和 npm 缓存均在 E 盘。官方 SDK/CLI 负责 GitHub 登录和订阅认证，清除继承的 GH_TOKEN、GITHUB_TOKEN、Copilot token、API Key/端点覆盖，拒绝把 BYOK/API-key 会话当订阅。
+
+Copilot 运行在监督器拥有的独立进程树内。SDK empty 模式关闭项目配置发现和自定义指令，不提供内置/MCP 工具，所有权限请求拒绝；模型必须属于账号返回的模型列表。传入模型输出上限，检查实际用量；发现额外模型调用、内置工具执行或超额时中止，并将可用的实际用量交回持久总预算，不自动转向 API。
+
+从 `E:\spawn-work\tui-ink` 执行（现在没有账号时不必登录）：
+
+```text
+npm run build
+node scripts/copilot-login.mjs
+node scripts/verify-copilot.mjs <账号支持的模型ID>
+```
+
+默认账号数据在当前项目 `.spawn/accounts/copilot`，可以用 SPAWN_COPILOT_HOME 指定固定 E 盘目录，供多个项目共用。登录脚本使用官方交互登录，spawn 不创建或购买 Copilot 订阅。验证脚本先报告 CLI 启动/认证状态；未登录时 inference=not_run、退出码 3。登录后必须提供账号实际支持的模型 ID，才继续运行 Copilot PM + API Worker 的真实端到端流程。
+
+```text
+/connect copilot-main copilot-subscription <模型ID>
+/route pm claude-main codex-main copilot-main k3
+/route implement codex-main copilot-main claude-main
+```
+
+订阅之后的 API 候选仍受 `/route api-fallback on|off` 控制，默认关闭；模型覆盖不能绕过配置链或预算。
+
+### 厂商套餐余量
+
+```text
+/usage
+/usage refresh codex
+/usage refresh claude
+/usage refresh copilot
+```
+
+`/usage` 离线读取缓存；`refresh` 异步查询，TUI/PM 不等待查询完成才能继续操作。`SubscriptionUsage` 是 PM/Worker 的只读缓存工具，不消耗推理预算，也不能购买额度、重置套餐或发送通知。
+
+| 厂商 | 查询来源 | 展示 |
+| --- | --- | --- |
+| Codex | 官方 app-server account/read、account/rateLimits/read | 独立额度桶、剩余百分比、重置时间 |
+| Copilot | 官方 SDK account.getQuota | 套餐包含量、剩余量/比例、无限额度、重置时间 |
+| Claude | OAuth usage 端点 | 新旧格式的滚动窗口、模型专属窗口、剩余比例与重置时间；端点拒绝或变化时显示不可用 |
+
+Claude 余量查询会在内存中只读已有 OAuth access token，并且只向固定的 Anthropic usage 地址发送；不复制令牌、不写入缓存/事件、不导出刷新令牌。Codex 由官方 app-server 查询余额，本地 auth.json 中的账号 ID 仅用于生成不可逆缓存指纹。GitHub 认证由官方 Copilot SDK/CLI 处理。
+
+数据明确区分 fresh、stale、unknown、error；缺少字段、未登录、403、未知格式不能解释成零余额。保留上次成功数据与时间，失败后标为 stale 并附安全错误码。余额窗口的 resetsAt 是 Unix 毫秒时间。
+
+缓存默认在 `.spawn/usage-cache`，按厂商与账号指纹隔离，不保存 OAuth token、邮箱或原始错误响应。90 秒有效期、手动刷新最短 5 秒；并发查询合并，跨进程锁和持久退避避免重复请求，429 的等待不因刷新而清零。SPAWN_USAGE_CACHE_DIR 可指定多个项目共同使用的 E 盘目录；Copilot 登录资料变化会使相关缓存失效。读取失败不阻塞正常沟通。
+
+路由在模型调用前检查新鲜缓存；确认已耗尽且尚未重置的适用窗口会暂停该候选，并按允许的链处理，不占用新的全局模型请求额度。Claude 模型专属额度只影响匹配的 Opus/Sonnet/Haiku 等定位模型，Codex 独立桶不会被当成所有模型的公共余额。过期、失败或未知数据不作为“已耗尽”的证据；没有后台高频轮询，需主动 refresh 获得最新状态。厂商套餐余量和本项目 `/budget` 是两个不同范围的账。
+
+### Codex 预算约束
+
+Codex 每次调用现在使用实际编译提示词的保守输入预留、输出分配和 60 秒监督超时。输出 schema 在提供商支持的结构化输出中限制可见字符串长度，最终响应再次校验；运行中按字节增量检查 JSONL，超过输出总量、出现第二轮或内置工具时立即请求监督器取消，不等进程自然结束。
+
+厂商返回的 input/output（含其报告的推理消耗）超过分配时，不接受该结果；按实际 Token 结算，而不是截断账单。预算错误禁止换模型/API 降级、自动续派和系统通知触发重试。暂停原因持久保存，重启后仍阻止自动调用；用户明确“继续”或提出新目标才解除执行暂停，已用总预算不清零。用户查询可使用只读沟通预留，`/budget` 与 `/usage` 的离线状态始终可用。
+
+必须区分本地停止和远端硬上限：Codex CLI 当前没有暴露可验证的服务端单次输出 Token 上限，结构化字符串长度也不约束隐藏推理 Token。在途响应可能已经超过预留才上报。本轮真实压力验证中分配 64 输出 Token，厂商报告 175，程序拒绝结果并记录 175，后续请求受预算阻止；不会声称这 175 已被提前限制成 64。
+
+若部署要求绝不发出缺少服务端 Token 硬上限的调用，设置 `SPAWN_CODEX_REQUIRE_HARD_TOKEN_CAP=1`：调用前拒绝 Codex CLI，不启动推理、不占用全局模型请求额度、不自动降级付费 API；由操作者选择合适的另一条通道。普通模式通过预留、输出/轮次/时间检查、完整结算和停止后续执行来限制损失，不能撤回厂商已产生的在途费用。
+
+Codex 的宿主事件在交给执行器前整段检查 JSON 和 agent 身份；拒绝时不会执行前半段合法事件。协议错误最多允许一次同模型纠正，照常计入请求/Token 预算，不切换计费通道。另修复旧解析兜底：格式错误的 JSON 中引用 `agent.done`（例如 dispatch.stop_conditions）不能被合成为成功完成。
+
+另外修复关闭/切换工作区的竞态：旧请求返回后不再向新工作区发布响应或结算预算，原工作区的不确定预留继续保留。
+
+强杀恢复时，监督进程可能在记录读取后完成清理并退出；恢复器会重新读取最终记录，避免误报孤儿进程。仍无明确终止证据时保持阻断。
+
+### 本轮验证
+
+新增专项 24 项：额度格式/模型范围/未知状态、缓存与退避、账号隔离、Codex 运行中取消/额外轮次/内置工具、输入与输出约束、实际消耗与沟通余量、预算暂停跨重启、严格拒绝模式、旧响应隔离、Copilot 文本模式/未登录/超额停止。
+
+全量 723 项：716 通过、7 项原有 TODO、0 失败；headless 82 通过；类型检查、构建和差异检查通过。真实验证包含 Codex 余量查询、结构化输出、受控超额拒绝、3 次总额度含 PM 沟通预留、没有第 4 次模型调用，以及 Codex PM + API Worker 执行期间追问/独立验收/发布。脚本：
+
+```text
+node scripts/verify-round9.mjs <账号支持的Codex模型ID>
+node scripts/verify-billing-mixed.mjs --codex <模型ID>
+node scripts/verify-copilot.mjs <Copilot模型ID>
+```
+
+本机真实查询 Codex 成功；Claude usage 实际返回 403，已验证不可用状态和退避，不能确认其余额。按用户选择，Copilot 本轮只验证官方运行时启动、未登录拒绝和可运行 E2E 脚本，没有完成有账号的真实推理与余额验收。凭据、临时项目和验证报告仍在 E 盘忽略目录，不上传 Git。
+
+仍有不足：厂商在途费用无法撤回；Codex 普通模式不是远端硬 Token 上限。Claude 使用的 usage 端点与本地凭据文件格式可能变化，当前账号需解决 403 才能验证余额。Copilot 需要有权限的账号完成真实验收，SDK 的部分 quota 接口仍是实验接口，因此固定版本。未覆盖所有 Coding Plan 的余额接口和账号自动轮换；新鲜额度缓存可能有最多 90 秒延迟，不能代替厂商账单硬限额。多进程缓存锁过期回收采用 30 秒租期，长时间系统挂起后可能重复一次只读查询。其他平台未实机验证。
+
+参考：[Copilot 用量接口](https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/usage-and-billing)、[官方 Codex app-server](https://learn.chatgpt.com/docs/app-server)。

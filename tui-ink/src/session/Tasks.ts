@@ -19,7 +19,7 @@ export interface WorkItem {
   retryRequested?: boolean;
   reason: string; operations: Record<string, TaskOperation>; verdict?: { passed: boolean; details: string[]; at: number; reviewer: string };
 }
-export const readTools = new Set(["Read", "Glob", "Grep", "LS", "CodeMap", "FindReferences", "Think", "WebSearch", "WebFetch", "SessionRecall", "TaskStatus", "BudgetStatus", "WorkspaceStatus"]);
+export const readTools = new Set(["Read", "Glob", "Grep", "LS", "CodeMap", "FindReferences", "Think", "WebSearch", "WebFetch", "SessionRecall", "TaskStatus", "SubscriptionUsage", "BudgetStatus", "WorkspaceStatus"]);
 export const fileHash = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
 const bounded = (value: unknown, fallback: number, max: number) => value === undefined ? fallback : (Number.isSafeInteger(value) && Number(value) >= 1 && Number(value) <= max ? Number(value) : (() => { throw new Error(`Task budget must be an integer in 1..${max}`); })());
 export function workItems(j = sessionJournal(), conversation?: string): WorkItem[] {

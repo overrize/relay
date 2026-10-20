@@ -34,7 +34,7 @@ export function resolveModelRoute(cfg: Config, role: AgentConfigRole, profile: M
     const sub = model.billing?.mode === "subscription";
     subscriptionSeen ||= sub;
     if (!sub && subscriptionSeen && !cfg.routing?.allowApiFallback) { route.skipped.push({ name, reason: "api-fallback-disabled" }); continue; }
-    if (model.transport !== "claude-cli" && model.transport !== "codex-cli" && !model.apiKey && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(model.baseUrl ?? "")) { route.skipped.push({ name, reason: "missing-api-credential" }); continue; }
+    if (model.transport !== "claude-cli" && model.transport !== "codex-cli" && model.transport !== "copilot-sdk" && !model.apiKey && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(model.baseUrl ?? "")) { route.skipped.push({ name, reason: "missing-api-credential" }); continue; }
     route.candidates.push({ name, config: { ...model, ...(cfg.agents[role].maxTokens ? { maxTokens: cfg.agents[role].maxTokens } : {}) } });
   }
   if (!route.candidates.length) throw new Error("MODEL_ROUTE: no eligible configured model; inspect /route and provider login");
@@ -44,6 +44,6 @@ export function resolveModelRoute(cfg: Config, role: AgentConfigRole, profile: M
 /** Only availability failures can advance a ranked chain, never a budget fence,
  * malformed request, requirement cancellation or rejected tool execution. */
 export function routeCanFallback(error: Error): boolean {
-  return /SUBSCRIPTION_(?:AUTH|STOPPED)|\b(?:401|402|403|404|408|429|500|502|503|504)\b|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(error.message)
-    && !/SESSION_BUDGET|MODEL_ROUTE|AbortError/i.test(error.message);
+  return /SUBSCRIPTION_(?:AUTH|STOPPED|QUOTA)|\b(?:401|402|403|404|408|429|500|502|503|504)\b|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(error.message)
+    && !/SESSION_BUDGET|SUBSCRIPTION_BUDGET|SUBSCRIPTION_PROTOCOL|MODEL_ROUTE|AbortError/i.test(error.message);
 }

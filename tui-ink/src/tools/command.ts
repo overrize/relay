@@ -56,7 +56,7 @@ export function execCommand(command: string, options: {
   cwd?: string; timeout?: number; encoding?: string; shell?: unknown;
   /** Internal structured process invocation; never constructed from model shell text. */
   invocation?: { file: string; args: string[]; input?: string };
-  env?: NodeJS.ProcessEnv; stdoutOnly?: boolean;
+  env?: NodeJS.ProcessEnv; stdoutOnly?: boolean; inspectStdout?: (chunk: Buffer) => void;
 } = {}): Promise<Buffer> {
   const signal = toolSignal.getStore();
   return new Promise((resolve, reject) => {
@@ -78,11 +78,12 @@ export function execCommand(command: string, options: {
     const cap = 1024 * 1024;
     let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0);
     let stopped: string | undefined;
+    let guardError: Error | undefined;
     const append = (old: Buffer, next: Buffer) => {
       const joined = Buffer.concat([old, next]);
       return joined.length <= cap ? joined : Buffer.concat([joined.subarray(0, cap / 2), joined.subarray(-cap / 2)]);
     };
-    child.stdout.on("data", (data: Buffer) => { stdout = append(stdout, data); });
+    child.stdout.on("data", (data: Buffer) => { if(!stopped)try{options.inspectStdout?.(data);}catch(error){guardError=error instanceof Error?error:new Error("Output guard rejected stream");stop(guardError.message);} stdout = append(stdout, data); });
     child.stderr.on("data", (data: Buffer) => { stderr = append(stderr, data); });
     const stop = (reason: string) => {
       if (stopped) return;
@@ -107,7 +108,7 @@ export function execCommand(command: string, options: {
         reject(Object.assign(new Error("Process tree termination is unconfirmed; inspect process registry before executing more tools"), { code: "unconfirmed_process", stdout, stderr })); return;
       }
       if (stopped || status !== 0) {
-        reject(Object.assign(new Error(stopped ?? `Command failed (exit ${status})`), {
+        reject(Object.assign(guardError ?? new Error(stopped ?? `Command failed (exit ${status})`), {
           code: stopped === "Tool cancelled" ? "ABORT_ERR" : status,
           stdout, stderr: stopped ? Buffer.concat([stderr, Buffer.from(`\n${stopped}`)]) : stderr,
         }));

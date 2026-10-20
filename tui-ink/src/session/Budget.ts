@@ -56,7 +56,7 @@ export function reserveSessionRequest(agent: string, input: number, output: numb
   const id = randomUUID(), reservation = { agent, role: b.parent ? b.role : "PM", input, output: cap, tokens: input + cap, microUsd, billingMode: mode, pricingKnown, model: selection.model?.slice(0,160), provider: selection.provider?.slice(0,80), inputRate, outputRate };
   j.append("budget.reserved", b.conversation, agent, b.revision, { id, reservation });
   persistFloor();
-  return { id, maxOutput: cap, communicationOnly };
+  return { id, maxOutput: cap, maxInput: input, communicationOnly };
 }
 export function settleSessionRequest(agent: string, id: string, input?: number, output?: number) {
   const scope = ensure(agent); if (!scope) return;
@@ -68,7 +68,7 @@ export function settleSessionRequest(agent: string, id: string, input?: number, 
   persistFloor();
 }
 export function consumeSessionTool(agent: string, name: string) {
-  if (["BudgetStatus", "TaskStatus", "TaskPolicy", "TaskRetry", "TaskReview", "TaskReconcile", "WorkspaceStatus"].includes(name)) return;
+  if (["SubscriptionUsage", "BudgetStatus", "TaskStatus", "TaskPolicy", "TaskRetry", "TaskReview", "TaskReconcile", "WorkspaceStatus"].includes(name)) return;
   const scope = ensure(agent); if (!scope) return;
   if (scope.budget.used.tools >= scope.budget.limits.tools) throw new Error("SESSION_BUDGET_EXHAUSTED: session tool allowance reached");
   scope.j.append("budget.tool", scope.b.conversation, agent, scope.b.revision, { name });

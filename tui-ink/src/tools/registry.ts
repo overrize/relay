@@ -1,3 +1,4 @@
+import { cachedUsage } from "../subscriptions/usage.js";
 import { waitForSessionControl } from "../session/Control.js";
 import { sessionJournal } from "../session/Journal.js";
 import { beginTaskOperation, finishTaskOperation, workItems } from "../session/Tasks.js";
@@ -118,6 +119,7 @@ const TaskReconcile: ToolDef = {
   name: "TaskReconcile", description: "PM 实际检查不确定副作用后，将指定操作标为不得重复；必须提供新的独立检查调用 ID 和理由。仅解锁剩余工作，不增加预算，不自动重放旧命令。", argsSchema: "task(str), operation(str), evidence(str comma separated call IDs), reason(str)", needsApproval: false, roles: new Set(["Leader"]),
   async execute(a) { const t = reconcileTask(String(a.__sessionAgent), String(a.task), String(a.operation), String(a.evidence).split(",").map((s) => s.trim()).filter(Boolean), String(a.reason)); return ok(JSON.stringify({ id: t.id, status: t.status, operation: a.operation, reconciliation: t.operations[String(a.operation)]?.reconciliation })); },
 };
+const SubscriptionUsage: ToolDef = { name:"SubscriptionUsage",description:"只读查询厂商套餐缓存、剩余比例、重置时间和新鲜度；未知不等于零。用户 /usage refresh 异步刷新，不会购买额度或发送消息。",argsSchema:"",needsApproval:false,roles:new Set(["Leader","Worker"]),async execute(){return ok(JSON.stringify([cachedUsage("claude"),cachedUsage("codex"),cachedUsage("copilot")]));} };
 const BudgetStatus: ToolDef = { name: "BudgetStatus", description: "只读查询整个工作区会话的持久预算，包括 PM、Leader、Worker、重试与验收。模型不能增加额度。", argsSchema: "", needsApproval: false, roles: new Set(["Leader", "Worker"]), async execute() { return ok(JSON.stringify(budgetReport())); } };
 const WorkspaceStatus: ToolDef = { name: "WorkspaceStatus", description: "查看隔离任务的修改、冲突、当前原文件哈希。Read(task=逻辑任务ID) 可检查暂存版本。", argsSchema: "task(str)", needsApproval: false, roles: new Set(["Leader", "Worker"]), async execute(a) { const b = sessionJournal().binding(String(a.__sessionAgent)), t = b && workItems(sessionJournal(), b.conversation).find((w) => w.id === a.task); if (!t) return err("Task not found"); const changes = await workspaceChanges(t); return ok(JSON.stringify({ id: t.id, isolation: t.isolation, status: t.workspace?.status, conflicts: t.workspace?.conflicts, changes: changes.slice(0, 30), total: changes.length })); } };
 const WorkspaceResolve: ToolDef = { name: "WorkspaceResolve", description: "PM 按当前哈希显式解决停止任务的单个文件冲突。ours 保留任务版本，theirs 保留原工作区版本；不会自动覆盖变化后的目标。", argsSchema: "task(str), path(str), expected(str current hash or missing), choice(ours|theirs)", needsApproval: false, roles: new Set(["Leader"]), async execute(a) { await resolveWorkspace(String(a.__sessionAgent), String(a.task), String(a.path), String(a.expected), String(a.choice)); return ok("Resolution recorded; use WorkspacePublish or retry/review after inspecting the result"); } };
@@ -859,7 +861,7 @@ const BrowserControl: ToolDef = {
 
 // ── 注册表（Map 保证 O(1) 查找）─────────────────────────────────────────────
 
-const ALL_TOOLS: ToolDef[] = [SessionRecall, TaskStatus, TaskRetry, TaskReview, TaskPolicy, TaskReconcile, BudgetStatus, WorkspaceStatus, WorkspaceResolve, WorkspacePublish,
+const ALL_TOOLS: ToolDef[] = [SubscriptionUsage, SessionRecall, TaskStatus, TaskRetry, TaskReview, TaskPolicy, TaskReconcile, BudgetStatus, WorkspaceStatus, WorkspaceResolve, WorkspacePublish,
   Read, Write, Edit, Bash, Grep, Glob, LS, Think, WebFetch, WebSearch,
   RunTests, TypeCheck, CodeMap, FindReferences, BrowserControl,
 ];

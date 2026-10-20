@@ -37,7 +37,14 @@ export async function recoverOrphanCommands(root = process.cwd(), timeout = 1000
     if (record && record.token !== token) throw new Error(`Process capability mismatch ${token}`);
     if (record && terminal.has(record.status)) { archiveFinishedProcess(root, token); continue; }
     if (record?.status === "blocked") throw new Error(`Orphan ${token} needs inspection: process tree termination is unconfirmed`);
-    if (record?.pid && !alive(record.pid)) throw new Error(`Orphan ${token} needs inspection: supervisor exited without confirming tree termination`);
+    if (record?.pid && !alive(record.pid)) {
+      // The supervisor publishes its terminal record before exiting. A record
+      // read before the liveness check can therefore be stale by this point.
+      record = JSON.parse(await fs.promises.readFile(path.join(dir, "record.json"), "utf8"));
+      if (record?.token !== token) throw new Error(`Process capability mismatch ${token}`);
+      if (terminal.has(record.status)) { archiveFinishedProcess(root, token); continue; }
+      throw new Error(`Orphan ${token} needs inspection: supervisor exited without confirming tree termination`);
+    }
     const lease = await fs.promises.stat(path.join(dir, "lease")).catch(() => undefined);
     if (alive(intent.ownerPid) && lease && Date.now() - lease.mtimeMs < 15000) continue;
     requestProcessCancel(dir);
@@ -49,7 +56,13 @@ export async function recoverOrphanCommands(root = process.cwd(), timeout = 1000
       record = JSON.parse(await fs.promises.readFile(path.join(dir, "record.json"), "utf8"));
       if (record?.token !== token) throw new Error(`Process capability mismatch ${token}`);
       if (terminal.has(record.status)) break;
-      if (record.status === "blocked" || (record.pid && !alive(record.pid))) throw new Error(`Orphan ${token} needs inspection: supervisor cannot confirm tree termination`);
+      if (record.status === "blocked") throw new Error(`Orphan ${token} needs inspection: supervisor cannot confirm tree termination`);
+      if (record.pid && !alive(record.pid)) {
+        record = JSON.parse(await fs.promises.readFile(path.join(dir, "record.json"), "utf8"));
+        if (record?.token !== token) throw new Error(`Process capability mismatch ${token}`);
+        if (terminal.has(record.status)) break;
+        throw new Error(`Orphan ${token} needs inspection: supervisor cannot confirm tree termination`);
+      }
       await pause(100);
     }
     if (!record || !terminal.has(record.status)) throw new Error(`Orphan cleanup timed out: ${token}; new tools remain blocked`);

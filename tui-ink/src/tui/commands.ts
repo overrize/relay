@@ -1,3 +1,4 @@
+import { cachedUsage, refreshUsage, type UsageProvider } from "../subscriptions/usage.js";
 import { resolveModelRoute, type ModelProfile } from "../models/routing.js";
 import { saveModelRouting } from "../config.js";
 import { loadConfig as loadBillingConfig, saveModelConfig, validateBillingConfig } from "../config.js";
@@ -150,6 +151,12 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
       clearPendingRating();
       applyEvent({ v: 1, type: "message", agent: "pm", to: "user",
         text: `评分已记录：${verdict === "good" ? "👍" : "👎"}${comment ? `  "${comment}"` : ""}` });
+    } },
+    { name: "usage", desc: "/usage [refresh] [claude|codex|copilot] — 厂商套餐余量与重置时间（不会增加套餐或发送通知）", handler: (args) => {
+      const provider=args.find(a=>["claude","codex","copilot"].includes(a)) as UsageProvider|undefined, providers:UsageProvider[]=provider?[provider]:["claude","codex","copilot"];
+      if(args.some(a=>a!=="refresh"&&a!==provider)){emitCommandMessage("用法 /usage [refresh] [claude|codex|copilot]");return;}
+      if(args.includes("refresh")){emitCommandMessage("正在异步查询套餐用量，PM 沟通和任务执行继续。未知或失败不会显示为零余额。");void Promise.all(providers.map(p=>refreshUsage(p,{force:true}))).then(values=>emitCommandMessage(JSON.stringify(values,null,2))).catch(()=>emitCommandMessage("套餐用量查询失败，已保留此前数据。"));}
+      else emitCommandMessage(JSON.stringify(providers.map(p=>cachedUsage(p)),null,2));
     } },
     { name: "route", desc: "/route [pm|leader|implement|research|review|verify|secretary <模型名...>|api-fallback on|off] — 定位与候选模型链", handler: (args) => {
       try {

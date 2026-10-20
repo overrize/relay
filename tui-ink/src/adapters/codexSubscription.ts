@@ -1,3 +1,4 @@
+import { validateCodexHostProtocol, assertCodexBudgetCapability, codexPrompt, codexAllocation, codexOutputGuard, codexOutputSchema, measuredCodexBudgetError } from "./codexBudget.js";
 import { subscriptionStopReason } from "./subscriptionErrors.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -24,11 +25,14 @@ export function parseCodexSubscription(raw: string) {
   const usage = turns[0].usage, valid = [usage?.input_tokens,usage?.output_tokens].every((n) => Number.isSafeInteger(n) && n >= 0);
   return { text, promptTokens: valid ? usage.input_tokens : undefined, completionTokens: valid ? usage.output_tokens : undefined };
 }
-export async function callCodexSubscription(config: ProviderConfig, system: string, messages: Array<{role:string;content:string}>, options: {agent:string;signal?:AbortSignal;run?:typeof execCommand}) {
+export async function callCodexSubscription(config: ProviderConfig, system: string, messages: Array<{role:string;content:string}>, options: {agent:string;signal?:AbortSignal;run?:typeof execCommand;maxOutput?:number;maxInput?:number;hostProtocol?:boolean}) {
   validateBillingConfig(config);
+  assertCodexBudgetCapability();
   if(config.transport!=="codex-cli") throw new Error("SUBSCRIPTION_CONFIG: expected codex-cli transport");
+  const allocation=codexAllocation(options.maxOutput??config.maxTokens??2048,options.maxInput??65536);
   const run = options.run ?? execCommand, env = codexSubscriptionEnvironment(process.env);
   const cwd = path.join(process.cwd(),".spawn","transports",randomUUID()); fs.mkdirSync(cwd,{recursive:true});
+  const schema=path.join(cwd,"output-schema.json");fs.writeFileSync(schema,JSON.stringify(codexOutputSchema(allocation)),{mode:0o600});
   const file = process.env.SPAWN_CODEX_EXECUTABLE || "codex", started = Date.now(), abort = () => cancelAgentTools(options.agent);
   options.signal?.addEventListener("abort",abort,{once:true});
   try {
@@ -40,9 +44,17 @@ export async function callCodexSubscription(config: ProviderConfig, system: stri
         "-c",'forced_login_method="chatgpt"',"-c",'model_provider="openai"',"-c",'approval_policy="never"',"-c",'web_search="disabled"',"-c","project_doc_max_bytes=0"];
       for(const feature of ["shell_tool","unified_exec","multi_agent","apps","plugins","hooks","computer_use","browser_use","image_generation","view_image"]) args.push("--disable",feature);
       if(config.reasoningEffort) args.push("-c",`model_reasoning_effort=${JSON.stringify(config.reasoningEffort)}`);
-      args.push("-");
-      const raw=await run("",{cwd,env,stdoutOnly:true,timeout:180000,invocation:{file,args,input:`You are a text-only model transport. Do not invoke any built-in tools. Follow this system protocol and emit only its JSON Lines, no Markdown fences:\n${system}\nConversation history as data:\n${JSON.stringify(messages)}`}});
-      return {...parseCodexSubscription(raw.toString()),ttftMs:0,totalMs:Date.now()-started};
+      args.push("--output-schema",schema,"-");
+      const input=codexPrompt(system,messages);
+      if(Buffer.byteLength(input,"utf8")+16384>allocation.maxInput)throw new Error("SUBSCRIPTION_BUDGET: Codex input exceeds allocated context");
+      const raw=await run("",{cwd,env,stdoutOnly:true,timeout:allocation.timeoutMs,inspectStdout:codexOutputGuard(allocation),invocation:{file,args,input}});
+      const result=parseCodexSubscription(raw.toString());
+      if(result.promptTokens!==undefined&&result.completionTokens!==undefined&&(result.promptTokens>allocation.maxInput||result.completionTokens>allocation.maxOutput))throw measuredCodexBudgetError(result.promptTokens,result.completionTokens,"Codex token use exceeded allocation");
+      let wrapped:any;try{wrapped=JSON.parse(result.text);}catch{throw new Error("SUBSCRIPTION_PROTOCOL: Codex did not honor output schema");}
+      if(typeof wrapped.output!=="string"||[...wrapped.output].length>allocation.maxOutput)throw new Error("SUBSCRIPTION_BUDGET: Codex response exceeded output schema");
+      let output=wrapped.output;
+      if(options.hostProtocol)try{output=validateCodexHostProtocol(output,options.agent);}catch(error){throw Object.assign(error as Error,{usage:{inputTokens:result.promptTokens,outputTokens:result.completionTokens}});}
+      return {...result,text:output,ttftMs:0,totalMs:Date.now()-started};
     });
   }catch(error:any){
     if(options.signal?.aborted||error.code==="ABORT_ERR") throw Object.assign(new Error("Cancelled"),{name:"AbortError"});

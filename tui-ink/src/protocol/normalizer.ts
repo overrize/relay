@@ -120,7 +120,8 @@ export function parseAgentOutput(
     } catch { /* not valid protocol JSON */ }
     // Plain-text "agent.done" signal — agent tried to quit via natural language instead of JSON.
     // Synthesize the event so the system actually stops invoking it.
-    if (/agent\.done/.test(raw)) {
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && /agent\.done/.test(raw)) {
       process.stderr.write(`[${agentId}] plain-text agent.done detected, synthesizing event\n`);
       recordProtocolMetric("protocol_repaired", "warn", "plain_text_agent_done_synthesized", raw);
       emitFn({ v: 1, type: "agent.done", agent: agentId, success: true,
@@ -129,8 +130,7 @@ export function parseAgentOutput(
     }
     // Drop output that looks like JSON but failed to parse or had no type field.
     // These are protocol blobs the LLM corrupted — showing raw JSON to the user is noise.
-    const trimmed = raw.trim();
-    if (trimmed.startsWith("{")) {
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
       process.stderr.write(`[${agentId}] raw JSON-like output dropped: ${trimmed.slice(0, 120)}\n`);
       return;
     }
