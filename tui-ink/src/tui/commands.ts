@@ -1,6 +1,8 @@
 import { cachedUsage, refreshUsage, type UsageProvider } from "../subscriptions/usage.js";
 import { formatUsage, formatBudget, formatModelConfig } from "./accountStatus.js";
-import { auditReport, formatAudit, type AuditFilter } from "../session/Audit.js";
+import { formatAudit, type AuditFilter } from "../session/Audit.js";
+import {backgroundAuditReport as auditReport} from "../session/BackgroundAudit.js";
+import {syncModelPrices,formatPriceStatus} from "../session/PriceSync.js";
 import {recordPrice} from "../session/Pricing.js";
 import { resolveModelRoute, type ModelProfile } from "../models/routing.js";
 import { saveModelRouting } from "../config.js";
@@ -165,7 +167,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
       else emitCommandMessage(show(providers.map(p=>cachedUsage(p))));
     } },
     { name: "account", desc: "/account — 离线查看模型配置、预算和套餐状态，不触发模型调用", handler: () => {
-      emitCommandMessage([formatModelConfig(loadBillingConfig()),formatBudget(budgetReport(),sessionJournal().bindings()),formatUsage([cachedUsage("claude"),cachedUsage("codex"),cachedUsage("copilot")])].join("\n\n"));
+      emitCommandMessage([formatModelConfig(loadBillingConfig()),formatPriceStatus(Object.values(loadBillingConfig().models)),formatBudget(budgetReport(),sessionJournal().bindings()),formatUsage([cachedUsage("claude"),cachedUsage("codex"),cachedUsage("copilot")])].join("\n\n"));
     } },
     { name: "audit", desc: "/audit [model=ID task=ID before=序号 limit=40] [--json] [--rebuild] — 长期用量与停止原因审计", handler: (args) => {
       const filter:AuditFilter={};
@@ -190,6 +192,18 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
         emitCommandMessage("模型路由已保存；新启动/恢复的 agent 生效，历史预算和任务副本保留。候选顺序决定优先级；订阅后的 API 默认不参与降级。");
       } catch(error) { emitCommandMessage(String(error)); }
     } },
+    { name:"prices",desc:"/prices [sync|history] — 自动价格来源、有效期、失败原因与变更追溯",handler:args=>{
+      if(args.length>1||args[0]&&!["sync","history"].includes(args[0])){emitCommandMessage("用法 /prices [sync|history]");return;}
+      if(args[0]==="history"){
+        emitCommandMessage("正在后台读取价格版本，PM 沟通继续。");void auditReport().then(r=>emitCommandMessage(JSON.stringify({totalObservations:r.priceDefinitions.length,latest:r.priceDefinitions.slice(-100),note:"最近100条；完整版本随受保护历史保留，/audit --json 可导出。"},null,2))).catch(()=>emitCommandMessage("价格版本读取失败：请检查历史完整性或稍后重试。"));return;
+      }
+      const models=Object.values(loadBillingConfig().models);
+      if(args[0]==="sync"){
+        emitCommandMessage("正在异步同步官方价格；不发送 API Key、不调用推理接口。手工价格优先；代理端点不会套用官方价格。");
+        void syncModelPrices(models,process.cwd(),{force:true}).then(()=>emitCommandMessage(formatPriceStatus(models))).catch(()=>emitCommandMessage("价格同步未完成，请检查 /prices 状态与持久记录。"));return;
+      }
+      emitCommandMessage(formatPriceStatus(models));
+    }},
     { name: "price", desc: "/price <注册模型> <输入USD/M> <输出USD/M> source=来源 [since=ISO日期] [legacy] — 记录有来源的价格并补算历史", handler: (args) => {
       try {
         const [name,input,output,...options]=args,model=name&&loadBillingConfig().models[name];

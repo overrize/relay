@@ -40,7 +40,7 @@ export function formatModelConfig(cfg: Config): string {
   const models = Object.entries(cfg.models).map(([name,m])=>{
     let valid = true; try { validateBillingConfig(m); } catch { valid = false; }
     const sub = m.billing?.mode === "subscription", local = /^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(m.baseUrl??"");
-    const pricing = sub ? "套餐消耗单独记账；本地不估算订阅账单" : m.billing?.inputUsdPerMillion!==undefined && m.billing.outputUsdPerMillion!==undefined ? `估价 $${m.billing.inputUsdPerMillion}/$${m.billing.outputUsdPerMillion} 每百万输入/输出 Token` : "模型未设价格；预算可能使用会话估价，不能视为免费";
+    const pricing = sub ? "套餐消耗单独记账；本地不估算订阅账单" : m.billing?.inputUsdPerMillion!==undefined && m.billing.outputUsdPerMillion!==undefined ? `估价 $${m.billing.inputUsdPerMillion}/$${m.billing.outputUsdPerMillion} 每百万输入/输出 Token` : "模型未设价格（手工）；自动官方价见 /prices，或使用会话估价；不能视为免费";
     return `${name} → ${m.provider}/${m.model} · ${sub?"订阅":"API"} · ${m.transport??"http"}\n  ${endpoint(m)}；${valid?"配置结构有效":"配置无效"}${sub?"":`；凭据${m.apiKey?"已配置":local?"本地端点无需凭据":"缺失"}`}\n  ${pricing}；maxTokens=${m.maxTokens??"角色默认"}`;
   });
   const profiles: ModelProfile[] = ["pm","leader","implement","research","review","verify","secretary"];

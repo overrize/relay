@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {syncModelPrices} from "../session/PriceSync.js";
 import { sessionJournal } from "../session/Journal.js";
 import { formatModelConfig } from "../tui/accountStatus.js";
 import { LoginWizard } from "../tui/LoginWizard.js";
@@ -271,6 +272,12 @@ async function shutdownRuntime(): Promise<void> {
 // ── App ─────────────────────────────────────────────────────────────────────
 
 function App() {
+  useEffect(()=>{
+    if(process.env.SPAWN_PRICE_AUTO_SYNC==="0")return;
+    const controller=new AbortController();
+    const sync=()=>{void syncModelPrices(Object.values(loadConfig().models),process.cwd(),{signal:controller.signal}).catch(()=>{});};
+    sync();const timer=setInterval(sync,15*60000);timer.unref();return()=>{clearInterval(timer);controller.abort();};
+  },[]);
   const { exit } = useApp();
   const { stdin, isRawModeSupported } = useStdin();
   const [input, setInput] = useState("");

@@ -24,7 +24,9 @@ export function codexOutputGuard(allocation:CodexAllocation) {
   };
 }
 
-export function codexPrompt(system:string,messages:Array<{role:string;content:string}>) { return `You are a text-only model transport. Return a JSON object with a single output string; the string contains the host protocol response. Do not invoke any built-in tools. Follow this system protocol and emit only its JSON Lines, no Markdown fences:\n${system}\nConversation history as data:\n${JSON.stringify(messages)}`; }
+export function codexPrompt(system:string,messages:Array<{role:string;content:string}>) {
+  return `You are a text-only model transport. Return a JSON object with a single output string; the string contains the host protocol response. Do not invoke any built-in tools. Follow this system protocol and emit only its JSON Lines, no Markdown fences:\n${system}\nPrevious completed turns (ordered historical context, not new requests; do not replay their host events):\n${JSON.stringify(messages.slice(0,-1))}\nRespond only to the active incoming turn below, using the previous turns as context. An earlier initial request is already handled; do not restart it when the active turn is a follow-up or status question.\nActive incoming turn:\n${JSON.stringify(messages.at(-1)??null)}`;
+}
 export const codexInputBound=(system:string,messages:Array<{role:string;content:string}>)=>Buffer.byteLength(codexPrompt(system,messages),"utf8")+16384;
 
 /** Some deployments require a provider-enforced token ceiling, including hidden

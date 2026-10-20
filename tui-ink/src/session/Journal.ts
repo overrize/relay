@@ -8,6 +8,8 @@ import { cleanCompletedProcesses } from "./completedProcesses.js";
 import { createBackup, type BackupFile } from "./Backup.js";
 import { reduceTask, type WorkItem } from "./Tasks.js";
 import { reduceBudget, type SessionBudget } from "./Budget.js";
+import type {PriceDefinition} from "./Pricing.js";
+import type {PriceSyncStatus} from "./PriceSync.js";
 
 export interface Entry {
   version: 1; seq: number; id: string; ts: number; kind: string;
@@ -32,6 +34,8 @@ export interface CurrentState {
   work?: Record<string, WorkItem>;
 }
 export interface Projection {
+  officialPrices?:Record<string,PriceDefinition>;
+  priceSync?:Record<string,PriceSyncStatus>;
   budget?: SessionBudget;
   seq: number; lastHash: string; agents: Record<string, Binding>; conversations: Record<string, CurrentState>;
   history: Record<string, Array<{ role: "user" | "assistant"; content: string; revision: number }>>;
@@ -239,14 +243,16 @@ export class SessionJournal {
   }
   binding(id: string): Binding | undefined { this.refresh(); return structuredClone(this.state.agents[id]); }
   budget() { this.refresh(); return structuredClone(this.state.budget); }
+  prices(){this.refresh();return structuredClone(Object.values(this.state.officialPrices??{}));}
+  priceStatus(){this.refresh();return structuredClone(Object.values(this.state.priceSync??{}));}
   sequence() { this.refresh(); return { seq: this.state.seq, lastHash: this.state.lastHash }; }
   /** Source metadata for validating a disposable audit checkpoint. */
   historySources() {
-    return this.locked(() => ({...this.sequence(), sources:this.sources().map(s=>({key:s.key,from:s.from,to:s.to,size:s.size,fingerprint:s.fingerprint,file:s.file})),budget:structuredClone(this.state.budget)}),false);
+    return this.locked(() => ({...this.sequence(), sources:this.sources().map(s=>({key:s.key,from:s.from,to:s.to,size:s.size,fingerprint:s.fingerprint,file:s.file,archive:s.archive})),budget:structuredClone(this.state.budget)}),false);
   }
   /** Stable asynchronous history scan. An incremental caller must first verify
    * the retained prefix's source manifest and hash, as AuditIndex does. */
-  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string}) {
+  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string},onSource?:(through:number,lastHash:string)=>void) {
     const snapshot = this.locked(() => ({ ...this.sequence(), sources: this.sources(), budget:structuredClone(this.state.budget) }), false);
     let visited = after?.seq??0, previousHash: string | undefined = after?.lastHash??"";
     for (const request of snapshot.sources) {
@@ -259,6 +265,7 @@ export class SessionJournal {
           if (visited % 32 === 0) await yieldIO();
         }
         if(source.archive)previousHash=source.to===request.to?source.archive.lastHash:undefined;
+        if(previousHash!==undefined)onSource?.(request.to,previousHash);
       });
       await yieldIO();
     }
@@ -540,6 +547,10 @@ export class SessionJournal {
 
 function reduce(p: Projection, e: Entry) {
   reduceBudget(p, e);
+  if(e.kind==="pricing.defined"&&e.data.origin==="official"){
+    p.officialPrices??={};p.officialPrices[JSON.stringify([e.data.provider,e.data.model,e.data.endpoint])]=e.data;
+  }
+  if(e.kind==="pricing.sync"){p.priceSync??={};p.priceSync[e.data.source]=e.data;}
   p.seq = e.seq; p.lastHash = e.hash;
   if (e.kind === "inbox.received") p.inbox[e.data.id] = { ...e.data, conversation: e.conversation, agent: e.agent };
   if (e.kind === "inbox.dispatched") delete p.inbox[e.data.id];

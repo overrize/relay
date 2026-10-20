@@ -1,3 +1,4 @@
+import {syncModelPrices,priceSourceFor} from "../session/PriceSync.js";
 import { assertCodexBudgetCapability, codexInputBound } from "./codexBudget.js";
 import { callCopilotSubscription } from "./copilotSubscription.js";
 import { cachedUsage, usageExhausted, type UsageProvider } from "../subscriptions/usage.js";
@@ -438,10 +439,14 @@ export class HttpConvAgent extends EventEmitter {
         await new Promise((r) => setTimeout(r, delaySec * 1000));
       }
       if (this._abort?.signal.aborted || (this.cfg.sessionManaged && !sessionJournal().isCurrent(this.cfg.id, this._activeRevision))) { abortedDuringRetry = true; break; }
-      if (this.cfg.sessionManaged && !consumeTaskRequest(this.cfg.id)) { lastErr = new Error("Shared task request/time budget exhausted"); break; }
       let permit: ReturnType<typeof reserveSessionRequest>;
       try {
         validateBillingConfig(this.cfg.providerCfg);
+        if(this.cfg.sessionManaged&&process.env.SPAWN_PRICE_AUTO_SYNC!=="0"&&priceSourceFor(this.cfg.providerCfg)&&this.cfg.providerCfg.billing?.inputUsdPerMillion===undefined&&this.cfg.providerCfg.billing?.outputUsdPerMillion===undefined){
+          await syncModelPrices([this.cfg.providerCfg],this._workspaceRoot,{signal:this._abort?.signal});
+          if(this._abort?.signal.aborted||!sessionJournal().isCurrent(this.cfg.id,this._activeRevision)){abortedDuringRetry=true;break;}
+        }
+        if (this.cfg.sessionManaged && !consumeTaskRequest(this.cfg.id)) { lastErr = new Error("Shared task request/time budget exhausted"); break; }
         if(this.cfg.providerCfg.transport==="codex-cli")assertCodexBudgetCapability();
         const quotaProvider:UsageProvider|undefined=this.cfg.providerCfg.transport==="codex-cli"?"codex":this.cfg.providerCfg.transport==="claude-cli"?"claude":this.cfg.providerCfg.transport==="copilot-sdk"?"copilot":undefined;
         if(quotaProvider&&usageExhausted(cachedUsage(quotaProvider),Date.now(),this.cfg.providerCfg.model))throw new Error("SUBSCRIPTION_QUOTA: fresh vendor quota is exhausted; waiting for reset");

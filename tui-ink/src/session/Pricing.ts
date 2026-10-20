@@ -13,22 +13,43 @@ export function priceEndpoint(provider?:string,baseUrl?:string){
 export interface PriceDefinition{
   provider:string;model:string;endpoint:string;inputRate:number;outputRate:number;
   source:string;since:number;recordedAt:number;legacy:boolean;
+  origin?:"official";version?:string;previousVersion?:string;expiresAt?:number;
+  sourceDocumentHash?:string;parserVersion?:string;
+  basis?:"upper-bound"|"catalog-estimate";currency?:"USD"|"CNY";
+  components?:Record<string,number>;
+  fx?:{source:string;date:string;usdPerUnit:number;version:string};
 }
 export function validatePrice(value:PriceDefinition){
   if(!value.provider||!value.model||!value.endpoint||![value.inputRate,value.outputRate,value.since,value.recordedAt].every(n=>Number.isFinite(n)&&n>=0)||!value.source||value.source.length>120||!/^[-\p{L}\p{N}_.:/]+$/u.test(value.source)||typeof value.legacy!=="boolean")throw Error("Invalid price definition; provide nonnegative USD/M rates, source label and effective date");
+  if(value.expiresAt!==undefined&&(!Number.isFinite(value.expiresAt)||value.expiresAt<=value.since))throw Error("Invalid price validity window");
+  if(value.components&&Object.values(value.components).some(n=>!Number.isFinite(n)||n<0))throw Error("Invalid price components");
   return value;
 }
 export function recordPrice(journal:SessionJournal,model:{provider:string;model:string;baseUrl?:string},inputRate:number,outputRate:number,options:{source:string;since?:number;legacy?:boolean}){
   const price=validatePrice({provider:model.provider,model:model.model,endpoint:priceEndpoint(model.provider,model.baseUrl),inputRate,outputRate,source:options.source,since:options.since??0,recordedAt:Date.now(),legacy:options.legacy??false});
   journal.append("pricing.defined","pm","user",0,price);return price;
 }
+type PriceBucket={manual:PriceDefinition[];official:PriceDefinition[]};
+const lookups=new WeakMap<PriceDefinition[],{length:number;scopes:Map<string,PriceBucket>}>();
 export function priceFor(row:AuditRow,prices:PriceDefinition[]){
-  return [...prices].reverse().filter(p=>p.provider===row.provider&&p.model===row.model&&p.since<=(row.requestedAt??row.at)&&(row.endpoint?p.endpoint===row.endpoint:p.legacy)).sort((a,b)=>b.since-a.since||b.recordedAt-a.recordedAt).at(0);
+  let lookup=lookups.get(prices);
+  if(!lookup||lookup.length!==prices.length){
+    const scopes=new Map<string,PriceBucket>();
+    for(const p of prices)for(const endpoint of [p.endpoint,...(p.legacy?[null]:[])]){
+      const key=JSON.stringify([p.provider,p.model,endpoint]),bucket=scopes.get(key)??{manual:[],official:[]};scopes.set(key,bucket);bucket[p.origin?"official":"manual"].push(p);
+    }
+    for(const bucket of scopes.values())for(const list of [bucket.manual,bucket.official])list.sort((a,b)=>a.since-b.since||a.recordedAt-b.recordedAt);
+    lookup={length:prices.length,scopes};lookups.set(prices,lookup);
+  }
+  const at=row.requestedAt??row.at,bucket=lookup.scopes.get(JSON.stringify([row.provider,row.model,row.endpoint??null]));
+  if(!bucket)return;
+  const choose=(list:PriceDefinition[])=>{let low=0,high=list.length;while(low<high){const middle=(low+high)>>>1;if(list[middle]!.since<=at)low=middle+1;else high=middle;}for(let i=low-1;i>=0;i--){const p=list[i]!;if(p.expiresAt===undefined||p.expiresAt>at)return p;}};
+  return choose(bucket.manual)??choose(bucket.official);
 }
 export function supplementPrice(row:AuditRow,prices:PriceDefinition[]){
   const price=priceFor(row,prices);
   if(!price)return {state:"missing-price" as const};
-  const provenance={source:price.source,since:price.since,recordedAt:price.recordedAt,legacy:!row.endpoint};
+  const provenance={source:price.source,version:price.version,basis:price.basis,currency:price.currency,fx:price.fx,since:price.since,recordedAt:price.recordedAt,legacy:!row.endpoint};
   if(row.state!=="measured"||row.inputTokens===undefined||row.outputTokens===undefined)return {state:"unmeasured" as const,...provenance};
   return {state:"supplemented" as const,microUsd:Math.ceil(row.inputTokens*price.inputRate+row.outputTokens*price.outputRate),inputRate:price.inputRate,outputRate:price.outputRate,...provenance};
 }

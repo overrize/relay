@@ -4,7 +4,7 @@ import { sessionJournal } from "../session/Journal.js";
 import { beginTaskOperation, finishTaskOperation, workItems } from "../session/Tasks.js";
 import { retryTask, reviewTask, taskMode, reconcileTask } from "../runtime/TaskRecovery.js";
 import { consumeSessionTool, budgetReport } from "../session/Budget.js";
-import { auditReport } from "../session/Audit.js";
+import {backgroundAuditReport as auditReport} from "../session/BackgroundAudit.js";
 import { toolWorkspace, resolveWorkspaceToolPath, withWorkspace, workspaceChanges, publishWorkspace, resolveWorkspace } from "../session/Workspaces.js";
 import { taskState } from "../session/Tasks.js";
 // Tool Registry — 每个工具是独立的 ToolDef 对象，单一职责

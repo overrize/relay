@@ -81,5 +81,5 @@ test("request failure is durably linked to its reservation and sanitized",async(
 });
 test("audit command returns immediately and rejects unsafe pagination parameters",async()=>{
   const messages:string[]=[];const commands=buildCommands({emitCommandMessage:(s:string)=>messages.push(s)} as any);commands.find(c=>c.name==="audit")!.handler([]);assert.equal(messages.length,1);
-  await new Promise(r=>setTimeout(r,30));assert.match(messages[1]!,/长期审计/);await assert.rejects(auditReport(process.cwd(),{limit:10000}));assert.equal(auditReason("token=private"),"unspecified");
+  const deadline=Date.now()+5000;while(messages.length<2&&Date.now()<deadline)await new Promise(r=>setTimeout(r,20));assert.match(messages[1]!,/长期审计/);await assert.rejects(auditReport(process.cwd(),{limit:10000}));assert.equal(auditReason("token=private"),"unspecified");
 });

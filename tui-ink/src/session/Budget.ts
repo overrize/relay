@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeSnapshot } from "../memory/atomic.js";
 import { digest } from "./Storage.js";
-import {priceEndpoint} from "./Pricing.js";
+import {priceEndpoint,priceFor} from "./Pricing.js";
 
 export interface BillingSelection { provider?: string; model?: string; baseUrl?:string; transport?: string; billing?: { mode: "api" | "subscription"; inputUsdPerMillion?: number; outputUsdPerMillion?: number; priceSource?:string; priceRecordedAt?:number } }
 type BillingUsage = { requests: number; tokens: number; microUsd: number };
@@ -16,17 +16,17 @@ export interface SessionBudget {
   reservations: Record<string, { agent: string; role: string; billingMode?: "api" | "subscription"; pricingKnown?: boolean; model?: string; provider?: string; input: number; output: number; tokens: number; microUsd: number; inputRate: number; outputRate: number; settled?: boolean; uncertain?: boolean }>;
 }
 function integer(name: string, fallback: number, minimum = 0) { const n = Number(process.env[name] ?? fallback); if (!Number.isSafeInteger(n) || n < minimum) throw new Error(`${name} must be an integer >= ${minimum}`); return n; }
-export function initialBudget(): SessionBudget {
+export function initialBudget(catalogPriced=false): SessionBudget {
   const requests = integer("SPAWN_SESSION_MAX_REQUESTS", 200, 1), tokens = integer("SPAWN_SESSION_MAX_TOKENS", 2000000, 1);
   const inputRate = Number(process.env.SPAWN_INPUT_USD_PER_MILLION ?? 0), outputRate = Number(process.env.SPAWN_OUTPUT_USD_PER_MILLION ?? 0), usd = Number(process.env.SPAWN_SESSION_MAX_USD ?? 0);
-  if (![inputRate, outputRate, usd].every((n) => Number.isFinite(n) && n >= 0) || (usd > 0 && (!process.env.SPAWN_INPUT_USD_PER_MILLION || !process.env.SPAWN_OUTPUT_USD_PER_MILLION))) throw new Error("A USD cap requires explicit nonnegative input/output rates; prices are user estimates, not provider billing");
-  return { limits: { requests, tools: integer("SPAWN_SESSION_MAX_TOOLS", 400, 1), tokens, microUsd: Math.round(usd * 1000000), inputRate, outputRate, communicationRequests: Math.min(Math.max(0, requests - 1), integer("SPAWN_COMMUNICATION_REQUESTS", 8)), communicationTokens: Math.min(Math.floor(tokens / 4), integer("SPAWN_COMMUNICATION_TOKENS", 64000)), communicationMicroUsd: Math.min(Math.floor(usd * 250000), Math.ceil(64000 * Math.max(inputRate, outputRate))) }, used: { requests: 0, tools: 0, tokens: 0, microUsd: 0 }, reservations: {} };
+  if (![inputRate, outputRate, usd].every((n) => Number.isFinite(n) && n >= 0) || (usd > 0 && !catalogPriced && (!process.env.SPAWN_INPUT_USD_PER_MILLION || !process.env.SPAWN_OUTPUT_USD_PER_MILLION))) throw new Error("A USD cap requires explicit nonnegative input/output rates; prices are user estimates, not provider billing");
+  return { limits: { requests, tools: integer("SPAWN_SESSION_MAX_TOOLS", 400, 1), tokens, microUsd: Math.round(usd * 1000000), inputRate, outputRate, communicationRequests: Math.min(Math.max(0, requests - 1), integer("SPAWN_COMMUNICATION_REQUESTS", 8)), communicationTokens: Math.min(Math.floor(tokens / 4), integer("SPAWN_COMMUNICATION_TOKENS", 64000)), communicationMicroUsd: Math.min(Math.floor(usd * 250000), (catalogPriced&&inputRate===0&&outputRate===0?Math.floor(usd*250000):Math.ceil(64000 * Math.max(inputRate, outputRate)))) }, used: { requests: 0, tools: 0, tokens: 0, microUsd: 0 }, reservations: {} };
 }
 function floorFile() { return path.join(process.cwd(), ".spawn", "budget-floor.json"); }
 function persistFloor() { const b = sessionJournal().budget()!; const body = { version: 1, used: b.used, limits: b.limits, unpricedApiRequests: b.unpricedApiRequests ?? 0, ...(b.byBilling ? { byBilling: b.byBilling } : {}) }; writeSnapshot(floorFile(), JSON.stringify({ ...body, digest: digest(body) })); }
-function ensure(agent: string) {
+function ensure(agent: string,catalogPriced=false) {
   const j = sessionJournal(), b = j.binding(agent); if (!b) return undefined;
-  if (!j.budget()) j.append("budget.created", b.conversation, agent, b.revision, initialBudget());
+  if (!j.budget()) j.append("budget.created", b.conversation, agent, b.revision, initialBudget(catalogPriced));
   if (fs.existsSync(floorFile())) {
     const { digest: actual, ...floor } = JSON.parse(fs.readFileSync(floorFile(), "utf8"));
     if (floor.version !== 1 || digest(floor) !== actual) throw new Error("Budget floor is corrupt; inspect billing/restore history before continuing");
@@ -36,13 +36,14 @@ function ensure(agent: string) {
   return { j, b, budget: j.budget()! };
 }
 export function reserveSessionRequest(agent: string, input: number, output: number, communication = false, selection: BillingSelection = {}) {
-  const scope = ensure(agent); if (!scope) return undefined;
+  const mode = selection.billing?.mode ?? "api",journal=sessionJournal();
+  const quote=mode==="api"&&selection.billing?.inputUsdPerMillion===undefined&&selection.billing?.outputUsdPerMillion===undefined?priceFor({provider:selection.provider,model:selection.model,endpoint:priceEndpoint(selection.provider,selection.baseUrl),at:Date.now()} as any,journal.prices()):undefined;
+  const scope = ensure(agent,!!quote); if (!scope) return undefined;
   const { j, b, budget } = scope, { limits: l, used: u } = budget;
-  const mode = selection.billing?.mode ?? "api";
-  const inputRate = mode === "subscription" ? 0 : selection.billing?.inputUsdPerMillion ?? l.inputRate;
-  const outputRate = mode === "subscription" ? 0 : selection.billing?.outputUsdPerMillion ?? l.outputRate;
+  const inputRate = mode === "subscription" ? 0 : selection.billing?.inputUsdPerMillion ?? quote?.inputRate ?? l.inputRate;
+  const outputRate = mode === "subscription" ? 0 : selection.billing?.outputUsdPerMillion ?? quote?.outputRate ?? l.outputRate;
   if (!["api","subscription"].includes(mode) || ![inputRate,outputRate].every((r) => Number.isFinite(r) && r >= 0)) throw new Error("Invalid model billing configuration");
-  const pricingKnown = mode === "subscription" || (selection.billing?.inputUsdPerMillion !== undefined && selection.billing?.outputUsdPerMillion !== undefined) || l.inputRate > 0 || l.outputRate > 0 || (!!process.env.SPAWN_INPUT_USD_PER_MILLION && !!process.env.SPAWN_OUTPUT_USD_PER_MILLION);
+  const pricingKnown = mode === "subscription" || !!quote || (selection.billing?.inputUsdPerMillion !== undefined && selection.billing?.outputUsdPerMillion !== undefined) || l.inputRate > 0 || l.outputRate > 0 || (!!process.env.SPAWN_INPUT_USD_PER_MILLION && !!process.env.SPAWN_OUTPUT_USD_PER_MILLION);
   const monetaryCap = mode === "api" && l.microUsd > 0;
   if (monetaryCap && !pricingKnown) throw new Error("SESSION_BUDGET_EXHAUSTED: API USD cap cannot be enforced without explicit prices");
   const canTalk = communication && !b.parent;
@@ -54,7 +55,7 @@ export function reserveSessionRequest(agent: string, input: number, output: numb
   const microUsd = Math.ceil(input * inputRate + cap * outputRate);
   if (monetaryCap && u.microUsd + microUsd > costLimit) throw new Error("SESSION_BUDGET_EXHAUSTED: configured cost estimate cap reached");
   const communicationOnly = u.requests >= l.requests - l.communicationRequests || u.tokens + input + cap > l.tokens - l.communicationTokens || !!(monetaryCap && u.microUsd + microUsd > l.microUsd - l.communicationMicroUsd);
-  const id = randomUUID(), reservation = { priceSource:selection.billing?.priceSource??(pricingKnown?"call-time-config":undefined),priceRecordedAt:selection.billing?.priceRecordedAt, endpoint:priceEndpoint(selection.provider,selection.baseUrl), agent, role: b.parent ? b.role : "PM", conversation:b.conversation, revision:b.revision, taskId:b.workId, transport:selection.transport??"http", communication:canTalk, input, output: cap, tokens: input + cap, microUsd, billingMode: mode, pricingKnown, model: selection.model?.slice(0,160), provider: selection.provider?.slice(0,80), inputRate, outputRate };
+  const id = randomUUID(), reservation = { priceQuote:quote, priceSource:selection.billing?.priceSource??quote?.source??(pricingKnown?"call-time-config":undefined),priceRecordedAt:selection.billing?.priceRecordedAt??quote?.recordedAt, endpoint:priceEndpoint(selection.provider,selection.baseUrl), agent, role: b.parent ? b.role : "PM", conversation:b.conversation, revision:b.revision, taskId:b.workId, transport:selection.transport??"http", communication:canTalk, input, output: cap, tokens: input + cap, microUsd, billingMode: mode, pricingKnown, model: selection.model?.slice(0,160), provider: selection.provider?.slice(0,80), inputRate, outputRate };
   j.append("budget.reserved", b.conversation, agent, b.revision, { id, reservation });
   persistFloor();
   return { id, maxOutput: cap, maxInput: input, communicationOnly };
