@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { sessionJournal } from "../session/Journal.js";
+import { formatModelConfig } from "../tui/accountStatus.js";
 import { releaseRuntimeOwners } from "../session/RuntimeOwner.js";
 import { waitForIndexing } from "../session/SearchIndex.js";
 import { stopTaskRecovery, waitTaskResolution, recordTaskCancellation } from "./TaskRecovery.js";
@@ -349,20 +350,7 @@ function App() {
 
   const showModelConfig = () => {
     const cfg = loadConfig();
-    const roleLines = (["leader", "worker", "secretary"] as AgentConfigRole[]).map((role) => {
-      const roleCfg = cfg.agents[role];
-      const providerCfg = getAgentProviderConfig(cfg, role);
-      const base = providerCfg.baseUrl ? ` ${providerCfg.baseUrl}` : "";
-      return `${role}: ${roleCfg.model} -> ${providerCfg.provider} / ${providerCfg.model}${base} [${providerCfg.billing?.mode ?? "api"}; ${providerCfg.transport ?? "http"}]`;
-    });
-    const modelLines = Object.entries(cfg.models).map(([name, modelCfg]) => {
-      const base = modelCfg.baseUrl ? ` ${modelCfg.baseUrl}` : "";
-      return `${name}: ${modelCfg.provider} / ${modelCfg.model}${base} [${modelCfg.billing?.mode ?? "api"}; ${modelCfg.transport ?? "http"}]`;
-    });
-    emitCommandMessage(
-      `当前角色模型:\n${roleLines.join("\n")}\n\n已注册模型:\n${modelLines.join("\n")}` +
-      `\n\n用法:\n/connect <name> <preset|baseUrl> [modelId] <apiKey>；订阅：/connect <name> claude-subscription <modelId>\n/model <leader|worker|secretary> <name>`,
-    );
+    emitCommandMessage(formatModelConfig(cfg));
   };
 
   const registerModelCommand = (
@@ -372,16 +360,16 @@ function App() {
     maybeApiKey: string | undefined,
   ) => {
     if (!name || !preset || !modelOrKey) {
-      emitCommandMessage("用法: /connect <name> <preset|baseUrl> [modelId] <apiKey>；订阅：/connect <name> claude-subscription <modelId>");
+      emitCommandMessage("用法: /connect <name> <preset|baseUrl> [modelId] <apiKey>；订阅：/connect <name> <claude-subscription|codex-subscription|copilot-subscription> <modelId>");
       return;
     }
     const cfg = resolveModelConfigInput(preset, modelOrKey, maybeApiKey);
     if (!cfg) {
-      emitCommandMessage(`缺少模型名。preset "${preset}" 没有默认模型时，请使用: /connect ${name} ${preset} <modelId> <apiKey>`);
+      emitCommandMessage("参数无效：API 需要模型和凭据；订阅只接受模型 ID，不接受额外 API Key。");
       return;
     }
-    saveModelConfig(name, cfg);
-    emitCommandMessage(`模型已注册: ${name} -> ${cfg.provider} / ${cfg.model}${cfg.baseUrl ? ` ${cfg.baseUrl}` : ""} ✓`);
+    try {saveModelConfig(name, cfg);emitCommandMessage(`模型已注册: ${name} → ${cfg.provider}/${cfg.model} · ${cfg.billing?.mode??"api"} · ${cfg.transport??"http"}。配置在新启动/恢复时生效；/model show 查看候选链。`);}
+    catch {emitCommandMessage("模型配置未保存；检查配置内容和配置目录写入权限。");}
   };
 
   const switchModelCommand = (

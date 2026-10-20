@@ -22,6 +22,7 @@ const {stopTaskRecovery,waitTaskResolution}=await import('../dist/runtime/TaskRe
 const {releaseRuntimeOwners}=await import('../dist/session/RuntimeOwner.js');
 const {executeTool}=await import('../dist/tools/registry.js');
 const {cancelAllAgentTools}=await import('../dist/tools/command.js');
+const {buildCommands}=await import('../dist/tui/commands.js');
 
 const r=createRuntimeContext(),replies=[],goal='Write result.txt exactly MIXED_OK';
 const dispatch={background:'subscription PM and API Worker acceptance test',constraints:['only result.txt'],acceptance_criteria:['exact final artifact'],stop_conditions:['agent.done'],acceptance_checks:[{criterion:0,type:'file_sha256',path:'result.txt',value:(await import('node:crypto')).createHash('sha256').update('MIXED_OK').digest('hex')}]};
@@ -30,5 +31,8 @@ configureAgentHandlers({...r,MODEL:'fixture',DEMO:false,buildSystemPrompt:(role,
 const until=async f=>{const end=Date.now()+180000;while(!f()){if(Date.now()>end)throw Error('mixed E2E timeout '+JSON.stringify(workItems()));await new Promise(r=>setTimeout(r,20));}};
 try{ensureAgent({id:'pm',name:'PM',role:'Leader',state:'idle'});startLeaderAgent({id:'pm',firstMessage:'START',conversationMode:true,replyHook:t=>replies.push(t)});await until(()=>workItems().length===1);r.agents.get('pm').receiveUserInput('PROGRESS?');await until(()=>workItems()[0].status==='accepted'&&replies.includes('MIXED_PROGRESS'));
 assert.equal(fs.readFileSync('result.txt','utf8'),'MIXED_OK');const budget=sessionJournal().budget();assert.ok(budget.byBilling.api.requests>0);assert.ok(budget.byBilling.subscription.requests>0);assert.equal(budget.byBilling.subscription.microUsd,0);assert.ok(budget.byBilling.api.microUsd>0);
-const report={root,mixedTransport:true,profileRouting:true,continuousPM:true,accepted:workItems()[0].status,budget:{used:budget.used,byBilling:budget.byBilling},replies};fs.writeFileSync('verification.json',JSON.stringify(report,null,2));console.log(JSON.stringify(report,null,2));
+const statusMessages=[];const commands=buildCommands({emitCommandMessage:text=>statusMessages.push(text)});commands.find(c=>c.name==='account').handler([]);commands.find(c=>c.name==='budget').handler([]);
+assert.match(statusMessages[0],/有效候选链/);assert.match(statusMessages[1],/PM 沟通预留/);assert.match(statusMessages[1],/最近调用/);assert.match(statusMessages[1],/codex-cli|claude-cli|copilot-sdk/);assert.match(statusMessages[1],/API：/);assert.match(statusMessages[1],/订阅：/);
+const accountConfig=loadConfig();for(const model of Object.values(accountConfig.models))if(model.apiKey?.length>8)assert.ok(!statusMessages.join('\n').includes(model.apiKey),'status must not expose API credentials');
+const report={root,mixedTransport:true,profileRouting:true,continuousPM:true,accountStatusVerified:true,accepted:workItems()[0].status,budget:{used:budget.used,byBilling:budget.byBilling},replies};fs.writeFileSync('verification.json',JSON.stringify(report,null,2));fs.writeFileSync('account-status.txt',statusMessages.join('\n\n'));console.log(JSON.stringify(report,null,2));
 }finally{stopTaskRecovery();for(const[id,a]of r.agents){r.killedAgents.add(id);a.kill();}for(const s of r.secretaries.values())s.destroy();r.pm.destroy();await waitTaskResolution();stopTaskRecovery();await cancelAllAgentTools();releaseRuntimeOwners();}

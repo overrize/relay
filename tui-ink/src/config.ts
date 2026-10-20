@@ -103,6 +103,7 @@ export function resolveProviderConfigInput(
   modelOrKey: string,
   maybeApiKey?: string,
 ): ProviderConfig | null {
+  if (["copilot-subscription","codex-subscription","claude-subscription"].includes(preset) && maybeApiKey !== undefined) return null;
   if (preset === "copilot-subscription") return { provider: "openai", model: modelOrKey, apiKey: "", transport: "copilot-sdk", billing: {mode:"subscription"} };
   if (preset === "codex-subscription") return { provider: "openai", model: modelOrKey, apiKey: "", transport: "codex-cli", billing: { mode: "subscription" } };
   if (preset === "claude-subscription") return { provider: "anthropic", model: modelOrKey, apiKey: "", transport: "claude-cli", billing: { mode: "subscription" } };
@@ -287,12 +288,13 @@ export function saveAgentConfig(role: AgentConfigRole, cfg: ProviderConfig): voi
 }
 
 export function saveModelConfig(name: string, cfg: ProviderConfig): void {
-  try {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    const existing = loadConfig();
-    existing.models[name] = cfg;
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(existing, null, 2));
-  } catch { /* 静默失败 */ }
+  if (!name.trim() || ["__proto__","prototype","constructor"].includes(name)) throw new Error("Invalid model registry name");
+  if (!cfg.model.trim()) throw new Error("Model ID is required");
+  validateBillingConfig(cfg);
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  const existing = loadConfig();
+  existing.models[name] = cfg;
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(existing, null, 2));
 }
 
 export function saveAgentModel(role: AgentConfigRole, modelName: string): boolean {

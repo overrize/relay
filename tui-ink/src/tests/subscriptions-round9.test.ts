@@ -99,7 +99,7 @@ test("reported overruns are fully charged, block further work and preserve commu
 });
 
 test("offline usage command stays local and has one unambiguous handler",()=>{
-  const messages:string[]=[];const commands=buildCommands({emitCommandMessage:(s:string)=>messages.push(s)} as any);assert.equal(commands.filter(c=>c.name==="usage").length,1);commands.find(c=>c.name==="usage")!.handler([]);assert.equal(JSON.parse(messages[0]!)[0].state,"unknown");
+  const messages:string[]=[];const commands=buildCommands({emitCommandMessage:(s:string)=>messages.push(s)} as any);assert.equal(commands.filter(c=>c.name==="usage").length,1);commands.find(c=>c.name==="usage")!.handler(["--json"]);assert.equal(JSON.parse(messages[0]!)[0].state,"unknown");
 });
 
 test("budget stop survives restart and blocks automatic requests until an explicit user resume",async()=>{

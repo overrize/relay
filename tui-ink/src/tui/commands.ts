@@ -1,4 +1,5 @@
 import { cachedUsage, refreshUsage, type UsageProvider } from "../subscriptions/usage.js";
+import { formatUsage, formatBudget, formatModelConfig } from "./accountStatus.js";
 import { resolveModelRoute, type ModelProfile } from "../models/routing.js";
 import { saveModelRouting } from "../config.js";
 import { loadConfig as loadBillingConfig, saveModelConfig, validateBillingConfig } from "../config.js";
@@ -152,11 +153,15 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
       applyEvent({ v: 1, type: "message", agent: "pm", to: "user",
         text: `评分已记录：${verdict === "good" ? "👍" : "👎"}${comment ? `  "${comment}"` : ""}` });
     } },
-    { name: "usage", desc: "/usage [refresh] [claude|codex|copilot] — 厂商套餐余量与重置时间（不会增加套餐或发送通知）", handler: (args) => {
-      const provider=args.find(a=>["claude","codex","copilot"].includes(a)) as UsageProvider|undefined, providers:UsageProvider[]=provider?[provider]:["claude","codex","copilot"];
-      if(args.some(a=>a!=="refresh"&&a!==provider)){emitCommandMessage("用法 /usage [refresh] [claude|codex|copilot]");return;}
-      if(args.includes("refresh")){emitCommandMessage("正在异步查询套餐用量，PM 沟通和任务执行继续。未知或失败不会显示为零余额。");void Promise.all(providers.map(p=>refreshUsage(p,{force:true}))).then(values=>emitCommandMessage(JSON.stringify(values,null,2))).catch(()=>emitCommandMessage("套餐用量查询失败，已保留此前数据。"));}
-      else emitCommandMessage(JSON.stringify(providers.map(p=>cachedUsage(p)),null,2));
+    { name: "usage", desc: "/usage [refresh|history] [claude|codex|copilot] [--json] — 套餐状态与查询原因", handler: (args) => {
+      const provider=args.find(a=>["claude","codex","copilot"].includes(a)) as UsageProvider|undefined, refreshing=args.includes("refresh"), providers:UsageProvider[]=provider?[provider]:refreshing?["codex","copilot"]:["claude","codex","copilot"];
+      if(args.some(a=>!["refresh","history","--json",provider].includes(a))||args.filter(a=>["claude","codex","copilot"].includes(a)).length>1){emitCommandMessage("用法 /usage [refresh|history] [claude|codex|copilot] [--json]");return;}
+      const show=(values:ReturnType<typeof cachedUsage>[])=>args.includes("--json")?JSON.stringify(values,null,2):formatUsage(values,args.includes("history"));
+      if(refreshing){emitCommandMessage("正在异步查询套餐用量，PM 沟通和任务执行继续。默认只刷新 Codex/Copilot；Claude 仅显式指定时查询。未知不等于零余额。");void Promise.all(providers.map(p=>refreshUsage(p,{force:true}))).then(values=>emitCommandMessage(show(values))).catch(()=>emitCommandMessage("套餐用量查询失败，已保留此前数据。使用 /usage history 查看已保存的原因。"));}
+      else emitCommandMessage(show(providers.map(p=>cachedUsage(p))));
+    } },
+    { name: "account", desc: "/account — 离线查看模型配置、预算和套餐状态，不触发模型调用", handler: () => {
+      emitCommandMessage([formatModelConfig(loadBillingConfig()),formatBudget(budgetReport(),sessionJournal().bindings()),formatUsage([cachedUsage("claude"),cachedUsage("codex"),cachedUsage("copilot")])].join("\n\n"));
     } },
     { name: "route", desc: "/route [pm|leader|implement|research|review|verify|secretary <模型名...>|api-fallback on|off] — 定位与候选模型链", handler: (args) => {
       try {
@@ -184,7 +189,8 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
     { name: "budget", desc: "/budget [add requests=N tokens=N tools=N usd=N] — 离线查询或显式增加会话总额度", handler: (args) => {
       try {
         if (args[0] === "add") { const additions: Record<string, number> = {}; for (const arg of args.slice(1)) { const [key, value] = arg.split("="); if (!key || !["requests", "tokens", "tools", "usd"].includes(key) || value === undefined) throw new Error("用法：/budget add requests=20 tokens=100000 tools=40"); additions[key] = Number(value); } const j = sessionJournal(), agent = j.binding(getState().selectedAgent)?.conversation ?? j.bindings().find((b) => !b.parent)?.id ?? "pm"; addSessionBudget(agent, additions); }
-        emitCommandMessage(JSON.stringify(budgetReport(), null, 2));
+        if(args[0] && args[0]!=="add" && !(args.length===1&&args[0]==="--json"))throw new Error("用法 /budget [--json] 或 /budget add requests=N tokens=N tools=N usd=N");
+        emitCommandMessage(args.includes("--json")?JSON.stringify(budgetReport(),null,2):formatBudget(budgetReport(),sessionJournal().bindings()));
       } catch (error) { emitCommandMessage(String(error)); }
     } },
     { name: "tasks", desc: "/tasks [pause|resume] [taskId] — 查看任务预算或暂停/恢复后续自动续派", handler: (args) => {
@@ -454,6 +460,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
       switchModelCommand(role, modelName);
     } },
     { name: "connect", desc: "/connect <name> <preset|baseUrl> [modelId] <apiKey> — 注册/更新模型连接", handler: (args) => {
+      if(args.length>4){emitCommandMessage("模型连接参数过多；订阅只需要名称、订阅类型和模型 ID。");return;}
       const [name, preset, modelOrKey, maybeApiKey] = args;
       registerModelCommand(name, preset, modelOrKey, maybeApiKey);
     } },

@@ -18,6 +18,7 @@ export interface Binding {
   goal: string; dispatch?: any; status: "running" | "done" | "failed" | "superseded" | "interrupted";
   outcome?: { seq: number; reason: string; summary: string; evidence: string[]; remaining: string[]; artifacts: string[]; reportedSuccess?: boolean; lastError?: string };
   lastError?: string;
+  modelSelection?: { candidate?: string; model: string; transport: string; billing: string; at: number };
   todos?: any[];
   workId?: string;
 }
@@ -539,6 +540,7 @@ function reduce(p: Projection, e: Entry) {
     if (agent && agent.status !== "superseded") agent.status = "running";
   }
   if(e.kind === "model.budget_resumed") { const resumed=p.agents[e.agent];if(resumed?.revision===e.revision&&resumed.lastError?.includes("SUBSCRIPTION_BUDGET"))delete resumed.lastError; }
+  if(e.kind === "model.selected") { const a=p.agents[e.agent];if(a?.revision===e.revision)a.modelSelection={candidate:e.data.candidate,model:e.data.model,transport:e.data.transport,billing:e.data.billing,at:e.ts}; }
   reduceTask(s, e);
   if (e.kind === "task.acceptance.reconciled" && e.revision === s.revision) { const tool = s.tools[e.data.key]; if (tool?.status === "uncertain") { tool.status = "completed"; tool.ok = false; tool.output = `PM inspected interrupted acceptance; do not replay: ${e.data.reason}`; tool.completedSeq = e.seq; } }
   if (e.kind === "input.accepted") {

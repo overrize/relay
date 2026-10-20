@@ -6,8 +6,10 @@ import { writeSnapshot } from "../memory/atomic.js";
 
 export type UsageProvider = "claude" | "codex" | "copilot";
 export interface UsageWindow { label: string; scope?: string; usedPercent?: number; remainingPercent?: number; resetsAt?: number; remaining?: number; limit?: number; unlimited?: boolean; unit?: string }
-export interface UsageSnapshot { provider: UsageProvider; state: "fresh" | "unknown" | "stale" | "error"; windows: UsageWindow[]; checkedAt: number; observedAt?: number; retryAt?: number; accountKey?: string; errorCode?: string }
-export class UsageError extends Error { constructor(public code: string, public retryAfterMs = 60000) { super(code); } }
+export interface UsageAttempt { id: string; at: number; durationMs: number; state: UsageSnapshot["state"]; code?: string; httpStatus?: number }
+export interface UsageSnapshot { provider: UsageProvider; state: "fresh" | "unknown" | "stale" | "error"; windows: UsageWindow[]; checkedAt: number; observedAt?: number; retryAt?: number; accountKey?: string; errorCode?: string; httpStatus?: number; attempts?: UsageAttempt[] }
+export class UsageError extends Error { constructor(public code: string, public retryAfterMs = 60000, public httpStatus?: number) { super(code); } }
+export const usageSources: Record<UsageProvider,string> = {claude:"Claude usage endpoint",codex:"Codex app-server account/rateLimits/read",copilot:"Copilot SDK account.getQuota"};
 const inflight = new Map<string,Promise<UsageSnapshot>>();
 const fingerprint = (value: string) => createHash("sha256").update(value).digest("hex");
 export function copilotHome() { return path.resolve(process.env.SPAWN_COPILOT_HOME ?? path.join(process.cwd(),".spawn","accounts","copilot")); }
@@ -44,8 +46,9 @@ export async function refreshUsage(provider: UsageProvider, options: {force?:boo
       catch(e:any){if(e.code!=="EEXIST")throw e;if(time-fs.statSync(lock).mtimeMs>30000){fs.unlinkSync(lock);fs.writeFileSync(lock,nonce,{flag:"wx",mode:0o600});held=true;}else return before?{...before,state:before.state==="fresh"?"stale":before.state}:{provider,state:"unknown" as const,windows:[],checkedAt:time,errorCode:"query-in-progress"};}
       const fetcher=options.fetch??(async()=>{const {fetchUsage}=await import("./usageProviders.js");return fetchUsage(provider);});
       let result:UsageSnapshot;
-      try {const windows=await fetcher();result={provider,state:windows.length?"fresh":"unknown",windows,checkedAt:now(),observedAt:now(),accountKey:identity};}
-      catch(error){const e=error instanceof UsageError?error:new UsageError("usage-unavailable");result={provider,state:before?.windows.length?"stale":"error",windows:before?.windows??[],observedAt:before?.observedAt,checkedAt:now(),retryAt:now()+Math.min(1800000,Math.max(5000,e.retryAfterMs)),accountKey:identity,errorCode:e.code};}
+      try {const windows=await fetcher();result={provider,state:windows.length?"fresh":"unknown",windows,checkedAt:now(),observedAt:now(),accountKey:identity,...(!windows.length?{errorCode:"no-quota-data"}:{})};}
+      catch(error){const e=error instanceof UsageError?error:new UsageError("usage-unavailable");result={provider,state:before?.windows.length?"stale":"error",windows:before?.windows??[],observedAt:before?.observedAt,checkedAt:now(),retryAt:now()+Math.min(1800000,Math.max(5000,e.retryAfterMs)),accountKey:identity,errorCode:/^[a-z0-9-]{1,80}$/.test(e.code)?e.code:"usage-unavailable",...(Number.isInteger(e.httpStatus)&&e.httpStatus!>=100&&e.httpStatus!<=599?{httpStatus:e.httpStatus}:{})};}
+      result.attempts=[...(before?.attempts??[]).slice(-9),{id:randomUUID(),at:result.checkedAt,durationMs:Math.max(0,result.checkedAt-time),state:result.state,...(result.errorCode?{code:result.errorCode}:{}),...(result.httpStatus?{httpStatus:result.httpStatus}:{})}];
       writeSnapshot(file,JSON.stringify(result));return result;
     } finally {if(held)try{if(fs.readFileSync(lock,"utf8")===nonce)fs.unlinkSync(lock);}catch{}}
   })();

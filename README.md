@@ -744,3 +744,30 @@ node scripts/verify-copilot.mjs <Copilot模型ID>
 仍有不足：厂商在途费用无法撤回；Codex 普通模式不是远端硬 Token 上限。Claude 使用的 usage 端点与本地凭据文件格式可能变化，当前账号需解决 403 才能验证余额。Copilot 需要有权限的账号完成真实验收，SDK 的部分 quota 接口仍是实验接口，因此固定版本。未覆盖所有 Coding Plan 的余额接口和账号自动轮换；新鲜额度缓存可能有最多 90 秒延迟，不能代替厂商账单硬限额。多进程缓存锁过期回收采用 30 秒租期，长时间系统挂起后可能重复一次只读查询。其他平台未实机验证。
 
 参考：[Copilot 用量接口](https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/usage-and-billing)、[官方 Codex app-server](https://learn.chatgpt.com/docs/app-server)。
+
+## 第十轮：模型、用量和预算状态
+
+按用户要求，Claude 403 暂不排查 host；只保留简明的不可用原因。`/usage refresh` 默认只查 Codex/Copilot，不探测 Claude。`/usage refresh claude` 仍可由用户显式调用；403 显示 `usage-forbidden / HTTP 403`，不推断为登录失效、无余额或确定的 host 故障。
+
+| 命令 | 展示内容 |
+| --- | --- |
+| `/account` | 离线总览：模型配置、有效候选链、工作区预算、厂商套餐缓存 |
+| `/model show` | 注册模型的 API/订阅通道、模型 ID、配置检查、价格是否设置、角色默认和候选链被跳过原因 |
+| `/usage` | 查询来源、新鲜/过期/未知/不可用、数据时间、重置时间、安全错误码和允许重试时间 |
+| `/usage history [codex\|copilot\|claude]` | 当前账号最近 10 次查询的追踪 ID、UTC 时间、耗时、结果和 HTTP 状态；读缓存不会制造查询记录 |
+| `/budget` | 总额度和执行池剩余、PM 沟通预留、API 估价与订阅消耗分列、未定价请求、未结算/不确定消耗、agent 最近实际调用通道和错误类别 |
+| `/usage --json`、`/budget --json` | 保留机器可读输出；`history`/`refresh` 可与 usage 的 `--json` 组合 |
+
+模型配置不等于登录成功，候选链不等于实际调用。新的 `model.selected` 记录投影到持久状态，重启可查看最近一次调用尝试；修改配置对新启动/恢复的 agent 生效。订阅注册误传 API Key、无效计费配置或写入失败不再显示保存成功。显示 API 端点时移除 URL 用户名、密码、路径和查询参数；不显示 API Key。没有模型价格时明确提示可能使用会话估价，不显示为免费；订阅 Token 不换算成厂商套餐剩余或订阅账单。
+
+额度失败记录保存在原有账号隔离缓存中，退避和最后成功数据跨重启保留。旧数据只供参考，不能当作当前额度；查询失败不会阻断 PM 的正常沟通。记录不保存原始错误响应、令牌或邮箱。Copilot 继续保留“待登录验证”，没有用未登录启动结果冒充真实推理成功。
+
+验证：新增 10 项专项测试，全量 **733 项：726 通过、7 项原有 TODO、0 失败**；headless 82 项通过，类型检查与构建通过。真实验证未查询 Claude，Codex 余量查询成功，Copilot 明确返回未登录；真实 Codex PM + API Worker 完成执行期间追问、文件写入、独立验收和发布，并验证总览里的实际通道、计费分列和凭据脱敏。运行：
+
+```text
+cd E:\spawn-work\tui-ink
+npm run build
+node scripts/verify-round10.mjs <账号支持的Codex模型ID>
+```
+
+仍有边界：查询历史只保留当前账号最近 10 次；更早记录没有做长期审计归档。API 金额依赖配置估价，未覆盖各厂商 API 余额查询；本地预算和订阅额度是不同数据源。Copilot 还需登录后做真实推理验收。Codex 普通模式的在途隐藏推理消耗限制同第九轮；Claude host 问题按用户要求暂不继续处理。
