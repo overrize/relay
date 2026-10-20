@@ -20,6 +20,8 @@ export interface BillingConfig {
   /** USD per million tokens; estimates, not an invoice. Subscription usage has no local per-token USD charge. */
   inputUsdPerMillion?: number;
   outputUsdPerMillion?: number;
+  priceSource?: string;
+  priceRecordedAt?: number;
 }
 export interface ProviderConfig {
   transport?: "http" | "claude-cli" | "codex-cli" | "copilot-sdk";
@@ -339,6 +341,9 @@ export function saveWebSearchSelection(providerName: string): boolean {
 
 
 export function validateBillingConfig(config: ProviderConfig): void {
+  const pricing=config.billing;
+  if(pricing?.priceSource!==undefined&&(!/^[-\p{L}\p{N}_.:/]{1,120}$/u.test(pricing.priceSource)))throw new Error("Price source must be a short source label, without credentials or query strings");
+  if(pricing?.priceRecordedAt!==undefined&&(!Number.isFinite(pricing.priceRecordedAt)||pricing.priceRecordedAt<0))throw new Error("Invalid price recording date");
   const b = config.billing;
   if (b && !["api", "subscription"].includes(b.mode)) throw new Error("Billing mode must be api or subscription");
   for (const rate of [b?.inputUsdPerMillion,b?.outputUsdPerMillion]) if (rate !== undefined && (!Number.isFinite(rate) || rate < 0)) throw new Error("Prices must be finite nonnegative USD per million tokens");

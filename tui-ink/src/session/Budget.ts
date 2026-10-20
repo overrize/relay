@@ -4,8 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeSnapshot } from "../memory/atomic.js";
 import { digest } from "./Storage.js";
+import {priceEndpoint} from "./Pricing.js";
 
-export interface BillingSelection { provider?: string; model?: string; transport?: string; billing?: { mode: "api" | "subscription"; inputUsdPerMillion?: number; outputUsdPerMillion?: number } }
+export interface BillingSelection { provider?: string; model?: string; baseUrl?:string; transport?: string; billing?: { mode: "api" | "subscription"; inputUsdPerMillion?: number; outputUsdPerMillion?: number; priceSource?:string; priceRecordedAt?:number } }
 type BillingUsage = { requests: number; tokens: number; microUsd: number };
 export interface SessionBudget {
   unpricedApiRequests?: number;
@@ -53,7 +54,7 @@ export function reserveSessionRequest(agent: string, input: number, output: numb
   const microUsd = Math.ceil(input * inputRate + cap * outputRate);
   if (monetaryCap && u.microUsd + microUsd > costLimit) throw new Error("SESSION_BUDGET_EXHAUSTED: configured cost estimate cap reached");
   const communicationOnly = u.requests >= l.requests - l.communicationRequests || u.tokens + input + cap > l.tokens - l.communicationTokens || !!(monetaryCap && u.microUsd + microUsd > l.microUsd - l.communicationMicroUsd);
-  const id = randomUUID(), reservation = { agent, role: b.parent ? b.role : "PM", conversation:b.conversation, revision:b.revision, taskId:b.workId, transport:selection.transport??"http", communication:canTalk, input, output: cap, tokens: input + cap, microUsd, billingMode: mode, pricingKnown, model: selection.model?.slice(0,160), provider: selection.provider?.slice(0,80), inputRate, outputRate };
+  const id = randomUUID(), reservation = { priceSource:selection.billing?.priceSource??(pricingKnown?"call-time-config":undefined),priceRecordedAt:selection.billing?.priceRecordedAt, endpoint:priceEndpoint(selection.provider,selection.baseUrl), agent, role: b.parent ? b.role : "PM", conversation:b.conversation, revision:b.revision, taskId:b.workId, transport:selection.transport??"http", communication:canTalk, input, output: cap, tokens: input + cap, microUsd, billingMode: mode, pricingKnown, model: selection.model?.slice(0,160), provider: selection.provider?.slice(0,80), inputRate, outputRate };
   j.append("budget.reserved", b.conversation, agent, b.revision, { id, reservation });
   persistFloor();
   return { id, maxOutput: cap, maxInput: input, communicationOnly };

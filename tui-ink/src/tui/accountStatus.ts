@@ -49,7 +49,7 @@ export function formatModelConfig(cfg: Config): string {
     try {const r=resolveModelRoute(cfg,role,profile);return `${profile}: ${r.candidates.map(c=>c.name).join(" → ")}${r.skipped.length?`；跳过 ${r.skipped.map(s=>`${s.name} (${s.reason})`).join(", ")}`:""}`;}
     catch {return `${profile}: 无可用候选或配置无效；检查 /route、凭据与计费模式`;}
   });
-  return `默认角色：${Object.entries(cfg.agents).map(([role,c])=>`${role}=${c.model}`).join("；")}\n已注册模型：\n${models.join("\n")}\n\n有效候选链（不代表已登录）：\n${routes.join("\n")}\n订阅后 API 降级：${cfg.routing?.allowApiFallback?"已显式允许":"关闭"}；修改对新启动/恢复的 agent 生效。\n/connect <名称> <claude-subscription|codex-subscription|copilot-subscription> <模型ID>\n/connect <名称> <preset|baseUrl> <模型ID> <apiKey>\n/billing <名称> api <输入美元/百万> <输出美元/百万>；/route <定位> <名称...>`;
+  return `默认角色：${Object.entries(cfg.agents).map(([role,c])=>`${role}=${c.model}`).join("；")}\n已注册模型：\n${models.join("\n")}\n\n有效候选链（不代表已登录）：\n${routes.join("\n")}\n订阅后 API 降级：${cfg.routing?.allowApiFallback?"已显式允许":"关闭"}；修改对新启动/恢复的 agent 生效。\n/connect <名称> <claude-subscription|codex-subscription|copilot-subscription> <模型ID>\n/connect <名称> <preset|baseUrl> <模型ID> <apiKey>\n/billing <名称> api <输入美元/百万> <输出美元/百万>；/route <定位> <名称...>\n/price <名称> <输入USD/M> <输出USD/M> source=来源 [since=ISO日期] [legacy]：补算历史，/audit 查看来源与结果`;
 }
 export function formatBudget(report: ReturnType<typeof budgetReport>, bindings: Binding[] = []): string {
   if (!("used" in report) || !report.used || !report.limits) return "error" in report ? "预算读取失败；恢复执行前需检查账本。" : "预算尚未初始化；第一次受管理调用后建立。";

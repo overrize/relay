@@ -1,6 +1,7 @@
 import { cachedUsage, refreshUsage, type UsageProvider } from "../subscriptions/usage.js";
 import { formatUsage, formatBudget, formatModelConfig } from "./accountStatus.js";
 import { auditReport, formatAudit, type AuditFilter } from "../session/Audit.js";
+import {recordPrice} from "../session/Pricing.js";
 import { resolveModelRoute, type ModelProfile } from "../models/routing.js";
 import { saveModelRouting } from "../config.js";
 import { loadConfig as loadBillingConfig, saveModelConfig, validateBillingConfig } from "../config.js";
@@ -166,9 +167,9 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
     { name: "account", desc: "/account — 离线查看模型配置、预算和套餐状态，不触发模型调用", handler: () => {
       emitCommandMessage([formatModelConfig(loadBillingConfig()),formatBudget(budgetReport(),sessionJournal().bindings()),formatUsage([cachedUsage("claude"),cachedUsage("codex"),cachedUsage("copilot")])].join("\n\n"));
     } },
-    { name: "audit", desc: "/audit [model=ID task=ID before=序号 limit=40] [--json] — 长期用量与停止原因审计", handler: (args) => {
+    { name: "audit", desc: "/audit [model=ID task=ID before=序号 limit=40] [--json] [--rebuild] — 长期用量与停止原因审计", handler: (args) => {
       const filter:AuditFilter={};
-      try{for(const arg of args){if(arg==="--json")continue;const split=arg.indexOf("="),key=arg.slice(0,split),value=arg.slice(split+1);if(split<1||!value||!["model","task","before","limit"].includes(key))throw new Error("参数无效");if(key==="before"||key==="limit")filter[key]=Number(value);else filter[key as "model"|"task"]=value;}}
+      try{for(const arg of args){if(arg==="--json")continue;if(arg==="--rebuild"){filter.rebuild=true;continue;}const split=arg.indexOf("="),key=arg.slice(0,split),value=arg.slice(split+1);if(split<1||!value||!["model","task","before","limit"].includes(key))throw new Error("参数无效");if(key==="before"||key==="limit")filter[key]=Number(value);else filter[key as "model"|"task"]=value;}}
       catch{emitCommandMessage("用法 /audit [model=模型ID task=任务ID before=序号 limit=1..200] [--json]");return;}
       const budget=budgetReport();if("error" in budget){emitCommandMessage("预算账本不可读；审计前请检查账本完整性。");return;}
       emitCommandMessage("正在异步读取受保护历史，PM 沟通继续。费用是调用时的配置估价；查询不会调用模型。");
@@ -188,6 +189,18 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
         }
         emitCommandMessage("模型路由已保存；新启动/恢复的 agent 生效，历史预算和任务副本保留。候选顺序决定优先级；订阅后的 API 默认不参与降级。");
       } catch(error) { emitCommandMessage(String(error)); }
+    } },
+    { name: "price", desc: "/price <注册模型> <输入USD/M> <输出USD/M> source=来源 [since=ISO日期] [legacy] — 记录有来源的价格并补算历史", handler: (args) => {
+      try {
+        const [name,input,output,...options]=args,model=name&&loadBillingConfig().models[name];
+        const source=options.find(v=>v.startsWith("source="))?.slice(7),date=options.find(v=>v.startsWith("since="))?.slice(6);
+        if(!model||input===undefined||output===undefined||!source||options.some(v=>v!=="legacy"&&!v.startsWith("source=")&&!v.startsWith("since="))||(model.transport&&model.transport!=="http")||model.billing?.mode==="subscription")throw Error("用法 /price <API注册模型> <输入USD/M> <输出USD/M> source=来源标签 [since=ISO日期] [legacy]；省略日期表示明确补算全部历史；legacy 明确允许匹配旧记录中未知的端点。");
+        const updated={...model,billing:{mode:"api" as const,inputUsdPerMillion:Number(input),outputUsdPerMillion:Number(output)}};
+        validateBillingConfig(updated);
+        const price=recordPrice(sessionJournal(),model,Number(input),Number(output),{source,since:date?Date.parse(date):0,legacy:options.includes("legacy")});
+        saveModelConfig(name!,{...updated,billing:{...updated.billing,priceSource:price.source,priceRecordedAt:price.recordedAt}});
+        emitCommandMessage(`价格来源 ${price.source} 已持久记录；/audit 显示后补估算。新启动/恢复的 agent 使用新价格。原账本、已用预算和不确定请求预留保持原值；缺实测用量不会编造费用。`);
+      }catch(error){emitCommandMessage(String(error));}
     } },
     { name: "billing", desc: "/billing <modelName> <api|subscription> [inputUSD/M outputUSD/M] — 配置模型计费方式", handler: (args) => {
       try {

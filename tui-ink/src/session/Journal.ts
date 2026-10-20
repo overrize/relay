@@ -68,7 +68,7 @@ export class SessionJournal {
   readonly stats = { checkpointUsed: false, replayedEvents: 0, bytesRead: 0 };
   readonly file: string;
   private readonly segmentDirectory: string;
-  constructor(readonly root = process.cwd(), private readonly options: { segmentBytes?: number; verifyHistory?: boolean; automatic?: boolean; policy?: Partial<StoragePolicy>; allowRestoreTransaction?: boolean } = {}) {
+  constructor(readonly root = process.cwd(), private readonly options: { segmentBytes?: number; verifyHistory?: boolean; automatic?: boolean; policy?: Partial<StoragePolicy>; allowRestoreTransaction?: boolean; cacheCheckpoint?:boolean } = {}) {
     if (!options.allowRestoreTransaction && fs.existsSync(path.join(root, ".spawn", "restore-transaction.json"))) throw new Error("Interrupted restore detected; finish restore repair before starting the application");
     this.file = path.join(root, ".spawn", "events", "journal.jsonl");
     this.segmentDirectory = path.join(path.dirname(this.file), "segments");
@@ -140,6 +140,13 @@ export class SessionJournal {
     for (const segment of segments.slice(skip)) {
       this.replay(fs.readFileSync(path.join(this.segmentDirectory, segment.name)), state, true);
       if (state.seq !== Number(segmentPattern.exec(segment.name)![2])) throw new Error("Sealed journal segment boundary mismatch");
+    }
+    // Imported history or a lost checkpoint should pay the sealed replay cost
+    // once. This disposable checkpoint has the same source/anchor validation
+    // as checkpoints written during ordinary rotation.
+    if(this.options.cacheCheckpoint&&segments.length&&skip===0){
+      const body={version:3 as const,baseGeneration:this.base?.generation??0,segments,state};
+      writeSnapshot(path.join(path.dirname(this.file),"checkpoint.json"),JSON.stringify({...body,digest:checksum(body)}));
     }
     this.state = state; this.offset = 0; this.activeStamp = "";
     this.segments = segments; this.segmentStart = state.seq + 1;
@@ -233,12 +240,17 @@ export class SessionJournal {
   binding(id: string): Binding | undefined { this.refresh(); return structuredClone(this.state.agents[id]); }
   budget() { this.refresh(); return structuredClone(this.state.budget); }
   sequence() { this.refresh(); return { seq: this.state.seq, lastHash: this.state.lastHash }; }
-  /** Stable, asynchronous scan of protected history, including cold archives.
-   * The callback cannot see writes after the captured boundary. */
-  async visitHistory(use: (entry: Entry) => void | Promise<void>) {
+  /** Source metadata for validating a disposable audit checkpoint. */
+  historySources() {
+    return this.locked(() => ({...this.sequence(), sources:this.sources().map(s=>({key:s.key,from:s.from,to:s.to,size:s.size,fingerprint:s.fingerprint,file:s.file})),budget:structuredClone(this.state.budget)}),false);
+  }
+  /** Stable asynchronous history scan. An incremental caller must first verify
+   * the retained prefix's source manifest and hash, as AuditIndex does. */
+  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string}) {
     const snapshot = this.locked(() => ({ ...this.sequence(), sources: this.sources(), budget:structuredClone(this.state.budget) }), false);
-    let visited = 0, previousHash: string | undefined = "";
+    let visited = after?.seq??0, previousHash: string | undefined = after?.lastHash??"";
     for (const request of snapshot.sources) {
+      if(request.to<=visited)continue;
       await this.withSource(request, async (source, read) => {
         for (const entry of await read()) {
           if (entry.seq < request.from || entry.seq > request.to || entry.seq > snapshot.seq || entry.seq <= visited) continue;
