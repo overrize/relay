@@ -76,9 +76,10 @@ test("Claude subscription catalog is prepared without probing Claude",async()=>{
 test("rendered wizard uses arrows, searchable providers and Enter rather than numeric shortcuts",async()=>{
   const input=new PassThrough(),output=new PassThrough();Object.assign(input,{isTTY:true,setRawMode:()=>{},ref:()=>{},unref:()=>{}});Object.assign(output,{isTTY:true,columns:110,rows:35});
   let frames="",cancelled=0;output.on("data",chunk=>{frames+=chunk.toString();});
-  const widget=render(React.createElement(LoginWizard,{onDone:()=>assert.fail("No key was configured"),onCancel:()=>cancelled++}),{stdin:input as any,stdout:output as any,stderr:output as any,exitOnCtrlC:false,patchConsole:false});
+  const widget=render(React.createElement(LoginWizard,{onDone:()=>assert.fail("No key was configured"),onCancel:()=>cancelled++}),{stdin:input as any,stdout:output as any,stderr:output as any,exitOnCtrlC:false,patchConsole:false,debug:true});
   const pause=()=>new Promise(r=>setTimeout(r,40));
-  try{await pause();input.write("2");await pause();assert.equal(frames.includes("搜索供应商"),false);input.write("\x1b[B");await pause();input.write("\r");await pause();assert.match(frames,/搜索供应商/);input.write("deepseek");await pause();input.write("\r");await pause();assert.match(frames,/API Key（隐藏输入/);assert.doesNotMatch(frames,/1\. 账号登录/);input.write("\x1b");await pause();assert.equal(cancelled,1);}finally{widget.unmount();input.end();output.end();}
+  const until=async(check:()=>boolean)=>{const end=Date.now()+5000;while(!check()){if(Date.now()>end)assert.fail("Wizard did not render expected state");await new Promise(r=>setTimeout(r,10));}};
+  try{await until(()=>frames.includes("账号登录"));input.write("2");await pause();assert.equal(frames.includes("搜索供应商"),false);input.write("\x1b[B");await until(()=>frames.includes("→ API Key"));input.write("\r");await until(()=>frames.includes("搜索供应商"));assert.match(frames,/搜索供应商/);const cursor=frames.length;input.write("deepseek");await until(()=>frames.slice(cursor).includes("deepseek"));input.write("\r");await until(()=>frames.includes("API Key（隐藏输入"));assert.match(frames,/API Key（隐藏输入/);assert.doesNotMatch(frames,/1\. 账号登录/);input.write("\x1b");await until(()=>cancelled===1);assert.equal(cancelled,1);}finally{widget.unmount();input.end();output.end();}
 });
 test("PM labels use the configured PM route before startup and actual model after startup",()=>{
   const cfg=loadConfig();cfg.models.kimi={provider:"openai",model:"kimi-k3",apiKey:"fixture"};cfg.agents.leader.model="kimi";cfg.routing={profiles:{pm:["kimi"]}};

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {splitCommand} from "../tui/splitCommand.js";
 import {syncModelPrices} from "../session/PriceSync.js";
 import { sessionJournal } from "../session/Journal.js";
 import { formatModelConfig } from "../tui/accountStatus.js";
@@ -491,7 +492,7 @@ function App() {
   });
 
   const runCommand = (cmd: string) => {
-    const parts = cmd.slice(1).split(/\s+/);
+    const parts = /^prices(?:\s|$)/.test(cmd.slice(1))?splitCommand(cmd.slice(1)):cmd.slice(1).split(/\s+/);
     const head = parts[0]!;
     const c = COMMANDS.find((c) => c.name === head);
     if (c) c.handler(parts.slice(1));

@@ -103,9 +103,11 @@ export function syncModelPrices(models:PriceModel[],root=process.cwd(),options:{
   const promise=performSync(selected,root,options).finally(()=>running.delete(key));running.set(key,promise);return promise;
 }
 export function formatPriceStatus(models:PriceModel[],root=process.cwd()){
-  const j=sessionJournal(root),prices=j.prices(),statuses=j.priceStatus();
+  const j=sessionJournal(root),prices=j.effectivePrices(),statuses=j.priceStatus();
   return ["可信价格同步（手工配置优先，自动价格为文本推理估算；不含税费/工具调用/交易汇差）",...models.map(m=>{
     if(m.billing?.mode==="subscription"||(m.transport&&m.transport!=="http"))return `${m.model} · 订阅，API 单价不适用`;
+    const contract=priceFor({provider:m.provider,model:m.model,endpoint:priceEndpoint(m.provider,m.baseUrl),at:Date.now()} as any,prices);
+    if(contract?.origin==="contract")return `${m.model} · 合同估价 $${contract.inputRate}/$${contract.outputRate} USD/M；来源 ${contract.source}；版本 ${contract.version}；生效 ${new Date(contract.since).toISOString()} 至 ${contract.expiresAt===undefined?"无固定终止":new Date(contract.expiresAt).toISOString()}；显式模型手工价仍优先`;
     const source=priceSourceFor(m);if(!source)return `${m.model} · 未支持/代理端点，保留手工价格`;
     const status=statuses.find(s=>s.source===priceSources[source]),price=priceFor({provider:m.provider,model:m.model,endpoint:priceEndpoint(m.provider,m.baseUrl),at:Date.now()} as any,prices);
     const manual=m.billing?.inputUsdPerMillion!==undefined&&m.billing.outputUsdPerMillion!==undefined?`手工价 $${m.billing.inputUsdPerMillion}/$${m.billing.outputUsdPerMillion} 优先；官方候选：`:"";

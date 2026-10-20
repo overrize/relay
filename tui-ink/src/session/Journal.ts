@@ -35,6 +35,9 @@ export interface CurrentState {
 }
 export interface Projection {
   officialPrices?:Record<string,PriceDefinition>;
+  contractPrices?:PriceDefinition[];
+  priceTrust?:Record<string,string>;
+  pricingRevision?:number;
   priceSync?:Record<string,PriceSyncStatus>;
   budget?: SessionBudget;
   seq: number; lastHash: string; agents: Record<string, Binding>; conversations: Record<string, CurrentState>;
@@ -199,18 +202,25 @@ export class SessionJournal {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const lock = `${this.file}.lock`;
     let fd: number;
-    try { fd = fs.openSync(lock, "wx", 0o600); }
-    catch (error: any) {
-      if (error.code !== "EEXIST") throw error;
-      let owner: number;
-      try { owner = Number(fs.readFileSync(lock, "utf8")); } catch { throw new Error("Session journal lock unavailable"); }
-      if (!Number.isSafeInteger(owner) || owner <= 0) throw new Error("Invalid session journal lock; inspect before retrying");
-      try { process.kill(owner, 0); } catch (e: any) {
-        if (e.code !== "ESRCH") throw e;
-        fs.unlinkSync(lock);
-        return this.locked(work);
+    const deadline=Date.now()+1000,wait=new Int32Array(new SharedArrayBuffer(4));
+    for(;;){
+      try{fd=fs.openSync(lock,"wx",0o600);break;}
+      catch(error:any){
+        if(error.code!=="EEXIST")throw error;
+        let owner=0;
+        try{owner=Number(fs.readFileSync(lock,"utf8"));}catch{/* A writer can release between open and read. */}
+        if(Number.isSafeInteger(owner)&&owner>0){
+          try{process.kill(owner,0);}catch(e:any){
+            if(e.code!=="ESRCH")throw e;
+            try{if(fs.readFileSync(lock,"utf8")===String(owner))fs.unlinkSync(lock);}catch(e:any){if(e.code!=="ENOENT")throw e;}
+            if(Date.now()<deadline)continue;
+          }
+        }
+        if(Date.now()>=deadline)throw new Error("Another process is writing this session; retry later");
+        // Worker-thread readers may briefly hold this lock. Wait only a bounded
+        // interval; a live/invalid owner is never force-unlocked.
+        Atomics.wait(wait,0,0,5);
       }
-      throw new Error("Another process is writing this session; retry later");
     }
     try {
       fs.writeFileSync(fd, String(process.pid)); if (durable) fs.fsyncSync(fd);
@@ -224,8 +234,9 @@ export class SessionJournal {
       return work();
     } finally { fs.closeSync(fd); fs.unlinkSync(lock); }
   }
-  append(kind: string, conversation: string, agent: string, revision: number, data: any): Entry {
+  append(kind: string, conversation: string, agent: string, revision: number, data: any, guard?:(state:Readonly<Projection>)=>void): Entry {
     return this.locked(() => {
+      guard?.(this.state);
       const body = { version: 1 as const, seq: this.state.seq + 1, id: randomUUID(), ts: Date.now(), kind, conversation, agent, revision, data };
       const event: Entry = { ...body, hash: hash(body, this.state.lastHash) };
       const line = JSON.stringify(event) + "\n";
@@ -244,6 +255,9 @@ export class SessionJournal {
   binding(id: string): Binding | undefined { this.refresh(); return structuredClone(this.state.agents[id]); }
   budget() { this.refresh(); return structuredClone(this.state.budget); }
   prices(){this.refresh();return structuredClone(Object.values(this.state.officialPrices??{}));}
+  priceRevision(){this.refresh();return this.state.pricingRevision??0;}
+  trustedPriceTable(digest:string){this.refresh();return this.state.priceTrust?.[digest];}
+  effectivePrices(){this.refresh();return structuredClone([...Object.values(this.state.officialPrices??{}),...(this.state.contractPrices??[])]);}
   priceStatus(){this.refresh();return structuredClone(Object.values(this.state.priceSync??{}));}
   sequence() { this.refresh(); return { seq: this.state.seq, lastHash: this.state.lastHash }; }
   /** Source metadata for validating a disposable audit checkpoint. */
@@ -547,6 +561,9 @@ export class SessionJournal {
 
 function reduce(p: Projection, e: Entry) {
   reduceBudget(p, e);
+  if(e.kind.startsWith("pricing."))p.pricingRevision=e.seq;
+  if(e.kind==="pricing.source_trusted"){p.priceTrust??={};p.priceTrust[e.data.digest]=e.data.issuer;}
+  if(e.kind==="pricing.imported"){p.contractPrices??=[];p.contractPrices.push(...e.data.prices);}
   if(e.kind==="pricing.defined"&&e.data.origin==="official"){
     p.officialPrices??={};p.officialPrices[JSON.stringify([e.data.provider,e.data.model,e.data.endpoint])]=e.data;
   }

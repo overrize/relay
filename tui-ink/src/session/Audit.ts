@@ -51,6 +51,7 @@ export async function auditReport(root=process.cwd(), filter:AuditFilter={}) {
   const boundary=await j.visitHistory((e:Entry)=>{
     visited++;
     if(e.kind==="pricing.sync"){syncStatus.set(e.data.source,e.data);remember({seq:e.seq,at:e.ts,agent:e.agent,conversation:e.conversation,revision:e.revision,id:e.id,kind:"price-sync",priceSource:e.data.source,state:e.data.state,reason:e.data.code??"price-source-checked"});}
+    if(e.kind==="pricing.imported"){prices.push(...e.data.prices.map(validatePrice));pricesChanged=true;remember({seq:e.seq,at:e.ts,agent:e.agent,conversation:e.conversation,revision:e.revision,id:e.id,kind:"price-import",state:"imported",reason:"local-reviewed-table",priceSource:e.data.digest});}
     if(e.kind==="pricing.defined"){prices.push(validatePrice(e.data));pricesChanged=true;}
     if(e.kind==="task.attempt")agentTasks.set(e.data.agent,e.data.id);
     if(e.kind==="agent.bound"&&e.data.workId)agentTasks.set(e.agent,e.data.workId);

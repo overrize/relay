@@ -37,7 +37,7 @@ function ensure(agent: string,catalogPriced=false) {
 }
 export function reserveSessionRequest(agent: string, input: number, output: number, communication = false, selection: BillingSelection = {}) {
   const mode = selection.billing?.mode ?? "api",journal=sessionJournal();
-  const quote=mode==="api"&&selection.billing?.inputUsdPerMillion===undefined&&selection.billing?.outputUsdPerMillion===undefined?priceFor({provider:selection.provider,model:selection.model,endpoint:priceEndpoint(selection.provider,selection.baseUrl),at:Date.now()} as any,journal.prices()):undefined;
+  const quote=mode==="api"&&selection.billing?.inputUsdPerMillion===undefined&&selection.billing?.outputUsdPerMillion===undefined?priceFor({provider:selection.provider,model:selection.model,endpoint:priceEndpoint(selection.provider,selection.baseUrl),at:Date.now()} as any,journal.effectivePrices()):undefined;
   const scope = ensure(agent,!!quote); if (!scope) return undefined;
   const { j, b, budget } = scope, { limits: l, used: u } = budget;
   const inputRate = mode === "subscription" ? 0 : selection.billing?.inputUsdPerMillion ?? quote?.inputRate ?? l.inputRate;

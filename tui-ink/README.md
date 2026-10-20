@@ -2,6 +2,8 @@
 
 多 agent TUI 的实现包。项目介绍和快速上手见 [../README.md](../README.md)。
 
+合同价与历史价目表导入见 [价格导入说明](docs/price-import.md)。
+
 ---
 
 ## 常用命令

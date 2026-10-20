@@ -1,3 +1,4 @@
+import {trustPriceTable,importPriceTable} from "../session/PriceImport.js";
 import { cachedUsage, refreshUsage, type UsageProvider } from "../subscriptions/usage.js";
 import { formatUsage, formatBudget, formatModelConfig } from "./accountStatus.js";
 import { formatAudit, type AuditFilter } from "../session/Audit.js";
@@ -193,6 +194,12 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
       } catch(error) { emitCommandMessage(String(error)); }
     } },
     { name:"prices",desc:"/prices [sync|history] — 自动价格来源、有效期、失败原因与变更追溯",handler:args=>{
+      if(args[0]==="trust"||args[0]==="import"){
+        const [action,file,...flags]=args;
+        if(!file||flags.some(f=>action==="trust"?!f.startsWith("issuer="):!f.startsWith("expect=")&&f!=="--apply")||new Set(flags.map(f=>f.split("=")[0])).size!==flags.length){emitCommandMessage('用法 /prices trust "文件" issuer=来源机构 或 /prices import "文件" [--apply] [expect=预览摘要]');return;}
+        emitCommandMessage("正在校验价目表；PM 沟通继续。默认仅预览，--apply 整批提交。");
+        void Promise.resolve().then(async()=>action==="trust"?trustPriceTable(process.cwd(),file,flags.find(f=>f.startsWith("issuer="))?.slice(7)??""):importPriceTable(process.cwd(),file,{apply:flags.includes("--apply"),expect:flags.find(f=>f.startsWith("expect="))?.slice(7)})).then(result=>emitCommandMessage(JSON.stringify("prices" in result?{...result,prices:result.prices?.slice(0,20),note:"最多显示20条；CLI 可导出完整预览。"}:result,null,2))).catch(e=>emitCommandMessage(/^PRICE_IMPORT_[A-Z_]+$/.test(e.message)?`${e.message}${e.row?`（第 ${e.row} 条价格）`:""}`:"PRICE_IMPORT_FILE_OR_HISTORY_ERROR"));return;
+      }
       if(args.length>1||args[0]&&!["sync","history"].includes(args[0])){emitCommandMessage("用法 /prices [sync|history]");return;}
       if(args[0]==="history"){
         emitCommandMessage("正在后台读取价格版本，PM 沟通继续。");void auditReport().then(r=>emitCommandMessage(JSON.stringify({totalObservations:r.priceDefinitions.length,latest:r.priceDefinitions.slice(-100),note:"最近100条；完整版本随受保护历史保留，/audit --json 可导出。"},null,2))).catch(()=>emitCommandMessage("价格版本读取失败：请检查历史完整性或稍后重试。"));return;
