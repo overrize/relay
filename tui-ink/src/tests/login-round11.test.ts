@@ -1,3 +1,4 @@
+import {stripVTControlCharacters} from "node:util";
 import {test,beforeEach,afterEach} from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -75,7 +76,7 @@ test("Claude subscription catalog is prepared without probing Claude",async()=>{
 });
 test("rendered wizard uses arrows, searchable providers and Enter rather than numeric shortcuts",async()=>{
   const input=new PassThrough(),output=new PassThrough();Object.assign(input,{isTTY:true,setRawMode:()=>{},ref:()=>{},unref:()=>{}});Object.assign(output,{isTTY:true,columns:110,rows:35});
-  let frames="",cancelled=0;output.on("data",chunk=>{frames+=chunk.toString();});
+  let frames="",rawFrames="",cancelled=0;output.on("data",chunk=>{rawFrames+=chunk.toString();frames=stripVTControlCharacters(rawFrames);});
   const widget=render(React.createElement(LoginWizard,{onDone:()=>assert.fail("No key was configured"),onCancel:()=>cancelled++}),{stdin:input as any,stdout:output as any,stderr:output as any,exitOnCtrlC:false,patchConsole:false,debug:true});
   const pause=()=>new Promise(r=>setTimeout(r,40));
   const until=async(check:()=>boolean)=>{const end=Date.now()+5000;while(!check()){if(Date.now()>end)assert.fail("Wizard did not render expected state");await new Promise(r=>setTimeout(r,10));}};

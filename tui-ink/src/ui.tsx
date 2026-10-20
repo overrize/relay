@@ -944,11 +944,11 @@ export function ModelBar({
   onConfirm: (role: AgentConfigRole, model: string) => void;
   onCancel: () => void;
 }) {
-  const [roleIndex,setRoleIndex]=useState(Math.max(0,MODEL_ROLES.indexOf(currentRole))),[search,setSearch]=useState(""),[selected,setSelected]=useState(0),[favorites,setFavorites]=useState<string[]>(uiPreferences().favorites);
+  const [roleIndex,setRoleIndex]=useState(Math.max(0,MODEL_ROLES.indexOf(currentRole))),[search,setSearch]=useState(""),[selected,setSelected]=useState(Math.max(0,((modelChoices??MODEL_CHOICES) as readonly string[]).indexOf(currentModelByRole[currentRole]))),[favorites,setFavorites]=useState<string[]>(uiPreferences().favorites);
   const role=MODEL_ROLES[roleIndex]!,choices=[...(modelChoices??MODEL_CHOICES)].filter(name=>(name+" "+(modelDescriptions?.[name]??"")).toLowerCase().includes(search.toLowerCase())),index=Math.min(selected,Math.max(0,choices.length-1)),start=Math.max(0,index-3);
   useInput((char,key)=>{
     if(key.escape||key.ctrl&&char==="c"){onCancel();return;}
-    if(key.tab){setRoleIndex(n=>(n+1)%MODEL_ROLES.length);setSelected(0);return;}
+    if(key.tab){const next=(roleIndex+1)%MODEL_ROLES.length;setRoleIndex(next);setSelected(Math.max(0,choices.indexOf(currentModelByRole[MODEL_ROLES[next]!]))) ;return;}
     if(key.upArrow){setSelected(n=>choices.length?(n+choices.length-1)%choices.length:0);return;}
     if(key.downArrow){setSelected(n=>choices.length?(n+1)%choices.length:0);return;}
     if(key.ctrl&&char==="f"&&choices[index]){setFavorites(toggleFavorite(choices[index]!));return;}

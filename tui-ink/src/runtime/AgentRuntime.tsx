@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {ShortcutInput} from "../tui/ShortcutInput.js";
 import {configuredModels,cycleModel,uiPreferences,nextReasoning} from "../tui/interaction.js";
 import {splitCommand} from "../tui/splitCommand.js";
 import {syncModelPrices} from "../session/PriceSync.js";
@@ -27,7 +28,6 @@ import { cancelAllAgentTools } from "../tools/command.js";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { render, useApp, useInput, useStdin, Box, Text } from "ink";
-import { Transform } from "node:stream";
 import { execSync, spawnSync, spawn as nodeSpawn } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
@@ -868,7 +868,7 @@ function App() {
       if(code===0x04){if(!input)requestExit(true);return;}
       if(code===0x07){setViewMode(v=>v==="agents"?"chat":"agents");return;}
       if(code===0x0f){setShowTools(v=>!v);return;}
-      if(code===0x10){const cfg=loadConfig(),role=selectedConfigRole(),chosen=cycleModel(cfg.models,cfg.agents[role].model,1,uiPreferences().favorites);if(chosen)confirmModelChoice(role,chosen);else emitCommandMessage("暂无已接入模型，请 /login。");}
+      if(code===0x10||code===0x80){const cfg=loadConfig(),role=selectedConfigRole(),chosen=cycleModel(cfg.models,cfg.agents[role].model,code===0x80?-1:1,uiPreferences().favorites);if(chosen)confirmModelChoice(role,chosen);else emitCommandMessage("暂无已接入模型，请 /login。");}
     };
     return()=>{controlKeyHandler=null;};
   });
@@ -1292,20 +1292,11 @@ if (_rgCheck.error || _rgCheck.status !== 0) {
 // see that file for why an async stdout write does not survive exit on Windows.
 writeTermSync(DISABLE_MOUSE_TRACKING);
 
-const filteredStdin = new Transform({
-  transform(chunk, _encoding, callback) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    // Strip control-shortcut bytes BEFORE Ink/ink-text-input sees them, so the
-    // input field never appends 't'/'l' on Ctrl+T / Ctrl+L. Fire the app handler
-    // instead (same pattern as Ctrl+C). 0x14=Ctrl+T, 0x0C=Ctrl+L, 0x03=Ctrl+C.
-    if (buf.includes(0x03)) { if(cancelLoginFromSignal)cancelLoginFromSignal();else {const r = requestExitFromSignal; if (r) r(); else process.exit(130);} }
-    if (buf.includes(0x14)) ctrlTHandler?.();
-    if (buf.includes(0x0c)) ctrlLHandler?.();
-    for(const code of [0x04,0x07,0x0f,0x10])if(buf.includes(code))controlKeyHandler?.(code);
-    const cleaned = Buffer.from(buf.filter((b) => ![0x03,0x14,0x0c,0x04,0x07,0x0f,0x10].includes(b)));
-    if (cleaned.length > 0) this.push(cleaned);
-    callback();
-  },
+const filteredStdin = new ShortcutInput(code=>{
+  if(code===0x03){if(cancelLoginFromSignal)cancelLoginFromSignal();else if(requestExitFromSignal)requestExitFromSignal();else process.exit(130);}
+  else if(code===0x14)ctrlTHandler?.();
+  else if(code===0x0c)ctrlLHandler?.();
+  else controlKeyHandler?.(code);
 });
 process.stdin.pipe(filteredStdin, { end: false });
 
