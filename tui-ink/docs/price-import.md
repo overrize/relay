@@ -127,8 +127,50 @@ node scripts/import-prices.mjs replace <DIGEST> "E:\contracts\corrected.json" --
 - **已经预留、已经结算或结果不确定的调用，保留原价格快照和预算金额。** 即便在 HTTP 请求执行期间修订，结算仍按预留时单价。后续请求重新选价；选择与预留之间遇到修订会在发出请求前有界重试。
 - 缺价历史调用的后补估算会按当前有效的修订表重新计算，并保持“后补”标记；撤销后缺少有效报价则恢复为缺价。不会把后补差额写入原费用或已消费预算。
 - 撤销后可回落到同一精确官方端点的有效官方报价，或原有显式手工单价；代理端点不会使用其他地址的官方价格。没有有效价格且启用了 USD 预算上限时，新调用明确停止，不把未知费用当免费。
-- 目前操作粒度为完整导入批次，不支持只撤销其中一行、跨机构/端点的原子迁移或厂商数字签名认证；不会自动创建退款或账单调整记录。
+- 支持整批与精确单行撤销/替换；跨机构或端点的价格迁移使用明确的 migrate 操作（见下一节）。仍不支持厂商数字签名认证，也不会自动创建退款或账单调整记录。
 
-新增错误码：`TARGET_DIGEST`（不是完整摘要）、`TARGET_NOT_FOUND`、`TARGET_RETIRED`、`RETIRED_BATCH`、`REVISION_REASON`、`REPLACEMENT_FILE`、`REPLACE_SAME_BATCH`、`REPLACEMENT_ALREADY_KNOWN`、`REPLACEMENT_SCOPE`。既有来源、区间冲突和预览失效错误码继续适用。
+新增错误码：`TARGET_DIGEST`（不是完整摘要或规范行版本 ID）、`TARGET_NOT_FOUND`、`TARGET_RETIRED`、`RETIRED_BATCH`、`REVISION_REASON`、`REPLACEMENT_FILE`、`REPLACE_SAME_BATCH`、`REPLACEMENT_ALREADY_KNOWN`、`REPLACEMENT_SCOPE`。既有来源、区间冲突和预览失效错误码继续适用。
 
 真实端到端验证：`npm run build` 后运行 `node scripts/verify-round15.mjs`。在独立工作区使用真实 Kimi PM 和 DeepSeek Worker；本机转发代理在第一条 Worker 请求尚未返回时等待 PM 真实进度回复并替换价格，在第二条请求进行中撤销更正表。校验两次调用分别保留原始/更正价格快照、任务通过独立验收、停用表不复活，以及清理和新进程备份恢复后的修订链与费用。测试费率明确是本地验证数据，不是厂商账单；不改动用户配置，不探测 Claude，Copilot 仍待登录验证。
+
+
+## 单行修订与跨机构、端点迁移
+
+每个导入价格的 `version` 是稳定行标识，形式为 `<64位文件摘要>:<从0开始的行索引>`。**从 `/prices history` 或 `/audit --json` 复制完整 `version`**，不要把屏幕上的排序、页内序号当作目标 ID。CSV 的标题行不计入数据行。批次摘要命令继续兼容，单行命令不会隐式扩大为整个批次。
+
+```text
+/prices revoke <完整行version> reason="只撤销这一行"
+/prices revoke <完整行version> reason="只撤销这一行" --apply
+/prices trust "E:\contracts\one-corrected-row.json" issuer=Agency
+/prices replace <完整行version> "E:\contracts\one-corrected-row.json" reason="更正该行报价" --apply
+```
+
+单行替换文件必须恰好包含一条价格，使用相同的 JSON/CSV 格式，不能夹带同批次其他行。普通 `replace` 保持该行的机构、协议、模型、端点不变，可以修正单价、汇率或生效区间；与未选中兄弟行的时间区间冲突仍会拒绝。需要拆分为多个区间时，当前单行操作不会自动执行一对多替换。
+
+跨机构、模型或端点的价格迁移必须明确使用 `migrate`，并先审核目标文件：
+
+```text
+/prices trust "E:\contracts\one-migrated-row.json" issuer=NewAgency
+/prices migrate <完整行version> "E:\contracts\one-migrated-row.json" reason="迁移到新机构报价"
+/prices migrate <完整行version> "E:\contracts\one-migrated-row.json" reason="迁移到新机构报价" --apply
+```
+
+`migrate <完整批次摘要> <文件>` 则表示明确迁移整个尚未被部分修订的批次，允许新的机构/端点集合；全表都需要通过审核和冲突检查。单行迁移仍严格要求目标文件只有一行。迁移以一个受保护事件同时停用所选旧价格、加入新价格，不存在先撤销成功、后导入失败的半成品状态。目标端点已有活动报价、文件未审核或校验期间出现并发修订时，整笔操作拒绝，原价格保留。
+
+**这里只迁移价格与审计归属，不修改模型路由、API Key 或订阅配置，也不会向新端点发送凭证。** 使用新端点的模型连接需要另外配置。现有调用保留原端点、机构和费用快照；新端点的新请求只能匹配新端点报价。没有价格时，既有 USD 预算约束继续生效。
+
+CLI 等价操作：
+
+```powershell
+node scripts/import-prices.mjs revoke <ROW_VERSION> --reason "单行撤销" --root E:\spawn-work\tui-ink --apply
+node scripts/import-prices.mjs replace <ROW_VERSION> "E:\contracts\one-corrected-row.json" --reason "更正单行" --root E:\spawn-work\tui-ink --apply
+node scripts/import-prices.mjs migrate <ROW_VERSION> "E:\contracts\one-migrated-row.json" --reason "迁移单行" --root E:\spawn-work\tui-ink --apply
+```
+
+两种入口都支持先预览，再通过 `expect=摘要`（CLI `--expect 摘要`）绑定准确的行、目标文件、原因和迁移方式。使用其他行的预览或将 replace 预览用于 migrate 都会失败；PM 普通对话不令预览失效。
+
+修订追溯新增 `targetVersions`（所选旧行）、新行的 `replacesVersions`（前驱行），以及明确的 `migration: true`。未选择的行保留原始版本和全部价格数据；它们的未来生效区间也不会被其他行的修订吞掉。
+
+批次一旦发生过部分修订，整批命令会拒绝并报告 `PRICE_IMPORT_PARTIAL_BATCH_USE_ROWS`，要求明确选择剩余行，避免把已迁出的行或其他未选中行一起处理。已撤销行不能通过重导原文件复活。其他新增校验包括 `SINGLE_ROW_REPLACEMENT`（单行目标收到多行文件）和 `MIGRATION_FILE`（迁移未给目标文件）。
+
+真实验证使用 `node scripts/verify-round16.mjs`：真实 PM/Worker 执行期间单行替换、撤销并原子迁移另一行，验证同批次哨兵价格完整保留；再通过受预算管理的真实 API 请求验证新端点、新机构的报价快照，并验证清理、独立进程恢复与修订链。两个本机代理均转发到原先已配置的同一个真实上游，测试不会把密钥发送到未知机构；示例机构和费率是明确的本地测试数据。

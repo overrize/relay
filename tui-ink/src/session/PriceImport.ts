@@ -90,36 +90,41 @@ export async function importPriceTable(root:string,file:string,options:{apply?:b
 }
 
 /** Explicit batch correction; never edits request reservations or settlements. */
-export async function revisePriceTable(root:string,target:string,options:{reason:string;file?:string;apply?:boolean;expect?:string}){
-  if(!/^[a-f0-9]{64}$/.test(target))fail('TARGET_DIGEST');
+export async function revisePriceTable(root:string,target:string,options:{reason:string;file?:string;apply?:boolean;expect?:string;migrate?:boolean}){
+  const match=/^([a-f0-9]{64})(?::(0|[1-9]\d{0,3}))?$/.exec(target);
+  if(!match)fail('TARGET_DIGEST');
+  const digest=match![1]!,single=match![2]!==undefined;
   const reason=options.reason?.trim();if(!reason||reason.length>240||/[\x00-\x1f\x7f]/.test(reason))fail('REVISION_REASON');
   if(options.file!==undefined&&(typeof options.file!=='string'||!options.file))fail('REPLACEMENT_FILE');
   const table=options.file!==undefined?readPriceTable(options.file):undefined,action=table?'replace':'revoke';
-  if(table?.digest===target)fail('REPLACE_SAME_BATCH');
+  if(options.migrate&&!table)fail('MIGRATION_FILE');
+  if(single&&table&&table.prices.length!==1)fail('SINGLE_ROW_REPLACEMENT');
+  if(table?.digest===digest)fail('REPLACE_SAME_BATCH');
   const j=new SessionJournal(root),pricingRevision=j.priceRevision(),report=await backgroundAuditReport(root,{limit:1});
-  const previous=report.priceDefinitions.filter(p=>p.origin==='contract'&&p.importDigest===target);
+  const previous=report.priceDefinitions.filter(p=>p.origin==='contract'&&p.importDigest===digest&&(!single||p.version===target));
   if(!previous.length)fail('TARGET_NOT_FOUND');
   const retired=previous.find(p=>p.retired)?.retired;
   if(retired){
-    if(previous.every(p=>p.retired?.id===retired.id)&&retired.action===action&&retired.reason===reason&&retired.replacementDigest===table?.digest)return {state:action==='revoke'?'already-revoked':'already-replaced',target,revision:retired.id};
-    fail('TARGET_RETIRED');
+    if(previous.every(p=>p.retired?.id===retired.id)&&retired.action===action&&retired.reason===reason&&retired.replacementDigest===table?.digest&&!!retired.migration===!!options.migrate)return {state:action==='revoke'?'already-revoked':'already-replaced',target,revision:retired.id};
+    fail(previous.some(p=>!p.retired)?'PARTIAL_BATCH_USE_ROWS':'TARGET_RETIRED');
   }
+  const preview=sha(JSON.stringify([action,target,table?.digest,reason,pricingRevision,!!options.migrate]));
+  if(options.expect&&options.expect!==preview)fail('PREVIEW_STALE');
   if(table){
     if(report.priceDefinitions.some(p=>p.origin==='contract'&&p.importDigest===table.digest))fail('REPLACEMENT_ALREADY_KNOWN');
     const scope=(p:PriceDefinition)=>JSON.stringify([p.provider,p.model,p.endpoint]),scopes=(prices:PriceDefinition[])=>JSON.stringify([...new Set(prices.map(scope))].sort());
-    if(scopes(previous)!==scopes(table.prices))fail('REPLACEMENT_SCOPE');
-    if([...new Set(previous.map(p=>p.issuer))].sort().join(',')!==table.issuer)fail('ISSUER_MISMATCH');
-    conflicts([...report.priceDefinitions.filter(p=>p.importDigest!==target),...table.prices]);
+    if(!options.migrate&&scopes(previous)!==scopes(table.prices))fail('REPLACEMENT_SCOPE');
+    if(!options.migrate&&[...new Set(previous.map(p=>p.issuer))].sort().join(',')!==table.issuer)fail('ISSUER_MISMATCH');
+    const selected=new Set(previous.map(p=>p.version));
+    conflicts([...report.priceDefinitions.filter(p=>!selected.has(p.version)),...table.prices]);
   }
-  const preview=sha(JSON.stringify([action,target,table?.digest,reason,pricingRevision]));
-  if(options.expect&&options.expect!==preview)fail('PREVIEW_STALE');
   const guard=(state:any)=>{
     if((state.pricingRevision??0)!==pricingRevision)fail('CONCURRENT_CHANGE_RETRY');
     if(table&&state.priceTrust?.[table.digest]!==table.issuer)fail('SOURCE_UNTRUSTED');
-    if(!state.contractPrices?.some((p:PriceDefinition)=>p.importDigest===target&&!p.retired))fail('TARGET_RETIRED');
+    if(!state.contractPrices?.some((p:PriceDefinition)=>p.importDigest===digest&&(!single||p.version===target)&&!p.retired))fail('TARGET_RETIRED');
   };
-  const prices=table?.prices.map(p=>({...p,replacesDigest:target}))??[];
-  const data:PriceRevision={action,target,reason,replacementDigest:table?.digest,prices,preview};
+  const prices=table?.prices.map(p=>({...p,replacesDigest:digest,...(single?{replacesVersions:[target]}:{})}))??[];
+  const data:PriceRevision={action,target,...(single?{targetVersions:[target]}:{}),...(options.migrate?{migration:true}:{}),reason,replacementDigest:table?.digest,prices,preview};
   // Validate current trust/state again inside the same durable writer lock.
   const event=options.apply?j.append('pricing.revised','pm','user',0,data,guard):undefined;
   if(!options.apply){if(j.priceRevision()!==pricingRevision)fail('CONCURRENT_CHANGE_RETRY');if(table&&j.trustedPriceTable(table.digest)!==table.issuer)fail('SOURCE_UNTRUSTED');}

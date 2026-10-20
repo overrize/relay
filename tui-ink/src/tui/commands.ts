@@ -193,12 +193,12 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
         emitCommandMessage("模型路由已保存；新启动/恢复的 agent 生效，历史预算和任务副本保留。候选顺序决定优先级；订阅后的 API 默认不参与降级。");
       } catch(error) { emitCommandMessage(String(error)); }
     } },
-    { name:"prices",desc:"/prices [sync|history|trust|import|revoke|replace] — 价格导入、撤销、替换与修订追溯",handler:args=>{
-      if(args[0]==="revoke"||args[0]==="replace"){
-        const [action,target,...rest]=args,file=action==="replace"?rest.shift():undefined,flags=rest;
-        if(!target||action==="replace"&&!file||flags.some(f=>f!=="--apply"&&!f.startsWith("reason=")&&!f.startsWith("expect="))||new Set(flags.map(f=>f.split("=")[0])).size!==flags.length){emitCommandMessage('用法 /prices revoke <批次摘要> reason="原因" [--apply] 或 /prices replace <旧批次摘要> "新价目表" reason="原因" [--apply] [expect=摘要]');return;}
+    { name:"prices",desc:"/prices [sync|history|trust|import|revoke|replace|migrate] — 价格导入、撤销、替换与修订追溯",handler:args=>{
+      if(args[0]==="revoke"||args[0]==="replace"||args[0]==="migrate"){
+        const [action,target,...rest]=args,file=action!=="revoke"?rest.shift():undefined,flags=rest;
+        if(!target||action!=="revoke"&&!file||flags.some(f=>f!=="--apply"&&!f.startsWith("reason=")&&!f.startsWith("expect="))||new Set(flags.map(f=>f.split("=")[0])).size!==flags.length){emitCommandMessage('用法 /prices revoke <批次摘要> reason="原因" [--apply] 或 /prices replace|migrate <批次摘要或行版本ID> "新价目表" reason="原因" [--apply] [expect=摘要]');return;}
         emitCommandMessage("正在后台校验价格修订；默认预览。历史调用快照保持不变，PM 沟通继续。");
-        void revisePriceTable(process.cwd(),target,{file,reason:flags.find(f=>f.startsWith("reason="))?.slice(7)??"",apply:flags.includes("--apply"),expect:flags.find(f=>f.startsWith("expect="))?.slice(7)}).then(result=>emitCommandMessage(JSON.stringify({...result,...("prices" in result?{prices:result.prices.slice(0,20),before:result.before.slice(0,20),displayLimit:20}:{})},null,2))).catch(e=>emitCommandMessage(/^PRICE_IMPORT_[A-Z_]+$/.test(e.message)?e.message:"PRICE_IMPORT_FILE_OR_HISTORY_ERROR"));return;
+        void revisePriceTable(process.cwd(),target,{file,migrate:action==="migrate",reason:flags.find(f=>f.startsWith("reason="))?.slice(7)??"",apply:flags.includes("--apply"),expect:flags.find(f=>f.startsWith("expect="))?.slice(7)}).then(result=>emitCommandMessage(JSON.stringify({...result,...("prices" in result?{prices:result.prices.slice(0,20),before:result.before.slice(0,20),displayLimit:20}:{})},null,2))).catch(e=>emitCommandMessage(/^PRICE_IMPORT_[A-Z_]+$/.test(e.message)?e.message:"PRICE_IMPORT_FILE_OR_HISTORY_ERROR"));return;
       }
       if(args[0]==="trust"||args[0]==="import"){
         const [action,file,...flags]=args;

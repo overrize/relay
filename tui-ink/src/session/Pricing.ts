@@ -10,12 +10,12 @@ export function priceEndpoint(provider?:string,baseUrl?:string){
   const identity=`${url.protocol}//${url.host}${url.pathname.replace(/\/+$/,"").replace(/\/v1$/,"")}`;
   return createHash("sha256").update(identity).digest("hex");
 }
-export interface PriceRetirement {id:string;at:number;action:"revoke"|"replace";reason:string;replacementDigest?:string}
-export interface PriceRevision {target:string;action:"revoke"|"replace";reason:string;replacementDigest?:string;prices:PriceDefinition[];preview:string}
+export interface PriceRetirement {id:string;at:number;action:"revoke"|"replace";reason:string;replacementDigest?:string;migration?:true}
+export interface PriceRevision {target:string;targetVersions?:string[];migration?:true;action:"revoke"|"replace";reason:string;replacementDigest?:string;prices:PriceDefinition[];preview:string}
 export interface PriceDefinition{
   provider:string;model:string;endpoint:string;inputRate:number;outputRate:number;
   source:string;since:number;recordedAt:number;legacy:boolean;
-  retired?:PriceRetirement;replacesDigest?:string;
+  retired?:PriceRetirement;replacesDigest?:string;replacesVersions?:string[];
   origin?:"official"|"contract";version?:string;previousVersion?:string;expiresAt?:number;
   sourceDocumentHash?:string;parserVersion?:string;issuer?:string;importDigest?:string;
   basis?:"upper-bound"|"catalog-estimate"|"contract-estimate";currency?:"USD"|"CNY";
@@ -36,8 +36,8 @@ type PriceBucket={manual:PriceDefinition[];contract:PriceDefinition[];official:P
 const lookups=new WeakMap<PriceDefinition[],{length:number;scopes:Map<string,PriceBucket>}>();
 /** Retain all versions; lifecycle metadata changes only the current price book. */
 export function applyPriceRevision(prices:PriceDefinition[],data:PriceRevision,event:{id:string;ts:number}){
-  const retirement:PriceRetirement={id:event.id,at:event.ts,action:data.action,reason:data.reason,...(data.replacementDigest?{replacementDigest:data.replacementDigest}:{})};
-  for(let i=0;i<prices.length;i++){const p=prices[i]!;if(p.origin==="contract"&&p.importDigest===data.target&&!p.retired)prices[i]={...p,retired:retirement};}
+  const retirement:PriceRetirement={id:event.id,at:event.ts,action:data.action,reason:data.reason,...(data.replacementDigest?{replacementDigest:data.replacementDigest}:{}),...(data.migration?{migration:true as const}:{})};
+  for(let i=0;i<prices.length;i++){const p=prices[i]!;if(p.origin==="contract"&&p.importDigest===data.target.split(":")[0]&&(!data.targetVersions||data.targetVersions.includes(p.version??""))&&!p.retired)prices[i]={...p,retired:retirement};}
   prices.push(...structuredClone(data.prices));lookups.delete(prices);
 }
 export function priceFor(row:AuditRow,prices:PriceDefinition[]){

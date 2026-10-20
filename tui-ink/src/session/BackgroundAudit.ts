@@ -14,8 +14,14 @@ function runAudit(root:string,filter:AuditFilter):ReturnType<typeof auditReport>
   return new Promise((resolve,reject)=>{
     const worker=new Worker(target,{workerData:{root,filter},stdout:true,stderr:true,...(source?{execArgv:[]}:{})});
     worker.stdout.resume();worker.stderr.resume();
-    let reported=false;
-    worker.once("message",message=>{reported=true;if(message.error)reject(Object.assign(Error(message.error),{busy:message.busy}));else resolve(message.report);});
-    worker.once("error",reject);worker.once("exit",code=>{if(code!==0||!reported)reject(Error("Audit worker exited before completion"));});
+    let response:any;
+    worker.once("message",message=>{response=message;});
+    worker.once("error",reject);
+    // Completion includes resource shutdown, so callers can safely exit/restore.
+    worker.once("exit",code=>{
+      if(code!==0||!response)reject(Error("Audit worker exited before completion"));
+      else if(response.error)reject(Object.assign(Error(response.error),{busy:response.busy}));
+      else resolve(response.report);
+    });
   });
 }
