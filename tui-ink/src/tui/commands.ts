@@ -1,5 +1,6 @@
 import { cachedUsage, refreshUsage, type UsageProvider } from "../subscriptions/usage.js";
 import { formatUsage, formatBudget, formatModelConfig } from "./accountStatus.js";
+import { auditReport, formatAudit, type AuditFilter } from "../session/Audit.js";
 import { resolveModelRoute, type ModelProfile } from "../models/routing.js";
 import { saveModelRouting } from "../config.js";
 import { loadConfig as loadBillingConfig, saveModelConfig, validateBillingConfig } from "../config.js";
@@ -68,6 +69,7 @@ export interface CommandCtx {
   connectWebProviderCommand: (args: string[]) => void;
   switchWebProviderCommand: (name: string | undefined) => void;
   emitCommandMessage: (text: string) => void;
+  startLogin?: () => void;
 }
 
 function parseScheduleDelay(raw: string, now = Date.now()): number | null {
@@ -100,6 +102,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
   const feishuSessions = { size: feishuSessionCount() };
   const __dirname = path.dirname(new URL(import.meta.url).pathname);
   const COMMANDS: CmdDef[] = [
+    {name:"login",desc:"/login — 选择供应商、订阅或 API Key，再配置模型和用途",handler:(args)=>{if(args.length){emitCommandMessage("请使用 /login 打开安全接入向导；不要把 API Key 写入命令参数。");return;}ctx.startLogin?.();}},
     { name: "pause",   desc: "kill the selected agent",     handler: () => { const sel = getState().selectedAgent; agents.get(sel)?.kill(); if (sessionJournal().binding(sel)?.parent) { killedAgents.add(sel); recordTaskCancellation(sel, "TUI pause"); } } },
     { name: "effort",  desc: "/effort [min|mid|high|max] — set or open effort selector", handler: (args) => {
       const lvl = args[0] as Effort | undefined;
@@ -162,6 +165,14 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
     } },
     { name: "account", desc: "/account — 离线查看模型配置、预算和套餐状态，不触发模型调用", handler: () => {
       emitCommandMessage([formatModelConfig(loadBillingConfig()),formatBudget(budgetReport(),sessionJournal().bindings()),formatUsage([cachedUsage("claude"),cachedUsage("codex"),cachedUsage("copilot")])].join("\n\n"));
+    } },
+    { name: "audit", desc: "/audit [model=ID task=ID before=序号 limit=40] [--json] — 长期用量与停止原因审计", handler: (args) => {
+      const filter:AuditFilter={};
+      try{for(const arg of args){if(arg==="--json")continue;const split=arg.indexOf("="),key=arg.slice(0,split),value=arg.slice(split+1);if(split<1||!value||!["model","task","before","limit"].includes(key))throw new Error("参数无效");if(key==="before"||key==="limit")filter[key]=Number(value);else filter[key as "model"|"task"]=value;}}
+      catch{emitCommandMessage("用法 /audit [model=模型ID task=任务ID before=序号 limit=1..200] [--json]");return;}
+      const budget=budgetReport();if("error" in budget){emitCommandMessage("预算账本不可读；审计前请检查账本完整性。");return;}
+      emitCommandMessage("正在异步读取受保护历史，PM 沟通继续。费用是调用时的配置估价；查询不会调用模型。");
+      void auditReport(process.cwd(),filter).then(report=>emitCommandMessage(args.includes("--json")?JSON.stringify(report,null,2):formatAudit(report))).catch(()=>emitCommandMessage("审计未完成：历史完整性、锁或筛选参数需要检查；不返回不完整的费用统计。"));
     } },
     { name: "route", desc: "/route [pm|leader|implement|research|review|verify|secretary <模型名...>|api-fallback on|off] — 定位与候选模型链", handler: (args) => {
       try {

@@ -233,6 +233,26 @@ export class SessionJournal {
   binding(id: string): Binding | undefined { this.refresh(); return structuredClone(this.state.agents[id]); }
   budget() { this.refresh(); return structuredClone(this.state.budget); }
   sequence() { this.refresh(); return { seq: this.state.seq, lastHash: this.state.lastHash }; }
+  /** Stable, asynchronous scan of protected history, including cold archives.
+   * The callback cannot see writes after the captured boundary. */
+  async visitHistory(use: (entry: Entry) => void | Promise<void>) {
+    const snapshot = this.locked(() => ({ ...this.sequence(), sources: this.sources(), budget:structuredClone(this.state.budget) }), false);
+    let visited = 0, previousHash: string | undefined = "";
+    for (const request of snapshot.sources) {
+      await this.withSource(request, async (source, read) => {
+        for (const entry of await read()) {
+          if (entry.seq < request.from || entry.seq > request.to || entry.seq > snapshot.seq || entry.seq <= visited) continue;
+          if(!source.archive){const {hash:actual,...body}=entry;if(previousHash===undefined||entry.version!==1||hash(body,previousHash)!==actual)throw new Error("Audit history integrity failure; refusing partial accounting");previousHash=actual;}
+          await use(entry); visited = entry.seq;
+          if (visited % 32 === 0) await yieldIO();
+        }
+        if(source.archive)previousHash=source.to===request.to?source.archive.lastHash:undefined;
+      });
+      await yieldIO();
+    }
+    if(previousHash!==snapshot.lastHash)throw new Error("Audit boundary changed during retention; retry the query");
+    return { seq: snapshot.seq, lastHash: snapshot.lastHash, budget:snapshot.budget };
+  }
   async backup() {
     const capture = this.locked(() => {
       if (!this.state.seq) throw new Error("No session events to back up");

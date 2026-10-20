@@ -234,6 +234,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
   };
 
   a.on("event", (e: TuiEvent) => {
+    if(getState().agents.get(opts.id)?.model!==a.cfg.providerCfg.model)updateAgentInfo(opts.id,{model:a.cfg.providerCfg.model});
     if (finishingFailure && e.type !== "token.usage") return;
     if (e.type === "agent.done" && e.success && (toolQueue.length || outstandingTools || [...getState().agents.values()].some((child) => child.parent === opts.id && child.state !== "done" && child.state !== "err"))) return;
     if (e.type === "agent.done" && !e.success && outstandingTools) {

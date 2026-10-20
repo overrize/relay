@@ -5,7 +5,7 @@ import path from "node:path";
 import { writeSnapshot } from "../memory/atomic.js";
 import { digest } from "./Storage.js";
 
-export interface BillingSelection { provider?: string; model?: string; billing?: { mode: "api" | "subscription"; inputUsdPerMillion?: number; outputUsdPerMillion?: number } }
+export interface BillingSelection { provider?: string; model?: string; transport?: string; billing?: { mode: "api" | "subscription"; inputUsdPerMillion?: number; outputUsdPerMillion?: number } }
 type BillingUsage = { requests: number; tokens: number; microUsd: number };
 export interface SessionBudget {
   unpricedApiRequests?: number;
@@ -53,18 +53,18 @@ export function reserveSessionRequest(agent: string, input: number, output: numb
   const microUsd = Math.ceil(input * inputRate + cap * outputRate);
   if (monetaryCap && u.microUsd + microUsd > costLimit) throw new Error("SESSION_BUDGET_EXHAUSTED: configured cost estimate cap reached");
   const communicationOnly = u.requests >= l.requests - l.communicationRequests || u.tokens + input + cap > l.tokens - l.communicationTokens || !!(monetaryCap && u.microUsd + microUsd > l.microUsd - l.communicationMicroUsd);
-  const id = randomUUID(), reservation = { agent, role: b.parent ? b.role : "PM", input, output: cap, tokens: input + cap, microUsd, billingMode: mode, pricingKnown, model: selection.model?.slice(0,160), provider: selection.provider?.slice(0,80), inputRate, outputRate };
+  const id = randomUUID(), reservation = { agent, role: b.parent ? b.role : "PM", conversation:b.conversation, revision:b.revision, taskId:b.workId, transport:selection.transport??"http", communication:canTalk, input, output: cap, tokens: input + cap, microUsd, billingMode: mode, pricingKnown, model: selection.model?.slice(0,160), provider: selection.provider?.slice(0,80), inputRate, outputRate };
   j.append("budget.reserved", b.conversation, agent, b.revision, { id, reservation });
   persistFloor();
   return { id, maxOutput: cap, maxInput: input, communicationOnly };
 }
-export function settleSessionRequest(agent: string, id: string, input?: number, output?: number) {
+export function settleSessionRequest(agent: string, id: string, input?: number, output?: number, stopReason?:string) {
   const scope = ensure(agent); if (!scope) return;
   const { j, b, budget } = scope, r = budget.reservations[id]; if (!r || r.settled) return;
   const measured = Number.isSafeInteger(input) && Number.isSafeInteger(output) && input! >= 0 && output! >= 0 && input! + output! > 0;
   // Missing usage, interrupted streams and failed requests keep their complete
   // reservation. A restart never refunds an operation with an unknown bill.
-  j.append("budget.settled", b.conversation, agent, b.revision, { id, tokens: measured ? Math.ceil(input! + output!) : r.tokens, microUsd: measured ? Math.ceil(input! * r.inputRate + output! * r.outputRate) : r.microUsd, uncertain: !measured });
+  j.append("budget.settled", b.conversation, agent, b.revision, { id, tokens: measured ? Math.ceil(input! + output!) : r.tokens, microUsd: measured ? Math.ceil(input! * r.inputRate + output! * r.outputRate) : r.microUsd, uncertain: !measured, ...(measured?{inputTokens:input,outputTokens:output}:{}),...(stopReason?{stopReason}:{}) });
   persistFloor();
 }
 export function consumeSessionTool(agent: string, name: string) {

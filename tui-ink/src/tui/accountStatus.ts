@@ -58,7 +58,7 @@ export function formatBudget(report: ReturnType<typeof budgetReport>, bindings: 
     `执行池剩余：请求 ${amount(l.requests-l.communicationRequests-u.requests)}；Token ${amount(l.tokens-l.communicationTokens-u.tokens)}`,
     `PM 沟通预留：请求 ${amount(l.communicationRequests)}；Token ${amount(l.communicationTokens)}（包含在总额内，单次仍需满足输入/输出预算）`,
     `API 费用估算 $${(u.microUsd/1e6).toFixed(6)}；${l.microUsd?`上限 $${(l.microUsd/1e6).toFixed(6)}，剩余 $${(Math.max(0,l.microUsd-u.microUsd)/1e6).toFixed(6)}`:"未设置美元上限"}`,
-    `未定价 API 请求 ${report.unpricedApiRequests??0}；未结算或消耗不确定 ${report.pendingOrUncertain}`];
+    `未定价 API 请求 ${report.unpricedApiRequests??0}；未结算或消耗不确定 ${report.pendingOrUncertain}（近期请求缓存；完整记录见 /audit）`];
   for (const mode of ["api","subscription"] as const) {const b=report.byBilling?.[mode];if(b)lines.push(`${mode==="api"?"API":"订阅"}：${b.requests} 请求 / ${b.tokens} Token${mode==="api"?` / $${(b.microUsd/1e6).toFixed(6)} 估算`:"；厂商套餐余量另见 /usage"}`);}
   for (const b of bindings) {
     if(b.modelSelection) lines.push(`${b.id} 最近调用：${b.modelSelection.candidate??b.modelSelection.model} · ${b.modelSelection.transport} · ${b.modelSelection.billing} · ${when(b.modelSelection.at)}`);

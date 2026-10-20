@@ -2,9 +2,10 @@ import type { ModelRouting } from "./models/routing.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { writeSnapshot } from "./memory/atomic.js";
 
-const CONFIG_DIR = process.env.SPAWN_CONFIG_DIR ?? path.join(os.homedir(), ".config", "multi-agent-tui");
-const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+function configDirectory() { return process.env.SPAWN_CONFIG_DIR ?? path.join(process.cwd(), ".spawn", "config"); }
+export function configPath() { return path.join(configDirectory(), "config.json"); }
 
 export type PaletteName = "paper" | "green" | "amber";
 
@@ -244,7 +245,8 @@ function normalizeConfig(parsed: Partial<Config> & { agents?: Record<string, unk
 
 export function loadConfig(): Config {
   try {
-    const raw = fs.readFileSync(CONFIG_FILE, "utf8");
+    const local=configPath(),legacy=path.join(os.homedir(),".config","multi-agent-tui","config.json");
+    const raw = fs.readFileSync(!process.env.SPAWN_CONFIG_DIR&&!fs.existsSync(local)?legacy:local, "utf8");
     const parsed = JSON.parse(raw) as Partial<Config> & { agents?: Record<string, unknown> };
     return normalizeConfig(parsed);
   } catch {
@@ -263,27 +265,27 @@ export function getAgentProviderConfig(cfg: Config, role: AgentConfigRole): Prov
 
 export function savePalette(name: PaletteName): void {
   try {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.mkdirSync(configDirectory(), { recursive: true });
     const existing = loadConfig();
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...existing, palette: name }, null, 2));
+    fs.writeFileSync(configPath(), JSON.stringify({ ...existing, palette: name }, null, 2));
   } catch { /* 静默失败，不影响 UI */ }
 }
 
 export function saveLayout(l: "v1" | "v3"): void {
   try {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.mkdirSync(configDirectory(), { recursive: true });
     const existing = loadConfig();
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...existing, layout: l }, null, 2));
+    fs.writeFileSync(configPath(), JSON.stringify({ ...existing, layout: l }, null, 2));
   } catch { /* 静默失败 */ }
 }
 
 export function saveAgentConfig(role: AgentConfigRole, cfg: ProviderConfig): void {
   try {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.mkdirSync(configDirectory(), { recursive: true });
     const existing = loadConfig();
     existing.models[cfg.model] = cfg;
     existing.agents[role] = { model: cfg.model, ...(cfg.maxTokens ? { maxTokens: cfg.maxTokens } : {}) };
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(existing, null, 2));
+    fs.writeFileSync(configPath(), JSON.stringify(existing, null, 2));
   } catch { /* 静默失败 */ }
 }
 
@@ -291,19 +293,19 @@ export function saveModelConfig(name: string, cfg: ProviderConfig): void {
   if (!name.trim() || ["__proto__","prototype","constructor"].includes(name)) throw new Error("Invalid model registry name");
   if (!cfg.model.trim()) throw new Error("Model ID is required");
   validateBillingConfig(cfg);
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.mkdirSync(configDirectory(), { recursive: true });
   const existing = loadConfig();
   existing.models[name] = cfg;
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(existing, null, 2));
+  fs.writeFileSync(configPath(), JSON.stringify(existing, null, 2));
 }
 
 export function saveAgentModel(role: AgentConfigRole, modelName: string): boolean {
   try {
     const existing = loadConfig();
     if (!existing.models[modelName]) return false;
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.mkdirSync(configDirectory(), { recursive: true });
     existing.agents[role] = { ...existing.agents[role], model: modelName };
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(existing, null, 2));
+    fs.writeFileSync(configPath(), JSON.stringify(existing, null, 2));
     return true;
   } catch {
     return false;
@@ -312,12 +314,12 @@ export function saveAgentModel(role: AgentConfigRole, modelName: string): boolea
 
 export function saveWebSearchProvider(name: string, cfg: WebSearchProviderConfig): void {
   try {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.mkdirSync(configDirectory(), { recursive: true });
     const existing = loadConfig();
     existing.web.providers[name] = cfg;
     existing.web.search.provider = name;
     existing.web.search.enabled = true;
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(existing, null, 2));
+    fs.writeFileSync(configPath(), JSON.stringify(existing, null, 2));
   } catch { /* 静默失败 */ }
 }
 
@@ -325,10 +327,10 @@ export function saveWebSearchSelection(providerName: string): boolean {
   try {
     const existing = loadConfig();
     if (!existing.web.providers[providerName]) return false;
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.mkdirSync(configDirectory(), { recursive: true });
     existing.web.search.provider = providerName;
     existing.web.search.enabled = true;
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(existing, null, 2));
+    fs.writeFileSync(configPath(), JSON.stringify(existing, null, 2));
     return true;
   } catch {
     return false;
@@ -347,6 +349,19 @@ export function validateBillingConfig(config: ProviderConfig): void {
 }
 
 export function saveModelRouting(routing: ModelRouting): void {
-  const existing = loadConfig(); fs.mkdirSync(CONFIG_DIR,{recursive:true});
-  fs.writeFileSync(CONFIG_FILE,JSON.stringify({...existing,routing},null,2));
+  const existing = loadConfig(); fs.mkdirSync(configDirectory(),{recursive:true});
+  fs.writeFileSync(configPath(),JSON.stringify({...existing,routing},null,2));
+}
+
+/** One atomic configuration transaction for the human-only login wizard. */
+export function saveLoginModel(name:string,model:ProviderConfig,target:"register"|"worker"|"pm"|"all") {
+  if(!/^[a-zA-Z0-9_.-]{1,80}$/.test(name)||["__proto__","constructor","prototype"].includes(name))throw new Error("Invalid registry name");
+  if(!model.model.trim())throw new Error("Model ID required");validateBillingConfig(model);
+  const cfg=loadConfig();cfg.models[name]=model;
+  const roles:AgentConfigRole[]=target==="all"?["leader","worker","secretary"]:target==="worker"?["worker"]:target==="pm"?["leader"]:[];
+  for(const role of roles)cfg.agents[role]={...cfg.agents[role],model:name};
+  const profiles=target==="all"?["pm","leader","implement","research","review","verify","secretary"]:target==="worker"?["implement"]:target==="pm"?["pm"]:[];
+  cfg.routing={...cfg.routing,profiles:{...cfg.routing?.profiles}};
+  for(const profile of profiles)(cfg.routing.profiles as Record<string,string[]>)[profile]=[name];
+  writeSnapshot(configPath(),JSON.stringify(cfg,null,2));
 }

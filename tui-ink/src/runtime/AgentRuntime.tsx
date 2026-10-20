@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { sessionJournal } from "../session/Journal.js";
 import { formatModelConfig } from "../tui/accountStatus.js";
+import { LoginWizard } from "../tui/LoginWizard.js";
+import {displayedPmModel} from "../tui/modelLabels.js";
+import {configPath} from "../config.js";
 import { releaseRuntimeOwners } from "../session/RuntimeOwner.js";
 import { waitForIndexing } from "../session/SearchIndex.js";
 import { stopTaskRecovery, waitTaskResolution, recordTaskCancellation } from "./TaskRecovery.js";
@@ -285,6 +288,7 @@ function App() {
   const effort           = useStore((s) => s.effort);
   const [effortSelecting, setEffortSelecting] = useState(false);
   const [modelSelecting, setModelSelecting] = useState(false);
+  const [loginSelecting, setLoginSelecting] = useState(false);
   // Zen mode: hide left (AGENTS) and right (TODO) panes, keep only the centre ConvPane
   // so the conversation text can be selected/copied without sidebar columns interleaving.
   const [zenMode, setZenMode] = useState(false);
@@ -306,6 +310,10 @@ function App() {
   const [planOpen, setPlanOpen] = useState(false);
   // Ctrl+T / Ctrl+L are intercepted at the stdin layer (so the input field
   // never sees the char); register the React state toggles here.
+  useEffect(() => {
+    cancelLoginFromSignal=loginSelecting?()=>setLoginSelecting(false):null;
+    return()=>{cancelLoginFromSignal=null;};
+  },[loginSelecting]);
   useEffect(() => {
     ctrlTHandler = () => setPlanOpen((v) => !v);
     ctrlLHandler = () => setViewMode((m) => (m === "logs" ? "chat" : "logs"));
@@ -347,6 +355,8 @@ function App() {
     if (selected?.role === "Secretary") return "secretary";
     return "leader";
   };
+  const refreshModelLabels=()=>{const model=displayedPmModel(loadConfig(),agents.get("pm")?.cfg.providerCfg);if(getState().agents.get("pm")?.model!==model)updateAgentInfo("pm",{model});};
+  useEffect(()=>{const file=configPath();fs.watchFile(file,{interval:500,persistent:false},refreshModelLabels);return()=>fs.unwatchFile(file,refreshModelLabels);},[]);
 
   const showModelConfig = () => {
     const cfg = loadConfig();
@@ -394,7 +404,7 @@ function App() {
       emitCommandMessage(`模型切换失败: ${role} -> ${modelName}`);
       return;
     }
-    if (role === "leader") updateAgentInfo("pm", { model: modelCfg.model });
+    if (role === "leader") refreshModelLabels();
     emitCommandMessage(`${role} 模型已切换: ${modelName} -> ${modelCfg.model} ✓`);
   };
 
@@ -406,7 +416,7 @@ function App() {
       setModelSelecting(false);
       return;
     }
-    if (role === "leader") updateAgentInfo("pm", { model: modelCfg.model });
+    if (role === "leader") refreshModelLabels();
     setModelSelecting(false);
     emitCommandMessage(`${role} 模型已切换: ${model} -> ${modelCfg.model} ✓`);
   };
@@ -470,6 +480,7 @@ function App() {
     showModelConfig, switchModelCommand, registerModelCommand,
     showWebConfig, connectWebProviderCommand, switchWebProviderCommand,
     emitCommandMessage,
+    startLogin:()=>{setModelSelecting(false);setEffortSelecting(false);setLoginSelecting(true);},
   });
 
   const runCommand = (cmd: string) => {
@@ -585,7 +596,7 @@ function App() {
   useEffect(() => {
     const cfg = loadConfig();
     const leaderCfg = getAgentProviderConfig(cfg, "leader");
-    ensureAgent({ id: "pm", name: "pm", role: "Leader", state: "idle", sub: "waiting for first message", model: leaderCfg.model });
+    ensureAgent({ id: "pm", name: "pm", role: "Leader", state: "idle", sub: "waiting for first message", model: displayedPmModel(cfg) });
     // process-monitor: visual representation of the TypeScript ProcessManager in the agent tree
     ensureAgent({ id: "process-monitor", name: "monitor", role: "Secretary", parent: "pm", state: "idle", sub: "", model: "internal" });
 
@@ -841,6 +852,7 @@ function App() {
 
   // 全局快捷键
   useInput((char, key) => {
+    if(loginSelecting)return; // The credential widget owns its input, including q/Tab/Esc.
     if (key.ctrl && char === "c") { requestExit(); return; }
     if (char === "q" && !input) { requestExit(); return; }
     // ── M3-7c view-mode keys (only when composing nothing) ──────────────────
@@ -1034,7 +1046,7 @@ function App() {
             <>
               {/* Home banner: stable in the Agents view (not tied to the selected
                   agent's messages). It's gone once you Enter into a chat. */}
-              <SpawnHeader model={getAgentProviderConfig(loadConfig(), "leader").model} />
+              <SpawnHeader model={displayedPmModel(loadConfig(),agents.get("pm")?.cfg.providerCfg)} />
               <Box paddingLeft={1}><Text dimColor>↑/↓ select · Enter open · Tab switch · Ctrl+T plan · Ctrl+L logs</Text></Box>
               <AgentsPane width={process.stdout.columns ?? 80} scroll={agentPaneScroll} />
             </>
@@ -1072,7 +1084,9 @@ function App() {
             </Box>
           );
         })()}
-        {modelSelecting
+        {loginSelecting
+          ? <LoginWizard onDone={message=>{setLoginSelecting(false);refreshModelLabels();emitCommandMessage(message);}} onCancel={()=>setLoginSelecting(false)} />
+          : modelSelecting
           ? (() => {
               const cfg = loadConfig();
               const modelChoices = Object.keys(cfg.models);
@@ -1246,7 +1260,7 @@ const filteredStdin = new Transform({
     // Strip control-shortcut bytes BEFORE Ink/ink-text-input sees them, so the
     // input field never appends 't'/'l' on Ctrl+T / Ctrl+L. Fire the app handler
     // instead (same pattern as Ctrl+C). 0x14=Ctrl+T, 0x0C=Ctrl+L, 0x03=Ctrl+C.
-    if (buf.includes(0x03)) { const r = requestExitFromSignal; if (r) r(); else process.exit(130); }
+    if (buf.includes(0x03)) { if(cancelLoginFromSignal)cancelLoginFromSignal();else {const r = requestExitFromSignal; if (r) r(); else process.exit(130);} }
     if (buf.includes(0x14)) ctrlTHandler?.();
     if (buf.includes(0x0c)) ctrlLHandler?.();
     const cleaned = Buffer.from(buf.filter((b) => b !== 0x03 && b !== 0x14 && b !== 0x0c));
@@ -1273,11 +1287,13 @@ process.on("exit", restoreTerminalForExit);
 process.on("SIGTERM", () => { writeTermSync(TERM_RESET); void shutdownRuntime().finally(() => process.exit(143)); });
 
 let requestExitFromSignal: (() => void) | null = null;
+let cancelLoginFromSignal:(()=>void)|null=null;
 // Control-shortcut handlers, registered by App; fired from filteredStdin so the
 // input field never receives the char (fixes Ctrl+T typing a literal 't').
 let ctrlTHandler: (() => void) | null = null;
 let ctrlLHandler: (() => void) | null = null;
 process.on("SIGINT", () => {
+  if(cancelLoginFromSignal){cancelLoginFromSignal();return;}
   writeTermSync(TERM_RESET);
   if (requestExitFromSignal) {
     requestExitFromSignal();

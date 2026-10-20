@@ -36,6 +36,7 @@ export function usageExhausted(value: UsageSnapshot, now=Date.now(),model?:strin
   return value.state === "fresh" && value.observedAt!==undefined && now-value.observedAt>=0 && now-value.observedAt<=90000 && applicable.some(w=>!w.unlimited && w.remainingPercent===0 && (w.resetsAt===undefined||w.resetsAt>now));
 }
 export async function refreshUsage(provider: UsageProvider, options: {force?:boolean; now?:()=>number; identity?:string; fetch?:()=>Promise<UsageWindow[]>} = {}):Promise<UsageSnapshot> {
+  const auditRoot=process.cwd();
   const now=options.now??Date.now, identity=options.identity??usageIdentity(provider), file=cacheFile(provider,identity), before=read(file,provider), time=now();
   if(before && ((before.retryAt??0)>time || time-before.checkedAt<(options.force?5000:90000))) return before.state === "fresh" && time-(before.observedAt??0)>90000 ? {...before,state:"stale"}:before;
   const running=inflight.get(file);if(running)return running;
@@ -49,6 +50,8 @@ export async function refreshUsage(provider: UsageProvider, options: {force?:boo
       try {const windows=await fetcher();result={provider,state:windows.length?"fresh":"unknown",windows,checkedAt:now(),observedAt:now(),accountKey:identity,...(!windows.length?{errorCode:"no-quota-data"}:{})};}
       catch(error){const e=error instanceof UsageError?error:new UsageError("usage-unavailable");result={provider,state:before?.windows.length?"stale":"error",windows:before?.windows??[],observedAt:before?.observedAt,checkedAt:now(),retryAt:now()+Math.min(1800000,Math.max(5000,e.retryAfterMs)),accountKey:identity,errorCode:/^[a-z0-9-]{1,80}$/.test(e.code)?e.code:"usage-unavailable",...(Number.isInteger(e.httpStatus)&&e.httpStatus!>=100&&e.httpStatus!<=599?{httpStatus:e.httpStatus}:{})};}
       result.attempts=[...(before?.attempts??[]).slice(-9),{id:randomUUID(),at:result.checkedAt,durationMs:Math.max(0,result.checkedAt-time),state:result.state,...(result.errorCode?{code:result.errorCode}:{}),...(result.httpStatus?{httpStatus:result.httpStatus}:{})}];
+      const {SessionJournal}=await import("../session/Journal.js");
+      new SessionJournal(auditRoot).append("usage.queried","__usage__",provider,0,{provider,account:fingerprint(identity),...result.attempts.at(-1),observedAt:result.observedAt,retryAt:result.retryAt,windows:result.windows});
       writeSnapshot(file,JSON.stringify(result));return result;
     } finally {if(held)try{if(fs.readFileSync(lock,"utf8")===nonce)fs.unlinkSync(lock);}catch{}}
   })();

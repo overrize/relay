@@ -1,0 +1,23 @@
+// Run from the terminal holding the user's TUI API configuration.
+import fs from 'node:fs';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+import {spawn,execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {SessionJournal} from '../dist/session/Journal.js';
+import {restoreBackup} from '../dist/session/Backup.js';
+const model=process.argv[2];if(!model)throw Error('Pass an account-supported Codex model ID');
+const repo=process.cwd();fs.mkdirSync('.test-tmp',{recursive:true});const output=fs.mkdtempSync(path.resolve('.test-tmp/live-round11-')),mixedReport=path.join(output,'mixed.json');
+const child=spawn(process.execPath,['scripts/verify-billing-mixed.mjs','--codex',model],{cwd:repo,env:{...process.env,SPAWN_VERIFICATION_REPORT_FILE:mixedReport},stdio:'inherit',windowsHide:true});
+const code=await new Promise((resolve,reject)=>{child.once('exit',resolve);child.once('error',reject);});assert.equal(code,0,'Real mixed transport must pass');
+const mixed=JSON.parse(fs.readFileSync(mixedReport,'utf8'));assert.equal(mixed.continuousPM,true);assert.equal(mixed.accepted,'accepted');
+const inspect=async root=>{const result=await promisify(execFile)(process.execPath,['scripts/session-audit.mjs','--root',root,'--json','limit=200'],{cwd:repo,windowsHide:true,maxBuffer:4*1024*1024});return JSON.parse(result.stdout);};
+const before=await inspect(mixed.root),j=new SessionJournal(mixed.root),budget=j.budget();
+assert.equal(before.totals.requests,budget.used.requests);assert.equal(before.totals.tokens,budget.used.tokens);assert.equal(before.totals.microUsd,budget.used.microUsd);
+assert.ok(before.byModel.some(g=>g.billing==='api'&&g.requests>0));assert.ok(before.byModel.some(g=>g.billing==='subscription'&&g.microUsd===0&&g.requests>0));
+assert.ok(before.byTask.some(g=>!g.task.startsWith('unassigned:')&&g.requests>0));assert.ok(before.rows.some(r=>r.kind==='task-state'&&r.state==='accepted'&&r.reason==='acceptance'));
+await j.maintain({maxLogBytes:0,retentionMs:0,maxIndexBytes:1024*1024,maxTotalBytes:32*1024*1024});
+const cold=await inspect(mixed.root);assert.deepEqual(cold.totals,before.totals);assert.deepEqual(cold.byModel,before.byModel);assert.deepEqual(cold.byTask,before.byTask);
+const backup=await j.backup(),restored=path.join(output,'restored');await restoreBackup(mixed.root,restored,{id:backup.id});const recovered=await inspect(restored);assert.deepEqual(recovered.totals,before.totals);assert.deepEqual(recovered.byTask,before.byTask);assert.ok(recovered.rows.some(r=>r.state==='accepted'&&r.reason==='acceptance'));
+const report={root:output,workspace:mixed.root,continuousPM:true,accepted:true,actualMixedModels:true,newProcessAudit:true,retentionAudit:true,backupRestoreAudit:true,taskStopReasonRecovered:true,claude:'not_queried',copilot:'pending_login',totals:recovered.totals,byModel:recovered.byModel,byTask:recovered.byTask};
+fs.writeFileSync(path.join(output,'verification.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report,null,2));console.log('ROUND11_REAL_E2E_PASS');

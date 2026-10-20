@@ -1,6 +1,7 @@
 import { assertCodexBudgetCapability, codexInputBound } from "./codexBudget.js";
 import { callCopilotSubscription } from "./copilotSubscription.js";
 import { cachedUsage, usageExhausted, type UsageProvider } from "../subscriptions/usage.js";
+import { auditReason } from "../session/Audit.js";
 import { callCodexSubscription } from "./codexSubscription.js";
 import { routeCanFallback, type ModelCandidate } from "../models/routing.js";
 import { callClaudeSubscription } from "./claudeSubscription.js";
@@ -481,7 +482,8 @@ export class HttpConvAgent extends EventEmitter {
         break; // success
       } catch (err: any) {
         if(this.cfg.sessionManaged && (process.cwd()!==this._workspaceRoot || !sessionJournal().binding(this.cfg.id))) { abortedDuringRetry=true; break; }
-        if (permit) settleSessionRequest(this.cfg.id, permit.id,err.usage?.inputTokens,err.usage?.outputTokens);
+        if (permit) settleSessionRequest(this.cfg.id, permit.id,err.usage?.inputTokens,err.usage?.outputTokens,auditReason(err.name==="AbortError"?"AbortError":err.message));
+        if(this.cfg.sessionManaged){const j=sessionJournal(),b=j.binding(this.cfg.id)!;j.append("model.request_failed",b.conversation,this.cfg.id,this._activeRevision??b.revision,{requestId:permit?.id,taskId:b.workId,model:this.cfg.providerCfg.model,provider:this.cfg.providerCfg.provider,transport:this.cfg.providerCfg.transport??"http",billing:this.cfg.providerCfg.billing?.mode??"api",reason:auditReason(err.name==="AbortError"?"AbortError":err.message)});}
         if (err.name === "AbortError") {
           abortedDuringRetry = true;
           break; // exit loop → outer finally clears _busy and drains queue

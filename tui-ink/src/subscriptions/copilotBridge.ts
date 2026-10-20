@@ -10,13 +10,16 @@ export function copilotExecutable():string {
   throw new Error("SUBSCRIPTION_CONFIG: copilot-native-runtime-missing");
 }
 export async function runCopilot(payload:any,suppliedClient?:CopilotClient) {
-  if(!["quota","infer"].includes(payload?.operation))throw new Error("SUBSCRIPTION_STOPPED: invalid-operation");
+  if(!["auth","models","quota","infer"].includes(payload?.operation))throw new Error("SUBSCRIPTION_STOPPED: invalid-operation");
   const client=suppliedClient??new CopilotClient({connection:{kind:"stdio",path:copilotExecutable()},mode:"empty",baseDirectory:copilotHome(),workingDirectory:process.cwd(),useLoggedInUser:true,logLevel:"none"});
   try{
     await client.start();const auth=await client.getAuthStatus();
+    if(payload.operation==="auth")return {authenticated:auth.isAuthenticated&&auth.authType!=="api-key"};
     if(!auth.isAuthenticated||auth.authType==="api-key")throw new Error("SUBSCRIPTION_AUTH: copilot-login-required");
     if(payload.operation==="quota")return await client.rpc.account.getQuota({});
-    const models=await client.listModels();if(!models.some(m=>m.id===payload.model))throw new Error("SUBSCRIPTION_STOPPED: model-not-available");
+    const models=await client.listModels();
+    if(payload.operation==="models")return {models:models.map(m=>({id:m.id,name:m.name}))};
+    if(!models.some(m=>m.id===payload.model))throw new Error("SUBSCRIPTION_STOPPED: model-not-available");
     const session=await client.createSession({model:payload.model,allowedModels:[payload.model],availableTools:[],excludedTools:["builtin:*","mcp:*"],enableConfigDiscovery:false,skipCustomInstructions:true,infiniteSessions:{enabled:false},systemMessage:{mode:"replace",content:payload.system},modelCapabilities:{limits:{max_output_tokens:payload.maxOutput}},onPermissionRequest:async()=>({kind:"denied-interactively-by-user"})});
     let input=0,output=0,calls=0,known=false,stop=false;
     session.on(event=>{

@@ -4,6 +4,7 @@ import { sessionJournal } from "../session/Journal.js";
 import { beginTaskOperation, finishTaskOperation, workItems } from "../session/Tasks.js";
 import { retryTask, reviewTask, taskMode, reconcileTask } from "../runtime/TaskRecovery.js";
 import { consumeSessionTool, budgetReport } from "../session/Budget.js";
+import { auditReport } from "../session/Audit.js";
 import { toolWorkspace, resolveWorkspaceToolPath, withWorkspace, workspaceChanges, publishWorkspace, resolveWorkspace } from "../session/Workspaces.js";
 import { taskState } from "../session/Tasks.js";
 // Tool Registry — 每个工具是独立的 ToolDef 对象，单一职责
@@ -120,7 +121,7 @@ const TaskReconcile: ToolDef = {
   async execute(a) { const t = reconcileTask(String(a.__sessionAgent), String(a.task), String(a.operation), String(a.evidence).split(",").map((s) => s.trim()).filter(Boolean), String(a.reason)); return ok(JSON.stringify({ id: t.id, status: t.status, operation: a.operation, reconciliation: t.operations[String(a.operation)]?.reconciliation })); },
 };
 const SubscriptionUsage: ToolDef = { name:"SubscriptionUsage",description:"只读查询厂商套餐缓存、剩余比例、重置时间和新鲜度；未知不等于零。用户 /usage refresh 异步刷新，不会购买额度或发送消息。",argsSchema:"",needsApproval:false,roles:new Set(["Leader","Worker"]),async execute(){return ok(JSON.stringify([cachedUsage("claude"),cachedUsage("codex"),cachedUsage("copilot")]));} };
-const BudgetStatus: ToolDef = { name: "BudgetStatus", description: "只读查询整个工作区会话的持久预算，包括 PM、Leader、Worker、重试与验收。模型不能增加额度。", argsSchema: "", needsApproval: false, roles: new Set(["Leader", "Worker"]), async execute() { return ok(JSON.stringify(budgetReport())); } };
+const BudgetStatus: ToolDef = { name: "BudgetStatus", description: "只读查询整个工作区预算；audit=true 异步读取长期按模型/任务统计和停止原因，model/task/before/limit 可筛选明细。模型不能增加额度。", argsSchema: "audit?(bool), model?(str), task?(str), before?(int), limit?(int 1..200)", needsApproval: false, roles: new Set(["Leader", "Worker"]), async execute(a) { const current=budgetReport();if("error" in current)return err("Budget accounting integrity must be inspected");return ok(JSON.stringify(a.audit?await auditReport(process.cwd(),{model:a.model as string|undefined,task:a.task as string|undefined,before:a.before as number|undefined,limit:a.limit as number|undefined}):current)); } };
 const WorkspaceStatus: ToolDef = { name: "WorkspaceStatus", description: "查看隔离任务的修改、冲突、当前原文件哈希。Read(task=逻辑任务ID) 可检查暂存版本。", argsSchema: "task(str)", needsApproval: false, roles: new Set(["Leader", "Worker"]), async execute(a) { const b = sessionJournal().binding(String(a.__sessionAgent)), t = b && workItems(sessionJournal(), b.conversation).find((w) => w.id === a.task); if (!t) return err("Task not found"); const changes = await workspaceChanges(t); return ok(JSON.stringify({ id: t.id, isolation: t.isolation, status: t.workspace?.status, conflicts: t.workspace?.conflicts, changes: changes.slice(0, 30), total: changes.length })); } };
 const WorkspaceResolve: ToolDef = { name: "WorkspaceResolve", description: "PM 按当前哈希显式解决停止任务的单个文件冲突。ours 保留任务版本，theirs 保留原工作区版本；不会自动覆盖变化后的目标。", argsSchema: "task(str), path(str), expected(str current hash or missing), choice(ours|theirs)", needsApproval: false, roles: new Set(["Leader"]), async execute(a) { await resolveWorkspace(String(a.__sessionAgent), String(a.task), String(a.path), String(a.expected), String(a.choice)); return ok("Resolution recorded; use WorkspacePublish or retry/review after inspecting the result"); } };
 const WorkspacePublish: ToolDef = { name: "WorkspacePublish", description: "PM 显式发布停止任务的已检查暂存修改；发布前再次检查文件哈希，冲突时保留双方版本并拒绝覆盖。", argsSchema: "task(str)", needsApproval: false, roles: new Set(["Leader"]), async execute(a) { const b = sessionJournal().binding(String(a.__sessionAgent)), t = b && workItems(sessionJournal(), b.conversation).find((w) => w.id === a.task); if (!t || b?.role !== "Leader" || (b.id !== t.parent && b.id !== t.conversation) || ["running", "evaluating", "retry_wait"].includes(t.status)) return err("Only the owner/root PM may publish a stopped task"); await publishWorkspace(t); return ok("Changes published; acceptance remains a separate decision"); } };
@@ -876,7 +877,7 @@ export const TOOL_ARG_SPECS: ReadonlyMap<string, ToolArgSpec> = new Map<string, 
   ["TaskRetry", { task: { type: "string" }, reason: { type: "string" } }],
   ["TaskReview", { task: { type: "string" }, verdict: { type: "enum", values: ["accept", "reject"] }, evidence: { type: "string" }, rationale: { type: "string" } }],
   ["TaskPolicy", { task: { type: "string" }, mode: { type: "enum", values: ["auto", "manual"] } }],
-  ["BudgetStatus", {}],
+  ["BudgetStatus", {audit:{type:"boolean",required:false},model:{type:"string",required:false},task:{type:"string",required:false},before:{type:"int",required:false,min:1},limit:{type:"int",required:false,min:1,max:200}}],
   ["WorkspaceStatus", { task: { type: "string" } }],
   ["WorkspaceResolve", { task: { type: "string" }, path: { type: "string" }, expected: { type: "string" }, choice: { type: "enum", values: ["ours", "theirs"] } }],
   ["WorkspacePublish", { task: { type: "string" } }],

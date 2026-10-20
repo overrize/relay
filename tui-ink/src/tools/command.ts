@@ -56,7 +56,7 @@ export function execCommand(command: string, options: {
   cwd?: string; timeout?: number; encoding?: string; shell?: unknown;
   /** Internal structured process invocation; never constructed from model shell text. */
   invocation?: { file: string; args: string[]; input?: string };
-  env?: NodeJS.ProcessEnv; stdoutOnly?: boolean; inspectStdout?: (chunk: Buffer) => void;
+  env?: NodeJS.ProcessEnv; stdoutOnly?: boolean; inspectStdout?: (chunk: Buffer) => void; inspectStderr?: (chunk: Buffer) => void;
 } = {}): Promise<Buffer> {
   const signal = toolSignal.getStore();
   return new Promise((resolve, reject) => {
@@ -84,7 +84,7 @@ export function execCommand(command: string, options: {
       return joined.length <= cap ? joined : Buffer.concat([joined.subarray(0, cap / 2), joined.subarray(-cap / 2)]);
     };
     child.stdout.on("data", (data: Buffer) => { if(!stopped)try{options.inspectStdout?.(data);}catch(error){guardError=error instanceof Error?error:new Error("Output guard rejected stream");stop(guardError.message);} stdout = append(stdout, data); });
-    child.stderr.on("data", (data: Buffer) => { stderr = append(stderr, data); });
+    child.stderr.on("data", (data: Buffer) => { if(!stopped)try{options.inspectStderr?.(data);}catch(error){guardError=error instanceof Error?error:new Error("Output guard rejected stream");stop(guardError.message);} stderr = append(stderr, data); });
     const stop = (reason: string) => {
       if (stopped) return;
       stopped = reason;

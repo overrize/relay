@@ -278,6 +278,7 @@ export function startWorker(
   secretary.once("destroy", () => { if (deadlineTimer) clearTimeout(deadlineTimer); });
 
   a.on("event", (ev: TuiEvent) => {
+    if(getState().agents.get(e.child)?.model!==a.cfg.providerCfg.model)updateAgentInfo(e.child,{model:a.cfg.providerCfg.model});
     if (finishingFailure && ev.type !== "token.usage") return;
     if (workerTerminal && ev.type !== "token.usage") {
       logDiag(`[${e.child}] dropped ${ev.type} after terminal agent.done\n`);
