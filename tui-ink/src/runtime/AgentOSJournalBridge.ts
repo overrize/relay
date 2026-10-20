@@ -18,18 +18,21 @@ export interface AgentOSBridgeOptions {
 }
 
 export class AgentOSJournalBridge {
-  private readonly journal: AgentOSJournal;
+  private cachedJournal?: AgentOSJournal;
+  private readonly journalPath: string;
+  private get journal(): AgentOSJournal { return this.cachedJournal ??= new AgentOSJournal(this.journalPath); }
   private readonly enabled: boolean;
 
   constructor(options: AgentOSBridgeOptions = {}) {
     this.enabled = options.enabled ?? process.env.SPAWN_AGENT_OS_JOURNAL !== "0";
-    this.journal = new AgentOSJournal(
-      options.journalPath ?? path.join(process.cwd(), ".spawn", "agent-os", "journal.json"),
-    );
+    this.journalPath = options.journalPath ?? path.join(process.cwd(), ".spawn", "agent-os", "journal.json");
   }
 
   observe(ev: TuiEvent, context: AgentOSBridgeContext): void {
     if (!this.enabled) return;
+    // Managed sessions already have the durable segmented journal. Retain the
+    // old full-JSON diagnostic rail only when explicitly requested.
+    if (ev.session_revision !== undefined && process.env.SPAWN_AGENT_OS_JOURNAL !== "1") return;
     for (const env of eventToEnvelopes(ev, context)) {
       const result = this.journal.append(env);
       if (!result.ok) {

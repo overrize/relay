@@ -50,7 +50,7 @@ export function fmt(ev: TuiEvent): string {
 
 export class Timeline {
   readonly entries: string[] = [];
-  readonly pm = new ProcessManager();
+  readonly pm = new ProcessManager("hierarchical");
   private readonly secretaries: SecretaryProxy[] = [];
 
   constructor() {

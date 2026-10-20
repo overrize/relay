@@ -52,12 +52,17 @@ export function installDiagnosticSink(opts: {
   isTTY: boolean;
   demo: boolean;
   logFile: string;
-}): void {
+}): (() => Promise<void>) | undefined {
   if (!opts.isTTY || opts.demo) return;
   try {
+    const previous = process.stderr.write;
     const stream = fs.createWriteStream(opts.logFile, { flags: "a" });
     process.stderr.write = ((chunk: any, ...rest: any[]) =>
       stream.write(chunk, ...rest)) as typeof process.stderr.write;
+    return () => new Promise<void>((resolve) => {
+      process.stderr.write = previous;
+      stream.end(() => { stream.close(() => resolve()); });
+    });
   } catch {
     /* fall back to terminal stderr */
   }

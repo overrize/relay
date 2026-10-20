@@ -34,3 +34,6 @@ wireframes/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local validation artifacts
+.test-tmp/

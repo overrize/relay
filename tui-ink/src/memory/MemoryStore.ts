@@ -1,3 +1,5 @@
+import { sessionJournal } from "../session/Journal.js";
+import { writeSnapshot } from "./atomic.js";
 // MemoryStore — 唯一的 .spawn/memory/ I/O 层
 // 原子写（tmp + rename）+ fsync，防止半写状态被 resume 读到
 
@@ -62,24 +64,34 @@ export function remindersPath(): string {
 }
 
 export function loadMemory(agentId: string): AgentMemory | null {
-  try {
-    return JSON.parse(fs.readFileSync(memoryPath(agentId), "utf8")) as AgentMemory;
-  } catch { return null; }
+  let legacy: AgentMemory | null = null;
+  try { legacy = JSON.parse(fs.readFileSync(memoryPath(agentId), "utf8")) as AgentMemory; } catch { /* replay source below */ }
+  const journal = sessionJournal(), binding = journal.binding(agentId);
+  if (!binding) return legacy;
+  const state = journal.current(binding.conversation)!;
+  const parentChain: string[] = [];
+  let parent = binding.parent;
+  while (parent && parentChain.length < 16) { parentChain.unshift(parent); parent = journal.binding(parent)?.parent; }
+  const mem = legacy ?? createMemory({ agentId, agentType: binding.parent ? binding.role === "Worker" ? "WORKER" : "LEADER" : "PM", parentChain, depth: parentChain.length, model: "configured-at-resume", roleName: binding.role });
+  if (!legacy) mem.session_hash = crypto.createHash("sha256").update(`journal:${agentId}`).digest("hex").slice(0, 7);
+  mem.dispatch = { ...mem.dispatch, ...binding.dispatch, background: binding.parent ? binding.goal : state.goal, constraints: state.constraints };
+  mem.working_set.decisions = state.decisions.map((d) => ({ id: `event-${d.seq}`, text: d.text, rationale: "durable event", ts: state.updatedAt }));
+  mem.working_set.facts = state.facts.map((f) => ({ id: `event-${f.seq}`, text: f.text, src: `event:${f.seq}`, ts: state.updatedAt, weight: 1 }));
+  mem.tombstone.last_todo = JSON.stringify(state.todos);
+  mem.tombstone.pending_tool_calls = Object.entries(state.tools).filter(([, t]) => t.agent === agentId && t.status !== "completed").map(([id, t]) => ({ id, name: t.name, args: t.args }));
+  if (!mem.tombstone.pending_tool_calls.length) mem.tombstone.pending_tool_calls = undefined;
+  mem.tombstone.resume_hint = `Current requirement revision ${state.revision}; verify uncertain effects before retrying`;
+  mem.tombstone.final_status = binding.status === "done" ? "done" : binding.status === "failed" ? "error" : null;
+  return mem;
 }
 
 export function saveMemory(agentId: string, mem: AgentMemory): void {
   ensureMemoryDir();
   const p = memoryPath(agentId);
   const content = JSON.stringify(mem, null, 2);
-  const tmp = `${p}.tmp`;
-  try {
-    fs.writeFileSync(tmp, content, "utf8");
-    fs.renameSync(tmp, p);  // atomic on Unix; best-effort on Windows
-  } catch {
-    // Windows fallback: rename can fail with EPERM (e.g. AV scanner holds)
-    try { fs.writeFileSync(p, content, "utf8"); } catch { /* best-effort */ }
-    try { fs.unlinkSync(tmp); } catch { /* ignore stale tmp */ }
-  }
+  try { writeSnapshot(p, content); }
+  catch (error) { process.stderr.write(`[memory] snapshot failed for ${agentId}: ${String(error)}\n`); }
+
 }
 
 // ── Session-based message history ────────────────────────────────────────────
@@ -101,15 +113,8 @@ function loadSessionsRaw(agentId: string): SessionEntry[] {
 
 function writeSessions(agentId: string, sessions: SessionEntry[]): void {
   const p = sessionsPath(agentId);
-  const tmp = `${p}.tmp`;
-  const content = JSON.stringify(sessions);
-  try {
-    fs.writeFileSync(tmp, content, "utf8");
-    fs.renameSync(tmp, p);
-  } catch {
-    try { fs.writeFileSync(p, content, "utf8"); } catch { /* best-effort */ }
-    try { fs.unlinkSync(tmp); } catch { /* stale tmp */ }
-  }
+  writeSnapshot(p, JSON.stringify(sessions));
+
 }
 
 /**
@@ -138,6 +143,14 @@ export function appendMessage(
       sessions.push({ session_hash: "implicit", started_at: Date.now(), messages: [] });
     }
     sessions[sessions.length - 1].messages.push(msg);
+    // Managed sessions keep complete messages in the append-only journal.
+    // Bound compatibility snapshots so a long conversation does not rewrite
+    // an ever-growing transcript on every message.
+    if (sessionJournal().binding(agentId)) {
+      for (const session of sessions) session.messages = session.messages.slice(-50).map((message) => ({
+        ...message, content: message.content.length <= 24000 ? message.content : message.content.slice(0, 12000) + "\n[full event available via SessionRecall]\n" + message.content.slice(-12000),
+      }));
+    }
     writeSessions(agentId, sessions);
   } catch { /* EPERM / locked file on Windows — memory write is best-effort */ }
 }
@@ -170,23 +183,21 @@ export function loadMemoryByHash(hash: string): AgentMemory | null {
         if (m.session_hash === hash) return m;
       } catch { /* skip corrupt file */ }
     }
+    for (const binding of sessionJournal().bindings()) {
+      const memory = loadMemory(binding.id);
+      if (memory?.session_hash === hash) return memory;
+    }
     return null;
   } catch { return null; }
 }
 
 /** 扫描所有 tombstone.final_status === null 的 agent（未正常退出）*/
 export function listUnfinishedAgents(): AgentMemory[] {
-  try {
-    ensureMemoryDir();
-    return fs
-      .readdirSync(memoryDir())
-      .filter((f) => f.endsWith(".json") && !f.endsWith(".tmp"))
-      .map((f) => {
-        try { return JSON.parse(fs.readFileSync(path.join(memoryDir(), f), "utf8")) as AgentMemory; }
-        catch { return null; }
-      })
-      .filter((m): m is AgentMemory => m !== null && m.tombstone?.final_status === null);
-  } catch { return []; }
+  ensureMemoryDir();
+  const ids = new Set<string>();
+  for (const file of fs.readdirSync(memoryDir())) if (file.endsWith(".json") && !file.endsWith(".sessions.json")) ids.add(file.slice(0, -5));
+  for (const binding of sessionJournal().bindings()) if (binding.status === "running" || binding.status === "interrupted") ids.add(binding.id);
+  return [...ids].map((id) => loadMemory(id)).filter((mem): mem is AgentMemory => !!mem && mem.tombstone.final_status === null && sessionJournal().isCurrent(mem.agent_id));
 }
 
 /**

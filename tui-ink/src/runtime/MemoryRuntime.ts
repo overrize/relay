@@ -5,6 +5,9 @@
  * inline in the handlers and moves in 6e — see docs/spawn-1.0/M1-6c-SPEC.md §2.
  */
 
+import { registerMemoryObserver } from "./MemoryEvents.js";
+import { clipTokens } from "../context/budget.js";
+import { estimateTokens } from "../context/tokens.js";
 import { SecretaryProxy } from "../memory/SecretaryProxy.js";
 import { createMemory, loadMemory } from "../memory/MemoryStore.js";
 import { retrieveRelevant } from "../memory/retrieval.js";
@@ -33,10 +36,13 @@ export function initSecretary(
   resumedMemoryId: string | undefined,
   makeParams: () => CreateMemoryParams,
 ): SecretaryProxy {
+  secretaries.get(id)?.destroy();
   const existingMem = resumedMemoryId ? loadMemory(id) : null;
   const mem = existingMem ?? createMemory(makeParams());
   const sec = new SecretaryProxy(mem, { startNewSession: !existingMem });
   secretaries.set(id, sec);
+  const unregister = registerMemoryObserver(id, (event) => sec.observe(event));
+  sec.once("destroy", unregister);
   return sec;
 }
 
@@ -75,35 +81,39 @@ export function buildResumeContext(
     return "";
   }
 
-  const budgetKb = mem.dispatch?.memory_quota_kb ?? 60;
-  const budgetChars = budgetKb * 512; // rough: ~512 chars per KB in markdown
-
-  // M3-1: retrieve facts most RELEVANT to the current goal, across the working
-  // set + cold archive (falls back to weight/recency when goal is empty).
+  const configured = mem.dispatch?.memory_quota_kb ?? 60;
+  const budgetKb = Number.isFinite(configured) ? Math.max(1, configured) : 60;
+  const maxBytes = Math.floor(budgetKb * 1024);
+  const maxTokens = Math.min(6000, Math.floor(budgetKb * 256));
   const relevant = retrieveRelevant(resumedMemoryId, mem.working_set.facts, goal ?? "", 10);
-
-  // Take top 10 respecting budget
-  const topFacts: string[] = [];
-  let charsUsed = 0;
-  for (const f of relevant) {
-    const line = `- [w${f.weight ?? 1}] ${f.text}`;
-    if (charsUsed + line.length > budgetChars && topFacts.length > 0) break;
-    topFacts.push(line);
-    charsUsed += line.length;
+  let todo = "(unknown)";
+  try {
+    if (mem.tombstone.last_todo) todo = JSON.parse(mem.tombstone.last_todo)
+      .map((t: { state: string; text: string }) => `[${t.state}] ${t.text}`).join("\n");
+  } catch { todo = "(invalid snapshot; inspect persisted history)"; }
+  const pending = (mem.tombstone.pending_tool_calls ?? []).map((t) =>
+    `- ${t.name}${t.needs_approval ? " (approval pending)" : ""} [id=${t.id}] args=${JSON.stringify(t.args ?? {})}`
+  ).join("\n");
+  const sections = [
+    `\n\n## ⚠️ RESUMED CONTEXT\nResume budget: ${budgetKb}KB\n` +
+      `先核对中断操作的实际副作用，不盲目重做。第一句必须输出 todo.set 重申计划。\n`,
+    `**中断时未完成的操作（pending）：**\n${pending || "(none)"}\n`,
+    `**约束：**\n${mem.dispatch.constraints.join("\n")}\n`,
+    `**上次 TODO 状态：**\n${todo}\n`,
+    `**关键决定（保留冲突，按时间核对）：**\n${mem.working_set.decisions.slice(-30).map((d) => `- ${d.text}`).join("\n")}\n`,
+    `**记录的事实片段（不代表独立验证）：**\n${relevant.map((f) => `- [w${f.weight ?? 1}] ${f.text}`).join("\n")}\n`,
+    `**恢复线索：** ${mem.tombstone.resume_hint ?? mem.tombstone.compact_summary ?? "未知"}`,
+  ];
+  let result = clipTokens(sections.join("\n"), maxTokens);
+  if (Buffer.byteLength(result, "utf8") > maxBytes) {
+    let lo = 0, hi = result.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (Buffer.byteLength(result.slice(0, mid) + "\n[truncated]", "utf8") <= maxBytes) lo = mid;
+      else hi = mid - 1;
+    }
+    result = result.slice(0, lo) + "\n[truncated]";
   }
-
-  const facts = topFacts.join("\n");
-  const decisions = mem.working_set.decisions.map((d) => `- ${d.text}`).join("\n");
-  const lastTodo = mem.tombstone.last_todo
-    ? JSON.parse(mem.tombstone.last_todo).map((t: { state: string; text: string }) => `  [${t.state}] ${t.text}`).join("\n")
-    : "(unknown)";
-  logDiag(`[resume] context injected: facts=${topFacts.length}, decisions=${mem.working_set.decisions.length}, hint="${(mem.tombstone.resume_hint ?? "").slice(0, 80)}"\n`);
-  // M1-8: surface the interrupted "现场" — tool.calls that never got a result.
-  const pendingTools = mem.tombstone.pending_tool_calls ?? [];
-  const pendingBlock = pendingTools.length
-    ? `\n\n**中断时未完成的操作（需你决定重做或跳过）：**\n${pendingTools
-        .map((t) => `- ${t.name}${t.needs_approval ? "（曾等待审批）" : ""} [id=${t.id}]`)
-        .join("\n")}`
-    : "";
-  return `\n\n---\n\n## ⚠️ RESUMED CONTEXT\n\n你正在从中断恢复。上次中断原因：${mem.tombstone.resume_hint ?? "未知"}\n\nResume budget: ${budgetKb}KB\n\n**上次 TODO 状态：**\n${lastTodo}\n\n**已确认事实（weight top 10，预算内）：**\n${facts || "(无)"}\n\n**关键决定：**\n${decisions || "(无)"}${pendingBlock}\n\n**第一句必须输出 todo.set 重申当前计划，然后继续推进。**`;
+  logDiag(`[resume] context injected: facts=${relevant.length}, decisions=${mem.working_set.decisions.length}, tokens=${estimateTokens(result)}\n`);
+  return result;
 }

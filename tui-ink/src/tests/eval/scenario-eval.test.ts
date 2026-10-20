@@ -96,14 +96,14 @@ describe("EV·收敛", () => {
 });
 
 describe("EV·记忆质量", () => {
-  it("EV-006 中文近似 fact 合并为一条并加权（M1-2 能力验收）", () => {
+  it("EV-006 中文近似 fact 独立保留，避免吞掉条件或否定", () => {
     ensureAgent({ id: "tl-1", name: "tl-1", role: "Leader", state: "run", parent: "pm" });
     const sec = t.attachSecretary("tl-1", "LEADER", 1);
     t.route({ v: 1, type: "tool.result", agent: "tl-1", id: "t1", ok: true, output: "配置文件在 src/config.ts，需要保留 baseUrl" });
     t.route({ v: 1, type: "tool.result", agent: "tl-1", id: "t2", ok: true, output: "src/config.ts 的配置文件必须保留 baseUrl" });
     const facts = sec.getMemory().working_set.facts;
-    assert.equal(facts.length, 1);
-    assert.equal(facts[0]!.weight, 2);
+    assert.equal(facts.length, 2);
+    assert.equal(facts[0]!.weight, 1);
   });
 
   it("EV-007 btw 旁路信息入 fact", () => {

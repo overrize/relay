@@ -1,3 +1,5 @@
+import { sessionJournal } from "../session/Journal.js";
+import { inputKind } from "../session/Control.js";
 /**
  * FeishuBridge — the Feishu WebSocket bridge + all Feishu-only module state
  * (spawn-1.0 M1-6e). Extracted verbatim from the god-file. Owns the feishu* state;
@@ -419,7 +421,7 @@ export function connectFeishu(appId: string, appSecret: string): void {
       isForkedTask: true,
       sharedSystemPrompt: sharedSysPrompt,
       initialMessages: snapshot,
-      firstMessage: text,
+      firstMessage: text, inputId: anchorMsgId || undefined,
       replyHook: forkReplyHook,
       turnEndHook: () => {
         outboundGateway.flush(forkId);
@@ -464,6 +466,10 @@ export function connectFeishu(appId: string, appSecret: string): void {
     }
     shadowAccept(openId, text, anchorMsgId);
     const pmId = `feishu-${crypto.createHash("sha256").update(openId).digest("hex").slice(0, 8)}`;
+    if (anchorMsgId) {
+      const j = sessionJournal();
+      j.append("inbox.received", pmId, pmId, j.current(pmId)?.revision ?? 0, { id: anchorMsgId, text, channel: "feishu", metadata: { openId, chatId, chatType } });
+    }
     const replyId   = chatType === 'group' ? chatId : openId;
     const replyType: 'open_id' | 'chat_id' = chatType === 'group' ? 'chat_id' : 'open_id';
     const rt = { replyId, replyType };
@@ -482,12 +488,10 @@ export function connectFeishu(appId: string, appSecret: string): void {
           userMessage(pmId, text);
           killedAgents.delete(pmId);
           feishuLog(`[feishu-pm-inject] reconnect → PM ${pmId} text="${text.slice(0, 120)}" (len=${text.length})`);
-          agents.get(pmId)!.sendCommand({ type: "user.message", text });
+          agents.get(pmId)!.receiveUserInput(text, anchorMsgId || undefined);
         } else {
-          const q = feishuMsgQueue.get(pmId) ?? [];
-          q.push({ text, messageId: anchorMsgId });
-          feishuMsgQueue.set(pmId, q);
-          feishuLog(`[FeishuBridge] reconnect-busy: queued for ${pmId}, len=${q.length}`);
+          agents.get(pmId)!.receiveUserInput(text, anchorMsgId || undefined);
+          feishuLog(`[FeishuBridge] reconnect-busy: durably queued for ${pmId}`);
         }
         return;
       }
@@ -501,7 +505,7 @@ export function connectFeishu(appId: string, appSecret: string): void {
       feishuAggregators.set(pmId, createAggregator(pmId));
       userMessage(pmId, text);
       feishuLog(`[feishu-pm-inject] new session → PM ${pmId} firstMessage="${text.slice(0, 120)}" (len=${text.length})`);
-      startLeaderAgent({ id: pmId, firstMessage: text, promptFile: "pm",
+      startLeaderAgent({ id: pmId, firstMessage: text, inputId: anchorMsgId || undefined, promptFile: "pm",
         conversationMode: true, replyHook: makeGatewayHook(pmId),
         turnEndHook: () => {
           feishuBusy.delete(pmId); // pre-clear: drain routing fix (Bug 2)
@@ -536,6 +540,12 @@ export function connectFeishu(appId: string, appSecret: string): void {
         `[FeishuBridge] existing pmId=${existingPmId} alive=${a instanceof HttpConvAgent} busy=${feishuBusy.has(existingPmId)}`,
       );
       if (a instanceof HttpConvAgent) {
+        if ((inputKind(text) === "change" || inputKind(text) === "constraint") && !/^(新任务|另一个任务|并行|另外帮我|new task|in parallel)/i.test(text)) {
+          userMessage(existingPmId, text);
+          killedAgents.delete(existingPmId);
+          a.receiveUserInput(text, anchorMsgId || undefined);
+          return;
+        }
         if (feishuBusy.has(existingPmId)) {
           if (isStatusQuery(text)) {
             const statusText = buildBusyStatusReply(openId, existingPmId);
@@ -548,6 +558,7 @@ export function connectFeishu(appId: string, appSecret: string): void {
                 feishuLog(`[FeishuStatus] reply failed: ${err instanceof Error ? err.message : String(err)}`);
               });
             }
+            sessionJournal().dispatched(anchorMsgId);
             return;
           }
 
@@ -555,17 +566,8 @@ export function connectFeishu(appId: string, appSecret: string): void {
           // can still fork for full-duplex concurrency.
           const followup = classifyFollowup(text);
           if (followup.isFollowup) {
-            const q = feishuMsgQueue.get(existingPmId) ?? [];
-            q.push({ text, messageId: anchorMsgId });
-            feishuMsgQueue.set(existingPmId, q);
-            markPendingInput(existingPmId);
-            feishuLog(
-              `[FeishuFollowup] queued to base ${existingPmId} reason=${followup.reason}` +
-              ` len=${q.length} text="${text.slice(0, 80)}"`,
-            );
-            if (anchorMsgId && feishuTokenManager) {
-              addProcessingReaction(anchorMsgId, feishuTokenManager).catch(() => {});
-            }
+            userMessage(existingPmId, text);
+            a.receiveUserInput(text, anchorMsgId || undefined);
             return;
           }
 
@@ -594,7 +596,7 @@ export function connectFeishu(appId: string, appSecret: string): void {
           killedAgents.delete(existingPmId);
           markPendingInput(existingPmId);
           feishuLog(`[feishu-pm-inject] existing session → PM ${existingPmId} text="${text.slice(0, 120)}" (len=${text.length})`);
-          a.sendCommand({ type: "user.message", text });
+          a.receiveUserInput(text, anchorMsgId || undefined);
         }
       } else {
         feishuLog(`[FeishuBridge] PM ${existingPmId} gone, starting fresh`);
@@ -611,7 +613,7 @@ export function connectFeishu(appId: string, appSecret: string): void {
             sub: "飞书会话", model: leaderProviderCfg.model });
           feishuAggregators.set(newPmId, createAggregator(newPmId));
           userMessage(newPmId, text);
-          startLeaderAgent({ id: newPmId, firstMessage: text, promptFile: "pm",
+          startLeaderAgent({ id: newPmId, firstMessage: text, inputId: anchorMsgId || undefined, promptFile: "pm",
             conversationMode: true, replyHook: makeGatewayHook(newPmId),
             turnEndHook: () => {
               feishuBusy.delete(newPmId);
@@ -644,6 +646,10 @@ export function connectFeishu(appId: string, appSecret: string): void {
   // Input-merge window: buffers rapid consecutive messages from the same user
   // and flushes them as one combined turn after FEISHU_INPUT_WINDOW_MS of silence.
   inputMgr = new FeishuInputWindowManager(FEISHU_INPUT_WINDOW_MS, dispatchMessage);
+  for (const input of sessionJournal().queued("feishu")) {
+    const meta = input.metadata;
+    setImmediate(() => dispatchMessage(meta.openId, input.text, input.id, meta.chatId, meta.chatType));
+  }
 
   startFeishuWebSocket({
     appId,

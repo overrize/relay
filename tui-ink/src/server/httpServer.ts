@@ -6,6 +6,7 @@ import { getState, userMessage } from "../store.js";
 export interface HttpServerConfig {
   enabled: boolean;
   port: number;
+  onMessage?: (text: string, inputId?: string) => void;
 }
 
 export function defaultConfig(): HttpServerConfig {
@@ -64,6 +65,7 @@ function handleGetStatus(res: http.ServerResponse, startedAt: number): void {
 function handlePostMessage(
   res: http.ServerResponse,
   body: Record<string, unknown>,
+  onMessage?: HttpServerConfig["onMessage"],
 ): void {
   const text = body.text;
   if (typeof text !== "string" || text.trim().length === 0) {
@@ -73,6 +75,7 @@ function handlePostMessage(
   const from = typeof body.from === "string" ? body.from.trim() : "http-api";
 
   // Push message to PM's inbox using the store API
+  onMessage?.(text.trim(), typeof body.id === "string" ? body.id : undefined);
   userMessage("pm", `[${from}] ${text.trim()}`);
 
   jsonResponse(res, 200, { status: "accepted", text: text.trim(), from });
@@ -106,7 +109,7 @@ export function createHttpServer(config?: Partial<HttpServerConfig>): http.Serve
 
       if (req.method === "POST" && path === "/message") {
         const body = await parseBody(req);
-        return handlePostMessage(res, body);
+        return handlePostMessage(res, body, config?.onMessage);
       }
 
       // 404 for anything else

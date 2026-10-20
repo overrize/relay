@@ -21,10 +21,10 @@ export type ToolCall = Extract<TuiEvent, { type: "tool.call" }>;
 
 /**
  * Execute a batch of tool calls, preserving order. Byte-equivalent to the inline
- * `Promise.all(batch.map((c) => executeTool(c.name, c.args, { agentId })))`.
+ * `Promise.all(batch.map((c) => executeTool(c.name, c.args, { agentId, revision: c.session_revision, callId: c.id })))`.
  */
 export function runToolBatch(batch: ToolCall[], agentId: string): Promise<ToolResult[]> {
-  return Promise.all(batch.map((c) => executeTool(c.name, c.args, { agentId })));
+  return Promise.all(batch.map((c) => executeTool(c.name, c.args, { agentId, revision: c.session_revision, callId: c.id })));
 }
 
 /**

@@ -15,7 +15,7 @@ export interface RuntimeContext {
     workerAgent: HttpConvAgent;
     toolName: string;
     toolArgs: unknown;
-    workerChildId: string;
+    workerChildId: string; revision?: number;
   }>;
 }
 
@@ -31,4 +31,3 @@ export function createRuntimeContext(): RuntimeContext {
     leaderApprovalQueue: new Map(),
   };
 }
-

@@ -155,18 +155,19 @@ const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 describe("Phase B/C/D — concurrent scenarios (simulation)", () => {
 
   // ── 场景1: 碎片合并 ────────────────────────────────────────────────────────
-  it("场景1 碎片合并: 1500ms 内连发 3 条 → 只 1 次 dispatch, 文本合并", async () => {
+  it("场景1 碎片合并: 1500ms 内连发 3 条 → 只 1 次 dispatch, 文本合并", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     const WIN = 30;
     const dispatched: Array<{ text: string; anchor: string }> = [];
     const mgr = new FeishuInputWindowManager(WIN, (_, text, anchor) => {
       dispatched.push({ text, anchor });
     });
     mgr.feed("u1", "I2C", "msg-1", "chat1", "p2p");
-    await wait(10);
+    t.mock.timers.tick(10);
     mgr.feed("u1", "总线", "msg-2", "chat1", "p2p");
-    await wait(10);
+    t.mock.timers.tick(10);
     mgr.feed("u1", "挂死", "msg-3", "chat1", "p2p");
-    await wait(WIN + 20);
+    t.mock.timers.tick(WIN + 20);
     assert.equal(dispatched.length, 1, "exactly 1 dispatch after merge");
     assert.equal(dispatched[0]!.text, "I2C\n总线\n挂死");
     assert.equal(dispatched[0]!.anchor, "msg-1");

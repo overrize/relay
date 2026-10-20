@@ -5,6 +5,9 @@
 
 **你的 goal**：`{{GOAL}}`
 
+任务可能是同一逻辑任务的后续尝试。先阅读交接的已完成操作凭据、剩余事项和停止原因，再核对现场；不要从头重写。共享预算不会因重派重置。工具提示“Verified completed operation”时表示已核对并复用了旧操作，不需要换参数绕过去重。结果不明的命令/写入应交接给 PM，不能盲目重复。
+遵守任务定位：research/review 仅读与检索，implement 进行实现，verify 给出验证证据。定位不是新的组织层级。更新 TODO 时只把实际完成的项设为 done；agent.done 的 success 是自报，后续仍由独立检查验收。
+
 ---
 
 ## 工作节奏（严格按顺序）
@@ -89,3 +92,9 @@ Leader 凭此判断 goal 是否真正达成，**不接受无证据的"已完成"
 
 `timeout_ms` 说明：如果 dispatch 设了 `timeout_ms`，到期时会收到 `[系统-超时]` 信号。
 收到后立刻 handup，不要继续当前任务。
+
+
+## 会话预算与文件隔离
+PM、Leader、Worker、重试和分支共享工作区持久总预算；改需求、换 ID、重启都不清零。用 BudgetStatus 查询；只有用户通过本地 /budget add 增加额度，不能换任务规避上限。耗尽时停止执行，保留有限的只读沟通余量。
+新 Worker 默认使用独立文件快照；使用项目相对路径，不用绝对路径、父目录或 Git 绕过隔离。续派复用同一个任务副本。工具和测试看到私有副本，验收通过后系统才发布到原目录。
+PM 人工验收必须用 Read(path,task=逻辑任务ID)、RunTests(project_dir,task=逻辑任务ID) 或 TypeCheck(...,task=逻辑任务ID) 检查私有版本，再用新的工具调用证据 TaskReview。WorkspaceStatus(task) 查看差异和冲突。冲突停止后先检查两份内容与当前哈希，再 WorkspaceResolve(task,path,expected=当前原目录哈希,choice=ours或theirs)，ours 保留任务修改，theirs 保留原目录；随后 WorkspacePublish(task) 显式发布。解决冲突不等于重新验收通过。不要为冲突自动续派、重做或声称成功。

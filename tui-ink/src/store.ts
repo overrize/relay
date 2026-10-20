@@ -1,3 +1,5 @@
+import { recordSessionEvent } from "./session/Control.js";
+import { observeMemoryEvent } from "./runtime/MemoryEvents.js";
 // Store — 单一可变状态。Ink 组件用 useStore() 订阅。
 // 手动 subscribe + useState,避免 useSyncExternalStore 与 Ink React 的兼容问题。
 
@@ -277,6 +279,8 @@ export function updateAgentInfo(id: string, patch: Partial<AgentInfo>): void {
 }
 
 export function applyEvent(e: TuiEvent) {
+  if (!recordSessionEvent(e)) return;
+  observeMemoryEvent(e);
   try {
     agentOSJournalBridge.observe(e, {
       getAgent: (agentId) => state.agents.get(agentId),
@@ -338,7 +342,7 @@ export function applyEvent(e: TuiEvent) {
         id: newMid(), ts: Date.now(),
         agent: e.agent, to: "user", kind: "tool_call",
         text: `${e.name}(${shortArgs(e.args)})`,
-        tool_name: e.name, tool_args: e.args, tool_id: e.id,
+        tool_name: e.name, tool_args: e.args, tool_id: e.id, session_revision: e.session_revision,
         needs_approval: !!e.needs_approval, approved: !e.needs_approval,
         level: e.needs_approval ? "warn" : "debug",
       };

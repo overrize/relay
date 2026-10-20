@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+import { sessionJournal } from "../session/Journal.js";
+import { releaseRuntimeOwners } from "../session/RuntimeOwner.js";
+import { waitForIndexing } from "../session/SearchIndex.js";
+import { stopTaskRecovery, waitTaskResolution, recordTaskCancellation } from "./TaskRecovery.js";
+import { cancelAllAgentTools } from "../tools/command.js";
 // Multi-agent TUI · entry
 // ─────────────────────────────────────────────────────────────────────────────
 // Layout: V1 三栏 inbox
@@ -93,6 +98,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
 const flag = (k: string) => argv.find((a) => a.startsWith(`--${k}`));
 const DEMO = !!flag("demo");
+const requestedMode = flag("mode")?.split("=")[1];
+if (requestedMode) process.env.SPAWN_ORCHESTRATION = requestedMode;
 const MODEL = flag("model")?.split("=")[1] ?? "claude-sonnet-4-5";
 const PROMPTS_DIR = path.resolve(__dirname, "..", "..",
   flag("prompts")?.split("=")[1] ?? "../prompts");
@@ -107,19 +114,20 @@ function buildSystemPrompt(
   promptFile?: string, // override default: "pm", "leader", "worker", etc.
 ): string {
   const base = readIfExists(path.join(PROMPTS_DIR, "_base.md"));
-  const rolePrompt = readIfExists(path.join(PROMPTS_DIR, `${promptFile ?? role.toLowerCase()}.md`));
+  const requestedPrompt = promptFile ?? role.toLowerCase();
+  const actualPrompt = requestedPrompt === "pm" && pm.getMode() !== "hierarchical" ? "pm-adaptive" : requestedPrompt;
+  const rolePrompt = readIfExists(path.join(PROMPTS_DIR, `${actualPrompt}.md`));
   let tpl = `${base}\n\n---\n\n${rolePrompt}`;
 
   // S3: inject RESUMED CONTEXT when resuming from memory (6c → MemoryRuntime)
-  if (resumedMemoryId) {
-    tpl += buildResumeContext(resumedMemoryId, agentId, role, goal);
-  }
+  // Live, fork and resumed requests use the same session context compiler.
 
   const cfg = loadConfig();
   const leaderCfg = getAgentProviderConfig(cfg, "leader");
   const workerCfg = getAgentProviderConfig(cfg, "worker");
   const secretaryCfg = getAgentProviderConfig(cfg, "secretary");
   return tpl
+    .replace(/\{\{ORCHESTRATION_MODE\}\}/g, pm.getMode())
     .replace(/\{\{AGENT_ID\}\}/g, agentId)
     .replace(/\{\{ROLE\}\}/g, role)
     .replace(/\{\{GOAL\}\}/g, goal ?? "(无，等用户指令)")
@@ -145,7 +153,14 @@ configureAgentHandlers({ agents, killedAgents, pm, feishuBusy, secretaries, pmPe
 // Start HTTP REST API server (configurable via .env or default port 3001)
 const serverPort = parseInt(process.env.SERVER_PORT ?? "3001", 10);
 const serverEnabled = process.env.SERVER_ENABLED !== "false";
-startHttpServer({ port: serverPort, enabled: serverEnabled });
+startHttpServer({ port: serverPort, enabled: serverEnabled, onMessage: (text, inputId) => {
+  const root = agents.get("pm");
+  if (root) root.receiveUserInput(text, inputId);
+  else {
+    ensureAgent({ id: "pm", name: "pm", role: "Leader", state: "idle" });
+    startLeaderAgent({ id: "pm", firstMessage: text, inputId, promptFile: "pm" });
+  }
+} });
 // Feishu-only module state moved to FeishuBridge.ts (6e).
 
 // Agents that were explicitly killed by the user (ESC) or by a parent agent.kill event.
@@ -199,14 +214,26 @@ export interface LeaderOpts {
   // Phase B: forked task options
   sharedSystemPrompt?: string;         // exact system prompt from base PM (enables cache reuse)
   initialMessages?: Array<{ role: "user" | "assistant"; content: string }>; // history snapshot
-  isForkedTask?: boolean;              // skip secretary/memory; lightweight single-task mode
+  inputId?: string;
+  isForkedTask?: boolean;              // concurrent task with its own persisted secretary
 }
 
 function killAgent(id: string, _reason = "interrupted"): void {
+  for (const child of getState().agents.values()) {
+    if (child.parent === id && child.state !== "done" && child.state !== "err" && !killedAgents.has(child.id)) killAgent(child.id, _reason);
+  }
   killedAgents.add(id);
   agents.get(id)?.kill?.(); // clears queue, pops unresponded user msg, aborts HTTP
   abortAgent(id);           // clears pending approvals in store
-  globalBus.unregisterAgent(id);
+  pm.cancelForeground(id);
+  for (const [toolId, pending] of leaderApprovalQueue) {
+    if (pending.workerChildId === id) leaderApprovalQueue.delete(toolId);
+  }
+  if (getState().agents.get(id)?.parent) {
+    applyEvent({ v: 1, type: "agent.error", agent: id, code: "cancelled", detail: _reason });
+    recordTaskCancellation(id, _reason);
+  }
+  if (getState().agents.get(id)?.parent) globalBus.unregisterAgent(id);
   // Release feishu serial lock so the next message for this PM isn't queued forever.
   feishuBusy.delete(id);
   // Phase B: remove from fork tracking so capacity count stays correct.
@@ -215,6 +242,18 @@ function killAgent(id: string, _reason = "interrupted"): void {
   }
   // Do NOT set state:err — httpAgent emits state:idle after AbortError,
   // which returns the agent to ready state so the user can resend immediately.
+}
+
+async function shutdownRuntime(): Promise<void> {
+  stopTaskRecovery();
+  for (const [id, agent] of agents) { killedAgents.add(id); agent.kill(); }
+  for (const secretary of secretaries.values()) secretary.destroy();
+  pm.destroy();
+  await cancelAllAgentTools();
+  await waitTaskResolution();
+  stopTaskRecovery();
+  await waitForIndexing();
+  releaseRuntimeOwners();
 }
 
 // replaceAgentForResume moved to OrchestratorRuntime (6d); called with { agents, secretaries, killedAgents }.
@@ -314,15 +353,15 @@ function App() {
       const roleCfg = cfg.agents[role];
       const providerCfg = getAgentProviderConfig(cfg, role);
       const base = providerCfg.baseUrl ? ` ${providerCfg.baseUrl}` : "";
-      return `${role}: ${roleCfg.model} -> ${providerCfg.provider} / ${providerCfg.model}${base}`;
+      return `${role}: ${roleCfg.model} -> ${providerCfg.provider} / ${providerCfg.model}${base} [${providerCfg.billing?.mode ?? "api"}; ${providerCfg.transport ?? "http"}]`;
     });
     const modelLines = Object.entries(cfg.models).map(([name, modelCfg]) => {
       const base = modelCfg.baseUrl ? ` ${modelCfg.baseUrl}` : "";
-      return `${name}: ${modelCfg.provider} / ${modelCfg.model}${base}`;
+      return `${name}: ${modelCfg.provider} / ${modelCfg.model}${base} [${modelCfg.billing?.mode ?? "api"}; ${modelCfg.transport ?? "http"}]`;
     });
     emitCommandMessage(
       `当前角色模型:\n${roleLines.join("\n")}\n\n已注册模型:\n${modelLines.join("\n")}` +
-      `\n\n用法:\n/connect <name> <preset|baseUrl> [modelId] <apiKey>\n/model <leader|worker|secretary> <name>`,
+      `\n\n用法:\n/connect <name> <preset|baseUrl> [modelId] <apiKey>；订阅：/connect <name> claude-subscription <modelId>\n/model <leader|worker|secretary> <name>`,
     );
   };
 
@@ -333,7 +372,7 @@ function App() {
     maybeApiKey: string | undefined,
   ) => {
     if (!name || !preset || !modelOrKey) {
-      emitCommandMessage("用法: /connect <name> <preset|baseUrl> [modelId] <apiKey>");
+      emitCommandMessage("用法: /connect <name> <preset|baseUrl> [modelId] <apiKey>；订阅：/connect <name> claude-subscription <modelId>");
       return;
     }
     const cfg = resolveModelConfigInput(preset, modelOrKey, maybeApiKey);
@@ -509,7 +548,9 @@ function App() {
     if (target === "pm" && !pmStarted.current) {
       userMessage("pm", body);
       pmStarted.current = true;
-      startLeaderAgent({ id: "pm", firstMessage: body, promptFile: "pm" });
+      const existing = agents.get("pm");
+      if (existing) existing.receiveUserInput(body);
+      else startLeaderAgent({ id: "pm", firstMessage: body, promptFile: "pm" });
       return;
     }
 
@@ -535,7 +576,7 @@ function App() {
 
     // HttpConvAgent has its own internal _queue and drains one message per turn,
     // so we always call sendCommand immediately — no React-level blocking needed.
-    a.sendCommand({ type: "user.message", text: body });
+    a.receiveUserInput(body);
   };
 
   useEffect(() => {
@@ -562,6 +603,14 @@ function App() {
 
     // On startup: if there's an unfinished PM session, prompt the user to decide.
     // Do NOT auto-resume — the user may want to start a fresh session instead.
+    const resumeId = flag("resume")?.split("=")[1] || "pm";
+    if (flag("resume") && sessionJournal().binding(resumeId) && !pmStarted.current) {
+      if (sessionJournal().binding(resumeId)?.parent) throw new Error("--resume requires a root PM; use /resume for individual tasks");
+      if (!sessionJournal().isCurrent(resumeId)) throw new Error("Cannot resume an obsolete task; resume its PM instead");
+      pmStarted.current = resumeId === "pm";
+      ensureAgent({ id: resumeId, name: resumeId, role: "Leader", state: "idle" });
+      startLeaderAgent({ id: resumeId, resumedMemoryId: resumeId, promptFile: "pm" });
+    }
     const pmMem = loadMemory("pm");
     if (pmMem && pmMem.tombstone?.final_status === null && !pmStarted.current) {
       const hash = pmMem.session_hash ? pmMem.session_hash.slice(0, 8) : "?";
@@ -573,7 +622,7 @@ function App() {
         ? `\n⚠ 上次存在子 agent：${deadWorkers.join(", ")}`
         : "";
       applyEvent({ v: 1, type: "message", agent: "pm", to: "user",
-        text: `🔔 检测到上次未完成的会话 (${hash})\n上次状态：${hint}${deadNote}\n\n/resume — 继续上次任务\n直接发消息 — 开始新会话（上次记录保留，可稍后 /resume）` });
+        text: `🔔 检测到上次未完成的会话 (${hash})\n上次状态：${hint}${deadNote}\n\n/resume — 继续上次任务\n直接提问 — 查询当前任务；/revise 新目标 — 替换目标并停止旧执行` });
     }
 
     // Auto-connect Feishu if credentials are present in .env
@@ -758,12 +807,11 @@ function App() {
     lastExitRequestAt.current = now;
     if (exitConfirm) {
       if (exitConfirmTimer.current) clearInterval(exitConfirmTimer.current);
-      exit();
-      // Restore the terminal HERE, not only from the "exit" handler: exit() is
-      // async (Ink unmount), so its effect cleanup may never run before the
-      // process.exit(0) below. writeTermSync guarantees the sequence lands.
-      writeTermSync(TERM_RESET);
-      process.exit(0);
+      void shutdownRuntime().finally(() => {
+        exit();
+        writeTermSync(TERM_RESET);
+        process.exit(0);
+      });
       return;
     }
     setExitSecsLeft(3);
@@ -853,7 +901,8 @@ function App() {
         approve(toolId);
         const agentInst = agents.get(m.agent);
         if (agentInst) {
-          executeTool(m.tool_name ?? "", m.tool_args, { agentId: m.agent }).then((r) => {
+          executeTool(m.tool_name ?? "", m.tool_args, { agentId: m.agent, revision: m.session_revision, callId: toolId }).then((r) => {
+            if (!sessionJournal().isCurrent(m.agent, m.session_revision)) return;
             applyEvent({ v: 1, type: "tool.result", agent: m.agent, id: toolId, ok: r.ok, output: r.output });
             agentInst.sendCommand({ type: "tool.result", id: toolId, ok: r.ok, output: r.output });
           });
@@ -1182,7 +1231,7 @@ const LOG_FILE = path.join(process.cwd(), "tui.log");
 
 const banner = DEMO
   ? "running in --demo mode (no real claude subprocess; fake events on first message)"
-  : `live mode — will spawn 'claude' on first message (model=${MODEL})`;
+  : `live mode — model=${getAgentProviderConfig(loadConfig(), "leader").model}, orchestration=${pm.getMode()}`;
 
 console.log(`\nmulti-agent TUI · ${banner}\n`);
 
@@ -1233,7 +1282,7 @@ function restoreTerminalForExit(): void {
   writeTermSync(buildExitRestoreSequence(process.stdout.rows ?? 24));
 }
 process.on("exit", restoreTerminalForExit);
-process.on("SIGTERM", () => { writeTermSync(TERM_RESET); process.exit(143); });
+process.on("SIGTERM", () => { writeTermSync(TERM_RESET); void shutdownRuntime().finally(() => process.exit(143)); });
 
 let requestExitFromSignal: (() => void) | null = null;
 // Control-shortcut handlers, registered by App; fired from filteredStdin so the
@@ -1285,4 +1334,3 @@ process.on("SIGINT", () => {
 installDiagnosticSink({ isTTY: !!process.stdout.isTTY, demo: DEMO, logFile: path.join(process.cwd(), "tui.log") });
 
 render(<App />, { stdin: filteredStdin as any, exitOnCtrlC: false });
-

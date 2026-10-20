@@ -1,5 +1,31 @@
 # spawn
 
+## 运行模式与第一轮可靠性修复
+
+默认 `adaptive`：PM 可以直接完成简单工作，或直接派发 Worker；只有需要协调时才增加 Leader。
+原有组织层级仍可选择。PowerShell 示例：
+
+```powershell
+cd E:\spawn-work\tui-ink
+npm run dev                              # 默认 adaptive
+npm run dev -- --mode=hierarchical        # PM → Leader → Worker
+npm run dev -- --mode=single              # 一个 PM 使用工具，不派生 agent
+```
+
+也可设置 `SPAWN_ORCHESTRATION=adaptive|hierarchical|single`，命令行优先。
+`SPAWN_CONFIG_DIR` 可指定配置目录，默认沿用原有用户配置。
+
+本轮改动：所有运行时接受的工具结果统一交给秘书；并发 PM 分身和合并对话持久化；
+完成的任务保留恢复快照；工具调用状态及时落盘；事实只合并完全相同的文本，避免把否定或条件变更吞掉。
+历史和恢复注入使用整体预算，超大消息会截断；原始完整消息仍保存在会话文件中。
+长命令异步执行，可取消进程树。PM 回复后释放飞书会话锁，后台任务不阻止后续沟通。
+取消不回滚已发生的修改；恢复时应先核对未完成操作的实际副作用。
+
+验证命令：`npm run typecheck`、`npm test`、`npm run test:headless`、`npm run build`。
+`src/tests/reliability-round1.test.ts` 使用真实处理器、局部模拟模型服务和真实子进程，
+验证后台 Worker 执行时 PM 仍可回复、秘书接收结果、分身恢复、预算和取消。
+飞书真实账号收发及需求版本化、语义记忆整理属于后续验证和改造范围。
+
 多 agent 对话系统。用户通过飞书或终端 TUI 发送任务，系统自动拆分并并行调度多个 LLM agent 完成，结果汇总回用户。
 
 **开发者文档（架构、内存系统、Feishu 接入、测试）→ [tui-ink/README.md](tui-ink/README.md)**
@@ -334,3 +360,299 @@ GitHub Actions（`.github/workflows/ci.yml`）：
 - `ubuntu-latest`，Node 22
 - 步骤：`apt install ripgrep` → `npm ci` → `typecheck` → `npm test`
 - 触发：push / PR 到 main
+
+## 第二轮：长会话、目标变更与恢复
+
+继续使用 spawn 自身的运行时；组织层级仍由第一轮的 adaptive / hierarchical / single 模式选择。PM 在 Worker 执行命令时仍可以接收用户追问。
+
+- `.spawn/events/journal.jsonl` 是追加写入并 fsync 的事件记录，带序号和哈希链；`current.json` 是可重建的派生快照。未写完整的末尾记录会单独保存，已提交记录损坏则停止执行，避免用错误状态继续工作。
+- 用户输入、当前目标、约束、决策、TODO、任务状态、工具结果都进入同一事件来源。上下文编译器统一用于正常请求、分支和重启；旧目标不会作为当前指令注入。近期历史和兼容快照有界，完整历史可通过 `SessionRecall` 按关键词检索，并返回事件序号及目标版本。
+- `/revise 新目标` 明确切换目标；`/constraint 新约束` 增加持久约束并使旧执行失效。进度问题保留当前目标。普通输入使用保守的规则分类；含糊的指令建议显式使用 `/revise`，分类目前不是语义理解器。
+- 目标版本先持久化，再取消旧模型请求和工具进程树。新工具执行等待取消完成；迟到回复、审批、工具结果和前台转后台回调均检查版本，不能推进旧任务。
+- 在相同工作目录运行 `npm --prefix tui-ink start -- --resume` 恢复 PM；`--resume=<根会话ID>` 可指定其他根会话。恢复时从事件记录重建状态，重发尚未处理的最新输入；旧 Worker 不会自动恢复执行。单个任务使用交互命令 `/resume`，过期任务会被拒绝。
+- 中断时尚未确认的工具标记为 `uncertain`，相同调用 ID 的直接重放会被阻止；已完成 ID 返回缓存结果摘要。必须先检查文件或外部状态，再决定是否发起新操作。
+
+验证：`npm --prefix tui-ink test` 包含 `session-round2.test.ts`；覆盖 180 轮历史、损坏/半写日志、真实子进程取消、迟到回复、异常退出跨进程恢复、持久收件箱和工具重放保护。另运行 `npm --prefix tui-ink run test:headless` 与 `npm --prefix tui-ink run build`。
+
+第二轮的孤儿进程和恢复性能边界已在下面第三轮继续处理。事件持久化仍不等于模型每轮都会自动想起全部历史，旧细节需要检索；任意外部操作的恰好一次执行和副作用回滚也不由事件记录保证。飞书消息聚合窗口及实际网络投递仍需要单独联调。
+
+## 第三轮：强杀后的进程清理与分段恢复
+
+每个 shell 命令由独立 Node 监督进程持有进程树。启动前先持久化随机令牌、所属应用 PID 和存活租约到 `.spawn/processes/<令牌>/`；监督进程在启动命令前写入自身状态并检查取消请求。主程序丢失后，监督进程自动停止旧进程树；重启也会检查未完成记录，并通过令牌目录请求清理。恢复不把历史 PID 当作直接查杀目标。正常结束的记录移入 `completed/`，后续启动不必读取每一条已完成记录。
+
+PM 对话与清理异步进行；新工具执行等待清理完成。取消进程树失败、监督进程非正常消失或清理超时，会保留明确的阻塞记录并拒绝新工具调用，PM 仍能回答进度问题。存活检测每 200 ms 检查一次，应用存活但租约超过 15 秒不更新时也会停止命令；长时间挂起或阻塞主程序可能因此中断任务。
+
+事件日志默认在活动文件达到 4 MiB 后封存到 `events/segments/`。分段通过连续序号与哈希链关联，检查点用校验和、分段元数据和末尾事件锚点验证后使用；正常恢复仅处理检查点后的活动尾部。检查点缺失或损坏时退回全量校验重放，封存段缺失或内容校验失败则停止执行。轮转过程中被强杀、活动文件末尾半写和第二轮遗留的单文件日志均可恢复；旧单文件首次升级仍需完整读取一次。
+
+`SessionRecall` 可跨所有分段检索，轮转不会漏掉原活动文件。受管理会话默认不再重复重写旧的整份 AgentOS JSON 诊断日志；如需该诊断通道可设置 `SPAWN_AGENT_OS_JOURNAL=1`。设置 `SPAWN_VERIFY_JOURNAL=1` 可跳过普通快速检查点，从恢复基线开始校验保留的原始日志；第四轮清理后的长期记忆在读取归档时另行校验。该模式用于排查，不用于性能测量。检查点是本地恢复优化，不是抵抗恶意修改的安全边界。
+
+验证包含 `session-round3.test.ts`：真实强杀应用、无需重启的自动清理、监督进程也被杀时的阻断、历史 PID 复用防误杀、清理失败时 PM 持续对话、分段检索、多读取者轮转、检查点损坏回退及缺失分段。另使用构建后的程序和已配置的真实模型做强杀→重启验证，确认旧进程停止后才写入新目标文件，并恢复新目标、E 盘约束和早期记忆。
+
+仍有边界：监督进程也被强杀、权限不足或程序主动脱离原进程树时，无法保证自动清理；不确定时保留阻塞记录，需要人工检查。已经发生的文件/网络副作用不能回滚。配额、保留期与历史索引已在第四轮继续实现，大量任务产生的当前状态仍会增加恢复基线体积。飞书真实网络端到端验证及 Linux/macOS 平台实机验证未在本轮进行。
+
+恢复性能可在构建后运行 `npm --prefix tui-ink run benchmark:session` 复测；默认生成 4001 条、约 17.4 MB 事件，产物保留在仓库 `.test-tmp/`，不使用系统临时盘。可用 `-- --events=数量` 调整规模，或用 `SPAWN_BENCHMARK_DIR` 指定输出父目录。本机 Windows 温缓存测量为快速恢复约 3.8 ms / 0.60 MB 读取，全量重放约 91 ms / 17.4 MB 读取；这是本机比较结果，不是冷盘时延承诺。
+
+## 第四轮：配额、保留期和历史检索索引
+
+原始运行日志和长期记忆分开保留。清理旧分段前先验证原始哈希链，把用户输入、完整历史消息、约束、决策、任务、工具证据等记录保存到带校验和的 gzip 记忆归档，再原子发布 `retention.json` 与 `retention.backup.json` 两份恢复基线。基线包含当前目标、所有会话绑定、近期上下文、未完成任务、待核对工具和未确认收件箱。两份基线写入并回读验证后才删除原始分段，删除中断可重试。旧的逐帧状态/心跳等诊断噪声可过期；这不是保留原始调试轨迹的无损备份。
+
+清理后恢复从保留基线接上后续日志，历史细节由 `SessionRecall` 跨记忆归档检索，原始事件序号和目标版本保持不变。一份基线损坏时使用另一份；两份均损坏时停止恢复，不会悄悄启动空会话。长期记忆归档缺失会阻止恢复，读取时校验失败会明确报错。基线与归档仍应纳入用户自己的备份。
+
+索引按不可变分段/记忆归档独立保存，使用字符三元组 Bloom 过滤候选事件，再对原文做精确子串匹配。支持中文、英文及多个查询词；很短的词和过滤器误报会退回候选扫描。索引缺失、过期或损坏可从源数据重建，不能代替记忆源。检索一次只持有一个源文件句柄，轮转或清理期间会定位到同一序号范围的归档。索引缓存可被配额淘汰，查询按最新事件优先并在达到结果数后停止。
+
+默认配置如下，环境变量单位均为字节或毫秒，可设为 0 进行立即回收/禁用缓存：
+
+| 环境变量 | 默认值 | 管理范围 |
+| --- | --- | --- |
+| `SPAWN_LOG_MAX_BYTES` | 64 MiB | 活动文件与原始分段的回收目标 |
+| `SPAWN_LOG_RETENTION_MS` | 30 天 | 超过保留期的原始分段转为长期记忆归档 |
+| `SPAWN_INDEX_MAX_BYTES` | 32 MiB | 可重建的历史检索缓存 |
+| `SPAWN_STORAGE_MAX_BYTES` | 256 MiB | `.spawn/events/` 总体存储目标，优先淘汰缓存和可清理日志 |
+| `SPAWN_PROCESS_RETENTION_MS` | 7 天 | 已归档、已终止的命令进程记录 |
+| `SPAWN_PROCESS_MAX_BYTES` | 8 MiB | 可清理的已终止进程记录配额 |
+
+PM 启动后约一分钟维护一次，分段完成后约一秒触发维护。压缩、索引构建和文件 I/O 异步进行，准备阶段会让出事件循环；只在发布恢复基线等短步骤持有写锁。维护期间可继续与 PM 提问和改变目标；准备期间新增的输入从后续日志恢复，旧基线不能覆盖新目标。
+
+TUI 中 `/storage` 查看状态，`/storage clean` 立即异步维护。也可在构建后运行：
+
+```powershell
+npm --prefix tui-ink run storage:session -- --root=E:\spawn-work
+npm --prefix tui-ink run storage:session -- --root=E:\spawn-work --clean
+npm --prefix tui-ink run benchmark:history
+```
+
+状态报告保存在 `.spawn/events/storage-status.json`，包含实际占用、清理错误和配额压力；删除失败的原始文件也计入占用。只删除已核实的受管理普通文件，不跟随链接、不递归删除未知内容；运行中、阻塞中或内容不明的进程记录保留。原子写入残留和半写尾部副本至少留存一天，再按保留期清理。基准数据保留在仓库 `.test-tmp/`，默认不写系统临时盘。
+
+配额不是“删记忆直到磁盘低于上限”的硬限制：长期记忆与恢复基线受保护，自身超过目标时报告 `overQuota`，保留数据并提示处理。维护存在短暂的写入/准备空间开销，也不能管理整个仓库、旧诊断通道或系统临时目录中的任意日志。用户应留出磁盘空间，不能用该机制代替文件系统容量监控。
+
+验证包含 `session-round4.test.ts`：配额/保留期、完整早期记忆、待处理输入/工具/收件箱、基线单副本恢复、物理删除失败重试、索引重建与精确结果对照，以及归档、首份基线和部分删除三个强杀窗口。构建后的程序还使用真实 `k3` 模型验证了部分删除时强杀后重启，旧记忆、最新目标及未确认操作均保留。
+
+仍有不足：受保护记忆持续增长时需要扩容或明确的业务归档/删除策略；两份基线和记忆归档都在本地，无法抵抗磁盘损坏。索引是可淘汰的词面过滤，不提供语义检索；冷索引重建、大量分段及短查询仍可能较慢。清理后的旧诊断轨迹不能完整重建。飞书真实网络端到端验证及其他操作系统实机验证仍未覆盖。
+
+## 第五轮：独立备份、冷检索与可追溯交接
+
+日志清理现在要求先完成独立备份；备份失败时保留原始分段并在维护报告中说明原因。在线备份短暂锁定事件边界，固定恢复基线、不可变归档/分段及已提交的活动尾部，然后异步上传到独立目录。备份对象按 SHA-256 去重，发布恢复点前同时验证对象字节、归档逻辑校验和、原始事件哈希链和最终序号。不会仅因文件大小相同就认定归档完好。旧快照引用的对象保留；无引用的上传残留至少留一天。
+
+默认备份父目录为工作目录加 `-backups`，再按工作目录哈希区分工作区。例如工作目录为 `E:\spawn-work`，备份就在 `E:\spawn-work-backups\<hash>`，不会默认写入 C 盘。`SPAWN_BACKUP_DIR` 可指定其他备份父目录；`SPAWN_BACKUP_KEEP` 默认保留最近 5 个有效恢复点，最小为 1。相同内容/序号不会重复生成恢复点。`/backup` 在线创建，`/backup list` 列出恢复点，期间可继续向 PM 发消息。
+
+构建后可用独立 CLI。下例的 `--root` 必须指向实际包含 `.spawn` 的程序工作目录；若程序从 `E:\spawn-work\tui-ink` 启动，则相应改为该路径。
+
+```powershell
+npm --prefix tui-ink run backup:session -- create --root=E:\spawn-work
+npm --prefix tui-ink run backup:session -- list --root=E:\spawn-work
+npm --prefix tui-ink run backup:session -- verify --root=E:\spawn-work
+# 先退出目标工作区的程序；精确修复损坏归档，不回滚新目标与后续日志
+npm --prefix tui-ink run backup:session -- repair-archives --root=E:\spawn-work
+# 将备份恢复到空工作区；可用 --id=恢复点ID 指定版本
+npm --prefix tui-ink run backup:session -- restore --root=E:\spawn-work --to=E:\spawn-recovered
+```
+
+完整恢复默认拒绝覆盖已有事件目录；确需替换时显式加 `--replace`，旧目录移到 `.spawn/events.before-restore-<uuid>` 保留。恢复先在暂存区校验，再写持久恢复事务并切换目录。中途退出后，正常启动会提示未完成恢复；重新执行相同 restore 命令续完事务。最新恢复点对象损坏时，自动选择较旧的有效恢复点，并在结果中明确返回 `fallback`、实际 `id` 和 `latestAvailable`，需要核对回退范围。修复归档只接受与当前基线精确匹配的副本，不会静默退回旧目标。运行与恢复共用工作区所有权锁，避免一边恢复一边执行任务。
+
+备份覆盖事件来源、恢复基线和长期记忆；代码文件、产出文件、配置、凭据与旧秘书私有快照不在该备份范围内。恢复后的统一上下文从事件状态和历史检索取得记忆；已经发生的外部副作用仍需核对。将备份复制到另一台机器时，保留其 `objects/` 与 `snapshots/`，用原 `--root` 值定位工作区哈希，并把 `SPAWN_BACKUP_DIR` 指向复制后的父目录。
+
+检索增加持久的源目录 Bloom 摘要，先排除不相关归档，再打开候选源的事件索引，减少大量小文件打开。缺失/损坏索引时直接精确扫描返回结果，每个工作区最多并发 2 个后台重建任务；单次维护最多补齐 64 个未覆盖源，避免反复维护同一批尾部分段。目录与事件索引都是可淘汰缓存，损坏或指纹不匹配时回退源数据；短词仍可能需要全扫描。目录摘要按需加载，带校验和，跨进程重启生效。
+
+### 默认分工与组织层级的折中
+
+- `adaptive` 为默认：简单任务由 PM 自己完成；较长且边界清楚的工作直接 PM → Worker，PM 保持用户对话。需要协调多个工作流时才用 PM → Leader → Worker；默认拒绝 Leader 再创建 Leader。
+- `hierarchical` 保留为显式选项，适用于确实需要独立负责人协调的工作；`single` 完全不创建子 agent。通过 `SPAWN_ORCHESTRATION` 选择。秘书、任务记录、恢复和历史查询不依赖组织层级，不必为记忆而增加管理 agent。
+- 子任务停止时保存停止原因、自报验收证据、交接摘要、未完成 TODO、产物路径与最后错误。PM 可用 `TaskStatus` 查询；大量任务按 `nextOffset` 翻页，或用 `agent` 精确定位，长证据用 `SessionRecall`。子任务的 `success` 仍需独立验收。
+- 修复了两个静默丢失窗口：工具尚未执行/返回时的提前完成会被拒绝；PM 一轮回复显示 done 后仍会接收子任务终止通知。通知先持久入队，即使父 PM 暂未在线也可在恢复后读取；失效的中间负责人会向上转交到仍可接管的 PM。旧需求版本的结果不能唤醒新任务。
+- 对只汇报后停在 idle、TODO 未完成却报告成功、模型请求最终失败及执行预算耗尽，采用有限次纠正后失败交接。停止后清掉排队的内部请求，不再默默占用模型调用。由 PM 根据证据决定续派或换方法，不把每次执行错误都转成用户必须选择的四选一。
+
+`session-round5.test.ts` 覆盖在线尾部快照、独立恢复、归档精确修复、损坏恢复点回退、备份失败不删日志、恢复切换中断、运行/恢复互斥、同大小归档损坏、冷索引/跨进程目录、分页任务追溯、提前完成及静默停止等场景。真实 `k3` 已验证：CLI 修复损坏归档并恢复到新目录，恢复后检索早期中文记忆与失败任务；PM 直接派真实 Worker 写文件/Read 核对，执行中继续接受追问，结束后接收持久交接。测试使用隔离的 E 盘工作区，未走飞书真实网络，也未覆盖完整人工 TUI 操作。
+
+基准可复测：`npm --prefix tui-ink run benchmark:history -- --events=1200 --segment-bytes=1024`。本机生成 1201 条事件、401 个归档：归档全扫描约 291 ms，新 Node 进程读取目录并检索约 31 ms，打开 1 个源、跳过 400 个；源与索引约 1.9 KB，目录约 96.6 KB。同进程热查询约 4.9 ms。索引完全缺失时扫描原始日志约 412 ms，同时只排队 2 个重建任务。文件系统缓存是热的，规模和数据分布会改变表现，不是冷盘承诺。
+
+仍有不足：默认备份与工作区同盘，不能抵抗磁盘故障；需要将 `SPAWN_BACKUP_DIR` 放到其他卷或自行同步。恢复点有数量限制，备份对象、受保护记忆及恢复隔离目录没有总字节硬配额，长期增长仍需管理。大基线/大量归档的完整备份校验有线性 I/O 开销，目录摘要也尚未分片，首次无索引与短词检索仍较慢。任务自动续派策略依靠 PM 判断，尚无确定性的重试预算/验收调度器；跨 Worker 文件写入冲突仍需靠任务边界约束。极短的所有权切换或锁文件写入窗口若被强杀，可能留下不完整锁，系统会拒绝猜测并要求人工核查。其他操作系统实机、飞书真实链路与磁盘断电一致性仍未覆盖。
+
+## 第六轮：持久续派预算、独立验收与 Worker 定位
+
+第五轮中依赖 PM 自行判断重派次数的部分，改为运行时控制的逻辑任务。任务 ID 根据会话、需求版本和规范化目标生成，与 Worker 的临时 ID 无关。一次任务的后续尝试共享次数、轮数、模型请求数、工具数和总时限，换 Worker ID 或重启程序不能归零。已验收、已耗尽、正在评估或正在续派的目标不能通过再次 spawn 重做；原任务用 `TaskRetry` 申请继续，明确的新需求才进入新版本。不同目标也受会话当前版本总计 12 次 Worker 派工约束，可通过 `SPAWN_TASK_ATTEMPTS_PER_REVISION` 配置为 1–100。
+
+默认任务预算与可选的 `dispatch.recovery` 字段：
+
+| 字段 | 默认值 | 硬上限 |
+| --- | --- | --- |
+| `mode` | `auto` | 可改 `manual`，只暂停后续续派 |
+| `max_attempts` | 2 次，包含首次 | 3 次 |
+| `max_turns` | 40 个运行轮次，含网络重试状态 | 80 |
+| `max_requests` | 60 次实际模型请求，包含 HTTP 重试 | 120 |
+| `max_tools` | 80 次 Worker 工具实际执行 | 160 |
+| `total_ms` | 首次派工起 20 分钟，含等待/退避 | 60 分钟 |
+
+自动续派仅用于已确认有新进展的可恢复停止、验收未通过，或可识别的临时网络/服务错误。权限/凭据错误、主动取消、没有新进展或不明确的阻塞交给 PM 核查，不会无限刷调用。先持久化续派预约和下一尝试 ID，再启动 Worker；退避等待期间可继续与 PM 沟通。运行中有总时限保护，验收测试也使用剩余时限。预算耗尽会明确记录 `exhausted`，不会自动放宽。组织策略冲突直接交给 PM；容量不足的等待受原总时限约束。
+
+续派前先等待旧工具取消及孤儿进程恢复完成，核对操作凭据。Write/Edit 完成后记录文件哈希；后续尝试发出相同操作且文件仍匹配时，复用已确认结果，不再次写入。文件被其他操作改动时阻止自动重做。命令成功也不代表其外部副作用可自动重放，因此 Bash/测试等无法用文件哈希完整描述的操作，默认需要 PM 核查。状态不明的写入或命令也会阻止自动续派。
+
+PM 工具如下，Worker 无权调用控制/验收工具：
+
+| 工具 | 用途 |
+| --- | --- |
+| `TaskStatus(agent?, task?, offset?, limit?)` | 查看停止交接、逻辑任务预算、验收结果；传 `task` 分页查看操作凭据 |
+| `TaskRetry(task, reason)` | 提供具体的新方案，在原预算内申请续派，不能直接绕过不确定副作用 |
+| `TaskPolicy(task, mode)` | 暂停/恢复后续自动续派，不重置预算、不打断当前 Worker |
+| `TaskReconcile(task, operation, evidence, reason)` | PM 使用新鲜的独立工具调用 ID，记录现场核查与“不得重复”决定；再推进剩余工作 |
+| `TaskReview(task, verdict, evidence, rationale)` | PM 独立验收或拒绝；证据必须来自最新 Worker 停止后的实际检查，不能自报或复用旧证据 |
+
+`evidence` 为逗号分隔的独立检查调用 ID。TaskReconcile 是可追溯的 PM 人工判断，不是对外部系统的数学证明；它不会自动重新执行旧命令。已核查为“不得重复”的相同命令再次出现时，返回核查记录并跳过。自动验收与 PM 接受都不能覆盖已经失败的机器检查。TUI `/tasks` 查看当前会话预算，`/tasks pause [taskId]` 暂停后续自动续派，`/tasks resume [taskId]` 恢复；省略 ID 对当前会话全部任务生效。暂停期间总时限仍继续计时。`/pause` 中断所选 Worker 时会留下主动停止记录。
+
+`agent.done(success:true)` 只是自报完成。运行时验收状态独立为 `evaluating`、`awaiting_review`、`accepted` 等。可在 dispatch 中声明机器检查，每个 criterion 对应 acceptance_criteria 中从 0 开始的序号：
+
+```json
+{
+  "background": "实现并验证结果文件",
+  "constraints": ["只修改指定文件"],
+  "acceptance_criteria": ["结果包含完成标记", "项目测试通过"],
+  "stop_conditions": ["agent.done"],
+  "worker_profile": "implement",
+  "recovery": {"mode":"auto","max_attempts":2,"max_requests":20},
+  "acceptance_checks": [
+    {"criterion":0,"type":"file_contains","path":"result.txt","value":"FINAL"},
+    {"criterion":1,"type":"test_suite","path":"."}
+  ]
+}
+```
+
+支持 `file_contains`、`file_sha256` 和 `test_suite`。文件检查最多读取 8 MiB 普通文件，路径不能越出工作区，包括链接解析后的路径。`test_suite` 由控制器在 Worker 停止后独立运行项目测试，严格要求解析到通过测试、且执行成功；空命令的退出码 0 不算通过。每次尝试的验收调用有稳定 ID，恢复时不会盲目重复不确定的验收命令。所有验收标准均有覆盖且检查通过，才自动进入 accepted；未提供完整机器检查的主观标准仍需 PM 新鲜证据与评审理由。测试命令由项目现有配置检测，不执行模型随口生成的验收命令。
+
+### 与 OMO 角色分工的关系
+
+借鉴按任务能力分工，不照搬固定角色名或固定链路，不引入 OMO 依赖。仍保留 PM → Worker 的直接派工；Worker 的定位是 dispatch.worker_profile 配置，同一套持久生命周期与预算适用于所有定位：
+
+| 定位 | 工作与工具范围 |
+| --- | --- |
+| `implement` | 修改实现、执行任务、提交可核对证据 |
+| `research` | 读文件、搜索与检索，不允许写入/执行命令 |
+| `review` | 只读审查与证据整理，不修改被审查实现 |
+| `verify` | 读与检索、RunTests、TypeCheck；不能 Write/Edit/Bash 修改实现 |
+
+只有任务确实需要时才派对应定位，不要求调研、实现、审查、验证每种都创建一个 agent。profile 限制不是 OS 沙箱；项目测试自身也可能写文件或访问外部系统。秘书、事件、预算、验收、重启恢复独立于这些定位和管理层级。复杂协同仍可显式选择 hierarchical；负责人失效且分层策略不允许直接续派时，会交给 PM 调整安排，不悄悄违反组织策略。
+
+验证：`session-round6.test.ts` 包含自动续派去重、错误完成拒绝、有限重试、需求变更隔离、暂停/恢复、网络请求预算、独立验收、归档/备份/跨进程预算、人工副作用核查、严格测试套件、验收中断及伪造协议结果拒绝等 20 项测试。全量 660 项中 653 通过、7 项原有 TODO、0 失败；headless 82 通过，类型检查与构建通过。验收证据必须有实际工具执行来源，模型输出的 tool.result 不能伪造独立验收。真实 k3 使用隔离 E 盘工作区验证：首次写入部分结果后强杀程序，重启自动续派，旧 Write 经哈希核对后不再执行，继续 Read/Edit 完成文件，独立文件 SHA-256 与实际 Node 测试均通过；期间 PM 可回答追问。共使用 2 次尝试，预算与凭据跨重启保留。真实验证使用受控故障注入提示词与真实模型/工具，不等于对任意自然任务的全覆盖验收。
+
+仍有不足：预算约束主要覆盖受管理的 Worker，PM 自己和传统 Leader 的总花费尚无统一金额/Token 上限；自动验收依赖事先约定标准和项目测试质量，不能自动证明复杂业务正确；测试输出解析有框架覆盖边界，严格模式可能拒绝不识别的输出格式。外部副作用核查依赖 PM 证据判断，无法保证网络请求恰好执行一次；命令语义改写也无法全部识别为同一操作。并行 Worker 仍共用工作区，未实现文件锁/隔离工作树，验收是某一时刻的结果，后续修改可能使其过期。完全耗尽后需用户明确调整需求，暂不支持在同一版本内人工增加预算。历史任务/操作凭据仍会增长，完整人工 TUI、飞书真实网络和其他系统实机未在本轮覆盖。
+
+
+## 第七轮：统一预算与并行文件隔离
+
+默认仍为 PM 直接派 Worker、持续接受用户消息，组织层级可选。本轮不依赖 OMO。此前第六轮列出的 PM 总预算和并行共用文件问题已由以下机制替代。
+
+### 持久总预算
+
+PM、传统 Leader、Worker、续派、根会话和分支共用当前项目 `.spawn` 内的一个累计预算池；切换需求版本、换 Worker ID、重启都不清零。每次 HTTP 请求先预留输入和输出额度并限制 max_tokens，每次工具调度先扣额度；供应商返回有效用量后结算。断流、强杀或缺少用量时保留全部预留量，宁可提前停，不把未知账单视为零。旧任务迟到的结算也会记账。工具额度统计调度尝试，包含失败或去重命中的调度。BudgetStatus、TaskStatus 和任务治理查询不消耗工具额度。
+
+| 环境变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| SPAWN_SESSION_MAX_REQUESTS | 200 | 全项目受管理模型请求总次数 |
+| SPAWN_SESSION_MAX_TOKENS | 2000000 | 输入、输出与未结算预留总 Token |
+| SPAWN_SESSION_MAX_TOOLS | 400 | 工具调度次数 |
+| SPAWN_COMMUNICATION_REQUESTS | 8 | 在上述总额内预留给用户追问的请求 |
+| SPAWN_COMMUNICATION_TOKENS | 64000 | 在上述总额内预留沟通 Token，最多总额四分之一 |
+| SPAWN_SESSION_MAX_USD | 0 | 可选估算金额上限，0 为未启用金额限制 |
+| SPAWN_INPUT_USD_PER_MILLION | 0 | 显式配置的每百万输入 Token 美元估价 |
+| SPAWN_OUTPUT_USD_PER_MILLION | 0 | 显式配置的每百万输出 Token 美元估价 |
+
+金额上限必须同时提供两项价格；不自动猜测厂商价格。价格为本地估算，并非供应商账单承诺。首次初始化后改变环境变量不会重置已持久化额度；预算耗尽时用本地命令显式追加：
+
+```text
+/budget
+/budget add requests=20 tokens=100000 tools=40
+/budget add usd=1
+/contextbudget 100k
+```
+
+`/budget` 为离线总额度状态，`add` 只增加上限，不清零消耗，模型没有追加额度工具。旧的 Token 展示告警命令改名 `/contextbudget`，不参与硬预算。预算耗尽后用户仍能获得本地状态；有限沟通余量允许 PM 解释进度，但不能派工、调用工具或修改状态。余量耗尽后不会为聊天无限请求模型。
+
+计数写入事件和 `.spawn/budget-floor.json`。同项目恢复旧事件备份时保留本地已知消耗，不能靠回滚备份退回额度。恢复到全新目录时无法推断原目录在备份之后的费用，需核对供应商账单并迁移预算底账。删除整个 `.spawn` 或启动项目外的其他程序不受此预算管理。
+
+### 私有快照、验收与冲突
+
+新任务默认 `SPAWN_WORKSPACE_ISOLATION=snapshot`，在 `.spawn/workspaces/<task>/<uuid>/tree` 拷贝普通项目文件；同一逻辑任务续派复用原副本。历史旧任务维持原来的 shared 语义，不能追溯隔离已发生的写入。仅操作者可设置 `SPAWN_WORKSPACE_ISOLATION=shared` 关闭新任务隔离，模型派工参数不能关闭。
+
+Worker 的文件工具、相对路径命令与测试在私有副本执行，原目录在验收后才发布。PM 用 `Read(path,task)`、`RunTests(project_dir,task)` 或 `TypeCheck(project_dir,task)` 查看和测试目标副本；人工验收拒绝拿原目录的旧内容当证据。发布先检测全部差异的基线与当前哈希，不同文件可合并，同文件冲突会保留双方并阻塞，不自动重派覆盖。续派前也检查已知冲突，避免为冲突消耗新尝试。
+
+PM 先用 WorkspaceStatus(task) 和 Read 检查双方。WorkspaceResolve(task,path,expected,choice) 要求当前原目录的精确 SHA-256（不存在为 missing）；ours 保留任务版本，theirs 保留原目录。只在目标没有再次变化时记录解决，然后 WorkspacePublish(task) 显式发布。解决或发布本身不意味着业务验收通过。
+
+发布事务先持久记录每个文件的 before/after 哈希；强杀后逐文件幂等恢复。外部改动导致恢复冲突时只阻塞相关任务，其他状态查询和 PM 沟通继续可用。需求已过期的待发布事务会持久放弃，保留现场供检查，绝不继续完成旧需求。多文件发布不是文件系统原子事务，中途已发布的文件不会擅自回滚。
+
+快照排除 `.git`、`.spawn`、`node_modules`、`.test-tmp`、`.venv`、`venv`；遇到链接或特殊文件拒绝建立快照。默认最多 10000 文件、128 MiB，可用 SPAWN_WORKSPACE_MAX_FILES、SPAWN_WORKSPACE_MAX_BYTES 显式调整。依赖没有复制，Node 可以沿父目录查找现有依赖；其他语言和工具可能需要额外配置。
+
+### 验证与当前边界
+
+专项测试覆盖共享预算、重启与需求变更不退额、未知用量、金额、旧备份底账、并行冲突、不同文件合并、私有命令目录、人工验收版本、发布中断、恢复时外部冲突、过期事务、PM 沟通余量和离线预算命令。旧轮次需要即时共享文件的回归夹具显式设为 shared；第七轮专项验证默认 snapshot。
+
+真实 k3 验证使用受控提示词、真实 HTTP 与工具，报告保存在 E 盘 `tui-ink/.test-tmp/live-round7-*/real-verification.json`：强杀后恢复续派，复用已核对的 Write，独立 SHA-256 和实际 Node 测试通过后发布；两个并行 Worker 修改同一文件，一方成功、一方冲突，双方内容保留，PM 期间正常回复；3 次模型请求总额含沟通预留，第四次追问仅返回本地预算状态，不新增模型请求。这些不是任意自然任务的全面成功率评测。
+
+仍有不足：快照是工作副本隔离，不是 OS 沙箱；任意 Bash、测试或显式绝对路径可能访问副本外部或外部系统，无法保证外部副作用恰好执行一次。Windows 上已实际验证，其他系统尚未实机验证。内容哈希没有完整覆盖文件权限、可执行位和重命名语义；大项目复制有磁盘和 IO 开销，工作副本/中断草稿尚无自动回收配额。事件记忆备份包含任务元数据，但不包含这些项目文件副本，跨目录恢复需另外备份项目及 `.spawn/workspaces`。金额依赖用户估价与供应商上报，不能代替账单硬限额；旧任务仍可能使用共享工作区。复杂业务验收、真实飞书网络及完整人工 TUI 体验仍需要补充验证。
+
+
+本轮最终验证：全量 676 项，669 通过、7 项原有 TODO、0 失败；headless 82 项通过；TypeScript 类型检查、构建和差异空白检查通过。可复现的真实模型脚本为 `tui-ink/scripts/verify-round7-{recovery,parallel,budget}.mjs`，从 tui-ink 执行 `npm run test:live:round7`（使用现有模型配置并消耗真实 API 额度，不在普通测试中自动运行）。脚本只在项目 `.test-tmp` 建立独立工作区，关闭服务/飞书外发，结束后保留验证报告。
+
+
+## 订阅/API 分账与按定位选择模型（OMO 风格）
+
+本实现借鉴 OMO 的“定位 + 有序候选模型链 + 独立提供商通道”，不引入 OMO 整套运行时或固定角色层级。调研、实现、审查、验证仍是 Worker 的定位，PM 直接协调与持续沟通保持不变。
+
+OMO 源码核对基于 `code-yeongyu/oh-my-openagent@657a02ef48cc6653ba845f0bb8c71b1097a64aa2`：`packages/omo-senpi/src/components/side-panel/usage/` 分别管理 Claude/Codex 订阅滚动窗口、比例、重置时间、共享缓存与请求退避；`side-panel/store.ts` 对结束的子任务成本去重累计；`docs/reference/features.md` 区分 chatgpt-subscription 与 openai API，并使用候选链。它的用量展示不等于自己向用户结算厂商账单。spawn 使用相同的分类思想，自行实现与现有持久任务/预算兼容的适配层。
+
+### 已接入的通道
+
+| 接入 | 模型配置 | 认证 | 本地费用展示 |
+| --- | --- | --- | --- |
+| Claude Pro/Max | transport=claude-cli，billing.mode=subscription | 已安装的官方 Claude Code 登录 | 记录订阅请求与 Token，不把 CLI 的 API 等价估价当新增账单 |
+| ChatGPT/Codex | transport=codex-cli，billing.mode=subscription | 官方 Codex CLI 的 ChatGPT 登录 | 同上；账号支持的模型名由官方 CLI 决定 |
+| OpenAI/Anthropic/兼容 API | transport=http（默认），billing.mode=api（默认） | 对应 API Key 与接口 | 按该模型显式价格或环境变量兜底价格估算 |
+| 提供受支持 HTTP 接口的 Coding Plan | transport=http，billing.mode=subscription | 套餐专用 Key 和对应接口 | 按订阅用量记账，不套用逐 Token API 单价 |
+
+Claude/Codex OAuth 凭据由官方 CLI 保存和刷新，spawn 不读取或复制其令牌文件。每次使用前检查登录类型，拒绝 API-key 登录冒充订阅；子进程移除继承的 API Key、替代端点/云提供商配置。CLI 子进程由现有监督器管理，取消、强杀和孤儿清理使用同一恢复机制。CLI 会话不持续保存，spawn 仍负责长会话事件、当前状态及历史上下文。
+
+Claude 使用单轮、无内置工具、无 MCP、无用户/项目设置的 print 模式，并设置输出上限。Codex 使用临时会话、read-only、忽略用户配置、禁用 shell/并行 agent/插件/应用/浏览器等能力；只接收文本/推理和一个最终 turn，发现内部工具结果时拒绝当作有效完成。真正的工具执行都通过 spawn 的任务副本、预算和验收机制。
+
+### 注册、分配与降级
+
+```text
+/connect claude-main claude-subscription sonnet
+/connect codex-main codex-subscription <该账号支持的模型ID>
+/route pm claude-main codex-main k3
+/route implement codex-main claude-main k3
+/route research claude-main k3
+/route review claude-main codex-main
+/route verify codex-main claude-main
+/route
+/budget
+```
+
+其中 k3 是你已有的模型注册名，示例不会自动创建 API Key。候选顺序由用户决定，不硬编码“最新模型”或假定登录就拥有所有模型。未配置定位链时保留已有角色模型配置。`/route <定位> off` 恢复角色默认模型。`secretary` 是预留的模型定位；当前秘书主要进行本地状态/记忆整理，不因为配置候选链而新增付费请求。
+
+每个模型保留完整的 provider、model、transport、billing 和凭据，切换候选时整体切换，避免只换模型名却继续使用另一家的 Key。设置定位链后，派工中的模型覆盖必须属于该链，不能让 Worker 绕开订阅计费策略。
+
+订阅之后的 API 候选默认跳过。只有操作者执行 `/route api-fallback on` 才允许在订阅失败后转向 API；`/route api-fallback off` 关闭。以 API 开头的定位链属于操作者主动指定 API 首选。配置修改对新启动/恢复的 agent 生效；运行中的 agent 不热切换配置。
+
+登录、限流、模型不存在、服务不可用等可用性失败，可以沿允许的链降级；取消、总预算耗尽、无效协议或工具拒绝不能靠换模型绕过。单次发送最多 4 个受管理尝试，不无限遍历。所有通道和降级都计入原来的项目总请求/Token/工具/续派额度。每次选择与降级写入 model.selected/model.fallback 事件，可通过 SessionRecall 检索。没有成功的订阅候选、且不允许 API 降级时暂停并向 PM 交接。
+
+### 费用与额度的边界
+
+`/budget` 的 byBilling.api 与 byBilling.subscription 分开展示请求、Token 和本地 API 估价；总池仍统一约束两种方式。未定价 API 请求在 unpricedApiRequests 标记为未知，金额 0 不表示免费。缺少供应商用量的调用保留完整预留，历史备份回滚不返还本地已知消耗。
+
+```text
+/billing <已注册模型名> api <输入美元/百万Token> <输出美元/百万Token>
+/billing <套餐专用模型名> subscription
+```
+
+API 每模型价格优先于 SPAWN_INPUT_USD_PER_MILLION、SPAWN_OUTPUT_USD_PER_MILLION。缓存输入目前按完整输入单价保守估算，未实现各厂商缓存折扣账单对账。订阅的套餐费、滚动额度和额外用量付费由厂商管理，microUsd=0 仅表示没有本地逐 Token API 估价，不承诺真实新增费用为零。若官方账户开启订阅超额付费，需在厂商侧管理。
+
+当前未抓取厂商私有额度接口，套餐剩余百分比/重置时间显示为未知，不伪造套餐余额。尚无跨项目共享的订阅额度缓存、账号轮换或 Copilot 的原生订阅适配器；Copilot 不能仅凭设置 billing.mode 就当作已接通。后续可在现有注册表与候选链下增加提供商适配器。CLI 内部网络重试对 spawn 不透明，计数单位为一次受管理 CLI 调用，而非承诺等于一次底层 HTTP；Codex CLI 没有在本实现中提供严格的单次输出 Token 上限，实际用量结算后会阻止后续超预算执行，单次可能超过预留。CLI 有统一超时和监督器取消，金额/额度的最终硬限制仍应配置在提供商侧。
+
+验证：新增计费/路由专项 23 项通过；全量 699 项中 692 通过、7 项原有 TODO、0 失败；headless 82 项通过，类型检查与构建通过。真实 Claude 订阅、ChatGPT/Codex 订阅分别验证文本调用；真实“Claude 订阅 PM + API Worker”与“ChatGPT/Codex 订阅 PM + API Worker”均验证定位路由、执行期间追问、私有副本、独立 SHA-256 验收和发布以及分账。可选真实验证：
+
+```text
+npm run build
+node scripts/verify-subscription.mjs claude sonnet
+node scripts/verify-subscription.mjs codex <该账号支持的模型ID>
+node scripts/verify-billing-mixed.mjs
+node scripts/verify-billing-mixed.mjs --codex <该账号支持的模型ID>
+```
+
+这些命令消耗真实额度，需要已有官方 CLI 登录和 API Worker 配置，证据保留在项目 E 盘 `.test-tmp/live-*` 中，不随 Git 上传。

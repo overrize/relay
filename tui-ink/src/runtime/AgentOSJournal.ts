@@ -1,3 +1,5 @@
+import { writeSnapshot } from "../memory/atomic.js";
+import { orchestrationMode, type OrchestrationMode } from "../pm/mode.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -122,7 +124,7 @@ const LEADER_TO_PM = new Set<AgentOSCommand>([
 ]);
 const SECRETARY_CMDS = new Set<AgentOSCommand>(["wiki.patch", "ctx.provide", "decision.record", "exception.report"]);
 
-export function validateRoute(env: AgentOSEnvelope): RouteDecision {
+export function validateRoute(env: AgentOSEnvelope, mode: OrchestrationMode = "hierarchical"): RouteDecision {
   if (!env.id || !env.trace_id || !env.task_id) {
     return { ok: false, code: "missing_identity", detail: "id, trace_id and task_id are required" };
   }
@@ -132,6 +134,8 @@ export function validateRoute(env: AgentOSEnvelope): RouteDecision {
   if (env.from.role === "worker" && env.to.role === "user") {
     return { ok: false, code: "worker_to_user_blocked", detail: "Worker cannot send commands directly to user" };
   }
+  if (mode === "adaptive" && env.from.role === "worker" && env.to.role === "pm") return allow(new Set([...WORKER_TO_LEADER, "ctx.provide"]), env.cmd);
+  if (mode === "adaptive" && env.from.role === "pm" && env.to.role === "worker") return allow(LEADER_TO_WORKER, env.cmd);
   if (env.from.role === "worker" && env.to.role === "pm") {
     return { ok: false, code: "worker_to_pm_blocked", detail: "Worker must report through its Leader" };
   }
@@ -179,7 +183,7 @@ export interface CreateEnvelopeInput<TPayload> {
 export class AgentOSJournal {
   private snapshot: AgentOSJournalSnapshot;
 
-  constructor(private readonly filePath: string) {
+  constructor(private readonly filePath: string, private readonly mode?: OrchestrationMode) {
     this.snapshot = this.load();
   }
 
@@ -204,7 +208,7 @@ export class AgentOSJournal {
   }
 
   append<TPayload>(env: AgentOSEnvelope<TPayload>): RouteDecision {
-    const route = validateRoute(env);
+    const route = validateRoute(env, this.mode ?? orchestrationMode());
     if (!route.ok) return route;
     this.snapshot.entries.push(env as AgentOSEnvelope);
     this.snapshot.next_seq = Math.max(this.snapshot.next_seq, env.seq + 1);
@@ -235,7 +239,7 @@ export class AgentOSJournal {
 
   private save(): void {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-    fs.writeFileSync(this.filePath, JSON.stringify(this.snapshot, null, 2), "utf8");
+    writeSnapshot(this.filePath, JSON.stringify(this.snapshot, null, 2));
   }
 }
 

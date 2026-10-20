@@ -26,7 +26,7 @@ export class SecretaryProxy extends EventEmitter {
   private decisionSeq: number;
   private destroyed = false;
   // M1-8: tool.calls issued but not yet resolved — persisted to tombstone for resume.
-  private _inflightTools = new Map<string, { id: string; name: string; needs_approval?: boolean }>();
+  private _inflightTools = new Map<string, { id: string; name: string; args?: unknown; needs_approval?: boolean }>();
   // Accept btw messages addressed to "<id>-secretary" as well as "<id>"
   private readonly secretaryAlias: string;
   // Bus log offset: the working_set reflects all events published up to this point.
@@ -37,8 +37,8 @@ export class SecretaryProxy extends EventEmitter {
     super();
     this.memory = memory;
     // Resume: init seqs from existing data to avoid ID collisions
-    this.factSeq = memory.working_set.facts.length;
-    this.decisionSeq = memory.working_set.decisions.length;
+    this.factSeq = Math.max(0, ...memory.working_set.facts.map((f) => Number(f.id.match(/^f(\d+)$/)?.[1] ?? 0)), Date.now());
+    this.decisionSeq = Math.max(0, ...memory.working_set.decisions.map((d) => Number(d.id.match(/^d(\d+)$/)?.[1] ?? 0)), Date.now());
     this.secretaryAlias = `${memory.agent_id}-secretary`;
     // Cursor: if the tombstone carries a cursor from the SAME process epoch, honour it
     // (intra-process recovery). Otherwise discard it — the ring was reset at restart.
@@ -75,13 +75,15 @@ export class SecretaryProxy extends EventEmitter {
       case "tool.call":
         // M1-8: track in-flight tool.calls so an interruption's "现场" survives.
         if (ev.agent === id) {
-          this._inflightTools.set(ev.id, { id: ev.id, name: ev.name, needs_approval: ev.needs_approval });
+          this._inflightTools.set(ev.id, { id: ev.id, name: ev.name, args: ev.args, needs_approval: ev.needs_approval });
+          this.saveAsync();
         }
         break;
 
       case "tool.result":
         if (ev.agent === id) {
           this._inflightTools.delete(ev.id); // completed → no longer in flight
+          this.saveAsync();
           if (ev.ok) {
             this.addFact({
               id: `f${++this.factSeq}`,
@@ -137,6 +139,7 @@ export class SecretaryProxy extends EventEmitter {
           }
           // 保存最后 todo 状态，供 resume 注入
           this.memory.tombstone.last_todo = JSON.stringify(ev.items);
+          this.saveAsync();
         }
         break;
 
@@ -263,7 +266,10 @@ export class SecretaryProxy extends EventEmitter {
   }
 
   destroy(): void {
+    if (this.destroyed) return;
+    this.flushSync();
     this.destroyed = true;
+    this.emit("destroy");
     this.stopTimer();
   }
 
@@ -283,16 +289,15 @@ export class SecretaryProxy extends EventEmitter {
 
   private addFact(fact: MemoryFact): void {
     const facts = this.memory.working_set.facts;
-    // CJK-aware n-gram Jaccard: Chinese text has no whitespace, so token-level
-    // Jaccard degenerates into exact-match only and misses near-duplicate facts.
-    const SIMILARITY_THRESHOLD = 0.72;
+    // Lexical similarity is for retrieval, never for destructive deduplication.
+    // Negation and changed conditions can be almost identical to the old claim.
     const now = Date.now();
 
-    // Look for a similar existing fact
+    // Merge only exact normalized repeats
     let merged = false;
     for (let i = 0; i < facts.length; i++) {
       const existing = facts[i];
-      if (factSimilarity(existing.text, fact.text) >= SIMILARITY_THRESHOLD) {
+      if (existing.text.normalize("NFKC").trim() === fact.text.normalize("NFKC").trim()) {
         // Merge: bump weight, update text to the longer one, refresh ts
         const previousWeight = existing.weight ?? 1;
         const newWeight = (existing.weight ?? 1) + (fact.weight ?? 1);
@@ -328,6 +333,7 @@ export class SecretaryProxy extends EventEmitter {
   }
 
   private addDecision(d: MemoryDecision): void {
+    if (this.memory.working_set.decisions.at(-1)?.text === d.text) return;
     this.memory.working_set.decisions.push(d);
     this.saveAsync();
   }

@@ -2,6 +2,7 @@
 // 订阅全局事件流，执行同步阻断（preCheckSpawn）和异步告警（observe + tick）
 // 没有 LLM，没有 sendCommand 能力；只读 + 发 pm.alert
 
+import { orchestrationMode, type OrchestrationMode } from "./mode.js";
 import { EventEmitter } from "node:events";
 import type { TuiEvent, AgentRunState } from "../protocol.js";
 import { getState } from "../store.js";
@@ -63,6 +64,7 @@ export class ProcessManager extends EventEmitter {
   // ── Auto-background tracking ────────────────────────────────────────────────
   /** childAgentId -> ForegroundSpawnHandle */
   private foregroundSpawns = new Map<string, ForegroundSpawnHandle>();
+  private foregroundTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** Register a new spawn and return a handle that resolves in 30s or switches to bg at 2min. */
   registerSpawn(childId: string, parentId: string): ForegroundSpawnHandle {
@@ -91,19 +93,24 @@ export class ProcessManager extends EventEmitter {
     this.foregroundSpawns.set(childId, handle);
 
     // Schedule 2min auto-background transition
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      this.foregroundTimers.delete(childId);
       const h = this.foregroundSpawns.get(childId);
       if (h && h.childId === childId && h.mode === 'foreground') {
         h.setBackground();
         this.emit("background", { childId, parentId, reason: "timeout" });
       }
     }, BG_TIMEOUT_MS);
+    timer.unref();
+    this.foregroundTimers.set(childId, timer);
 
     return handle;
   }
 
   /** Complete or cancel a foreground wait (called when child finishes or errors). */
   completeForeground(childId: string, result: { success: boolean; reason?: string; evidence?: string[] } | null): void {
+    clearTimeout(this.foregroundTimers.get(childId));
+    this.foregroundTimers.delete(childId);
     const h = this.foregroundSpawns.get(childId);
     if (h) {
       if (h.mode === 'foreground') {
@@ -122,6 +129,8 @@ export class ProcessManager extends EventEmitter {
 
   /** Cancel foreground tracking for a child (cleanup). */
   cancelForeground(childId: string): void {
+    clearTimeout(this.foregroundTimers.get(childId));
+    this.foregroundTimers.delete(childId);
     const h = this.foregroundSpawns.get(childId);
     if (h) {
       h._resolve(null);
@@ -139,7 +148,7 @@ export class ProcessManager extends EventEmitter {
   }
 
 
-  constructor() {
+  constructor(private mode: OrchestrationMode = orchestrationMode()) {
     super();
     // 每 10s 检查超时类规则
     this.tickTimer = setInterval(() => this.tick(), 10_000);
@@ -154,11 +163,14 @@ export class ProcessManager extends EventEmitter {
 
   getMaxFanout(): number { return this.maxFanout; }
 
+  getMode(): OrchestrationMode { return this.mode; }
+
   preCheckSpawn(
     ev: Extract<TuiEvent, { type: "spawn" }>,
     parentRole: string | undefined,
   ): { ok: true } | { ok: false; code: string; detail: string } {
     const state = getState();
+    if (this.mode === "single") return this.reject("single_mode", ev.parent, "Single mode does not create child agents");
 
     // Worker 不能 spawn
     if (parentRole === "Worker") {
@@ -168,7 +180,8 @@ export class ProcessManager extends EventEmitter {
 
     // 深度 0 (PM) 只能 spawn Leader 或 Secretary — 不能直接 spawn Worker
     const parentDepthNow = this.getDepth(ev.parent);
-    if (parentDepthNow === 0 && ev.role === "Worker") {
+    if (this.mode === "adaptive" && parentDepthNow >= 1 && ev.role === "Leader") return this.reject("adaptive_layer_limit", ev.parent, "Adaptive mode allows one coordinator layer only; dispatch Workers directly or explicitly choose hierarchical mode");
+    if (this.mode === "hierarchical" && parentDepthNow === 0 && ev.role === "Worker") {
       return this.reject("pm_cannot_spawn_worker", ev.parent,
         `PM (depth=0) 不能直接 spawn Worker — 先 spawn Tech Lead (role:"Leader")，再由 Tech Lead spawn Worker`);
     }
@@ -335,6 +348,7 @@ export class ProcessManager extends EventEmitter {
   }
 
   destroy(): void {
+    for (const id of this.foregroundSpawns.keys()) this.cancelForeground(id);
     if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = null; }
   }
 

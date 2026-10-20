@@ -14,7 +14,7 @@ export interface HandlerDeps {
   feishuBusy: Set<string>;
   secretaries: Map<string, SecretaryProxy>;
   pmPendingArtifacts: Map<string, string[]>;
-  leaderApprovalQueue: Map<string, { workerAgent: HttpConvAgent; toolName: string; toolArgs: unknown; workerChildId: string }>;
+  leaderApprovalQueue: Map<string, { workerAgent: HttpConvAgent; toolName: string; toolArgs: unknown; workerChildId: string; revision?: number }>;
   buildSystemPrompt: (role: "Leader" | "Secretary" | "Worker", agentId: string, goal?: string, resumedMemoryId?: string, promptFile?: string) => string;
   killAgent: (id: string, reason?: string) => void;
   MODEL: string;

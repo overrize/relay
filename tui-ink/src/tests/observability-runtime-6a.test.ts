@@ -38,6 +38,7 @@ describe("M1-6a ObservabilityRuntime façade", () => {
   it("§4.2 sink resets to a process.stderr writer", () => {
     setDiagSinkForTests(null);
     const orig = process.stderr.write.bind(process.stderr);
+
     const seen: string[] = [];
     (process.stderr as any).write = (chunk: any) => {
       seen.push(typeof chunk === "string" ? chunk : String(chunk));
@@ -97,10 +98,12 @@ describe("M1-6a ObservabilityRuntime façade", () => {
 
     // TTY && !demo → redirects to logFile
     const orig = process.stderr.write.bind(process.stderr);
+    let cleanup: (() => Promise<void>) | undefined;
     try {
-      installDiagnosticSink({ isTTY: true, demo: false, logFile });
+      cleanup = installDiagnosticSink({ isTTY: true, demo: false, logFile });
       process.stderr.write("z\n");
     } finally {
+      await cleanup?.();
       (process.stderr as any).write = orig;
     }
     // createWriteStream flushes asynchronously — poll briefly for the file.

@@ -1,3 +1,10 @@
+import { waitForSessionControl } from "../session/Control.js";
+import { sessionJournal } from "../session/Journal.js";
+import { beginTaskOperation, finishTaskOperation, workItems } from "../session/Tasks.js";
+import { retryTask, reviewTask, taskMode, reconcileTask } from "../runtime/TaskRecovery.js";
+import { consumeSessionTool, budgetReport } from "../session/Budget.js";
+import { toolWorkspace, resolveWorkspaceToolPath, withWorkspace, workspaceChanges, publishWorkspace, resolveWorkspace } from "../session/Workspaces.js";
+import { taskState } from "../session/Tasks.js";
 // Tool Registry — 每个工具是独立的 ToolDef 对象，单一职责
 // 架构借鉴自 claude_leack ExecutionRegistry 的 frozen-dataclass 思路
 // 但实现了真正的执行逻辑（他们的 execute_tool 只是 stub）
@@ -7,7 +14,8 @@ import * as path from "node:path";
 import * as https from "node:https";
 import * as http from "node:http";
 import * as os from "node:os";
-import { execSync } from "node:child_process";
+import { execCommand, withToolCancellation } from "./command.js";
+export { cancelAgentTools } from "./command.js";
 // playwright 在运行时通过动态 import() 加载，以允许未安装时不阻塞编译
 import { WorkspaceBoundary } from "../execution/WorkspaceBoundary.js";
 import { loadConfig, type WebSearchProviderConfig } from "../config.js";
@@ -49,6 +57,7 @@ interface ToolArgField {
 type ToolArgSpec = Record<string, ToolArgField>;
 
 function resolveToolPath(inputPath: string): ToolResult & { path?: string } {
+  if (toolWorkspace() !== process.cwd()) { try { return { ok: true, output: "", path: resolveWorkspaceToolPath(inputPath) }; } catch (error) { return err(String(error)); } }
   const boundary = new WorkspaceBoundary(process.cwd(), [os.tmpdir()]);
   const resolved = boundary.resolveInside(inputPath);
   if (!resolved.ok) return err(`Path rejected: ${resolved.reason} (${resolved.path})`);
@@ -56,6 +65,63 @@ function resolveToolPath(inputPath: string): ToolResult & { path?: string } {
 }
 
 // ── 工具实现 ──────────────────────────────────────────────────────────────────
+
+const SessionRecall: ToolDef = {
+  name: "SessionRecall", description: "按关键词检索本会话持久事件，返回事件序号、需求版本和片段。旧版本仅供参考，不代表当前目标。",
+  argsSchema: "query(str), limit?(int default:10)", needsApproval: false, roles: new Set(["Leader", "Worker"]),
+  async execute(a) {
+    const id = String(a.__sessionAgent ?? "");
+    const binding = sessionJournal().binding(id);
+    if (!binding) return err("No durable session is bound to this tool call");
+    return ok(JSON.stringify(await sessionJournal().search(binding.conversation, String(a.query ?? ""), Number(a.limit ?? 10))));
+  },
+};
+const TaskStatus: ToolDef = {
+  name: "TaskStatus", description: "查询本会话子任务的持久状态、停止原因、交接、证据和未完成事项。子任务自报成功不代表已独立验收。",
+  argsSchema: "agent?(str), task?(str logical task ID), offset?(int default:0), limit?(int default:10)", needsApproval: false, roles: new Set(["Leader", "Worker"]),
+  async execute(a) {
+    const journal = sessionJournal(), binding = journal.binding(String(a.__sessionAgent ?? ""));
+    if (!binding) return err("No durable session is bound");
+    const summarize = (t: NonNullable<ReturnType<typeof workItems>[number]>) => ({ id: t.id, status: t.status, reason: t.reason.slice(0, 500), profile: t.profile, mode: t.mode, attempts: t.attempts, maxAttempts: t.maxAttempts, turns: [t.usedTurns, t.maxTurns], requests: [t.usedRequests, t.maxRequests], tools: [t.usedTools, t.maxTools], deadline: t.deadline, nextAt: t.nextAt, verdict: t.verdict && { ...t.verdict, details: t.verdict.details.slice(0, 4).map((s) => s.slice(0, 300)) } });
+    if (a.task) {
+      const t = workItems(journal, binding.conversation).find((w) => w.id === a.task); if (!t) return err("Logical task not found in this conversation");
+      const rows = Object.values(t.operations), offset = Math.max(0, Math.floor(Number(a.offset) || 0)), page: unknown[] = []; let bytes = 2500;
+      for (const op of rows.slice(offset, offset + Math.min(10, Math.max(1, Number(a.limit) || 10)))) { const row = { ...op, output: op.output?.slice(-300) }, size = JSON.stringify(row).length; if (page.length && bytes + size > 9500) break; page.push(row); bytes += size; }
+      return ok(JSON.stringify({ ...summarize(t), goal: t.goal.slice(0, 700), totalOperations: rows.length, operations: page, nextOffset: offset + page.length < rows.length ? offset + page.length : null }));
+    }
+    const tasks = journal.tasks(binding.conversation).filter((t) => !a.agent || t.id === a.agent).reverse();
+    const offset = Math.max(0, Math.floor(Number(a.offset) || 0)), limit = Math.min(20, Math.max(1, Math.floor(Number(a.limit) || 10)));
+    const page: unknown[] = []; let bytes = 0;
+    for (const task of tasks.slice(offset, offset + limit)) {
+      const cut = (items: string[]) => items.slice(0, 5).map((s) => String(s).slice(0, 300));
+      const control = task.workId && journal.current(binding.conversation)?.work?.[task.workId];
+      const row = { id: task.id, parent: task.parent, role: task.role, revision: task.revision, status: task.status, goal: task.goal.slice(0, 700), lastError: task.lastError?.slice(0, 500), control: control && summarize(control), outcome: task.outcome && { ...task.outcome, reason: task.outcome.reason.slice(0, 500), summary: task.outcome.summary.slice(0, 1200), evidence: cut(task.outcome.evidence), remaining: cut(task.outcome.remaining), artifacts: cut(task.outcome.artifacts) } };
+      const size = JSON.stringify(row).length; if (page.length && bytes + size > 9500) break;
+      page.push(row); bytes += size;
+    }
+    return ok(JSON.stringify({ total: tasks.length, offset, nextOffset: offset + page.length < tasks.length ? offset + page.length : null, tasks: page, detail: "Fields are abbreviated; query agent for a specific task and SessionRecall for full historical evidence." }));
+  },
+};
+const TaskRetry: ToolDef = {
+  name: "TaskRetry", description: "PM 在原逻辑任务共享预算内申请续派；必须说明具体调整方案，不能绕过不确定副作用或耗尽预算。", argsSchema: "task(str), reason(str)", needsApproval: false, roles: new Set(["Leader"]),
+  async execute(a) { const t = retryTask(String(a.__sessionAgent), String(a.task), String(a.reason)); return ok(JSON.stringify({ id: t.id, status: t.status, reason: t.reason, attempts: t.attempts.length, maxAttempts: t.maxAttempts })); },
+};
+const TaskReview: ToolDef = {
+  name: "TaskReview", description: "PM 独立验收：evidence 为逗号分隔的本 PM 检查工具调用 ID，不能使用 Worker 自报或旧验收证据。", argsSchema: "task(str), verdict(accept|reject), evidence(str), rationale(str)", needsApproval: false, roles: new Set(["Leader"]),
+  async execute(a) { const t = reviewTask(String(a.__sessionAgent), String(a.task), a.verdict as "accept" | "reject", String(a.evidence).split(",").map((s) => s.trim()).filter(Boolean), String(a.rationale)); if (t.status === "accepted") try { await publishWorkspace(t); } catch (error) { taskState(t, { status: "blocked", reason: `workspace-publish:${String(error)}` }); return err(String(error)); } return ok(JSON.stringify({ id: t.id, status: t.status, verdict: t.verdict })); },
+};
+const TaskPolicy: ToolDef = {
+  name: "TaskPolicy", description: "暂停/恢复指定任务的后续自动续派，不中断正在运行的 Worker，也不会重置任何预算。", argsSchema: "task(str), mode(auto|manual)", needsApproval: false, roles: new Set(["Leader"]),
+  async execute(a) { const t = taskMode(String(a.__sessionAgent), String(a.task), a.mode as "auto" | "manual"); return ok(JSON.stringify({ id: t.id, mode: t.mode, status: t.status })); },
+};
+const TaskReconcile: ToolDef = {
+  name: "TaskReconcile", description: "PM 实际检查不确定副作用后，将指定操作标为不得重复；必须提供新的独立检查调用 ID 和理由。仅解锁剩余工作，不增加预算，不自动重放旧命令。", argsSchema: "task(str), operation(str), evidence(str comma separated call IDs), reason(str)", needsApproval: false, roles: new Set(["Leader"]),
+  async execute(a) { const t = reconcileTask(String(a.__sessionAgent), String(a.task), String(a.operation), String(a.evidence).split(",").map((s) => s.trim()).filter(Boolean), String(a.reason)); return ok(JSON.stringify({ id: t.id, status: t.status, operation: a.operation, reconciliation: t.operations[String(a.operation)]?.reconciliation })); },
+};
+const BudgetStatus: ToolDef = { name: "BudgetStatus", description: "只读查询整个工作区会话的持久预算，包括 PM、Leader、Worker、重试与验收。模型不能增加额度。", argsSchema: "", needsApproval: false, roles: new Set(["Leader", "Worker"]), async execute() { return ok(JSON.stringify(budgetReport())); } };
+const WorkspaceStatus: ToolDef = { name: "WorkspaceStatus", description: "查看隔离任务的修改、冲突、当前原文件哈希。Read(task=逻辑任务ID) 可检查暂存版本。", argsSchema: "task(str)", needsApproval: false, roles: new Set(["Leader", "Worker"]), async execute(a) { const b = sessionJournal().binding(String(a.__sessionAgent)), t = b && workItems(sessionJournal(), b.conversation).find((w) => w.id === a.task); if (!t) return err("Task not found"); const changes = await workspaceChanges(t); return ok(JSON.stringify({ id: t.id, isolation: t.isolation, status: t.workspace?.status, conflicts: t.workspace?.conflicts, changes: changes.slice(0, 30), total: changes.length })); } };
+const WorkspaceResolve: ToolDef = { name: "WorkspaceResolve", description: "PM 按当前哈希显式解决停止任务的单个文件冲突。ours 保留任务版本，theirs 保留原工作区版本；不会自动覆盖变化后的目标。", argsSchema: "task(str), path(str), expected(str current hash or missing), choice(ours|theirs)", needsApproval: false, roles: new Set(["Leader"]), async execute(a) { await resolveWorkspace(String(a.__sessionAgent), String(a.task), String(a.path), String(a.expected), String(a.choice)); return ok("Resolution recorded; use WorkspacePublish or retry/review after inspecting the result"); } };
+const WorkspacePublish: ToolDef = { name: "WorkspacePublish", description: "PM 显式发布停止任务的已检查暂存修改；发布前再次检查文件哈希，冲突时保留双方版本并拒绝覆盖。", argsSchema: "task(str)", needsApproval: false, roles: new Set(["Leader"]), async execute(a) { const b = sessionJournal().binding(String(a.__sessionAgent)), t = b && workItems(sessionJournal(), b.conversation).find((w) => w.id === a.task); if (!t || b?.role !== "Leader" || (b.id !== t.parent && b.id !== t.conversation) || ["running", "evaluating", "retry_wait"].includes(t.status)) return err("Only the owner/root PM may publish a stopped task"); await publishWorkspace(t); return ok("Changes published; acceptance remains a separate decision"); } };
 
 const Read: ToolDef = {
   name: "Read",
@@ -155,7 +221,7 @@ function isBanned(cmd: string): string | null {
 
 const Bash: ToolDef = {
   name: "Bash",
-  description: "执行 shell 命令（状态持久，环境变量跨调用保留）",
+  description: "异步执行 shell 命令（独立 shell，可取消，不保留跨调用环境）",
   argsSchema: "command(str), timeout?(ms default:60000)",
   needsApproval: false,
   roles: new Set(["Leader", "Worker"]),
@@ -178,7 +244,7 @@ const Bash: ToolDef = {
       return buf.toString("utf8");
     };
     try {
-      const raw = execSync(cmd, { encoding: "buffer", timeout, cwd: process.cwd(), shell: true as any });
+      const raw = await execCommand(cmd, { encoding: "buffer", timeout, cwd: toolWorkspace(), shell: true as any });
       const out = decodeOutput(raw as unknown as Buffer);
       return ok(middleTruncate(out || "(no output)"));
     } catch (e: any) {
@@ -206,7 +272,7 @@ const Grep: ToolDef = {
     const ctx  = typeof a.context === "number" ? `-C ${a.context}` : "";
     const cmd  = `rg -n --no-heading ${ci} ${ctx} ${glob} ${JSON.stringify(pat)} ${JSON.stringify(dir)}`.replace(/\s+/g, " ").trim();
     try {
-      const out = String(execSync(cmd, { encoding: "utf8", timeout: 10_000, cwd: process.cwd() }));
+      const out = String(await execCommand(cmd, { encoding: "utf8", timeout: 10_000, cwd: toolWorkspace() }));
       return ok(out.slice(0, 20_000) || "(no matches)");
     } catch (e: any) {
       return rgNotFoundResult(e, "Grep") ?? ok((String(e.stdout ?? "")).slice(0, 20_000) || "(no matches)");
@@ -226,9 +292,9 @@ const Glob: ToolDef = {
     if (!rp.ok || !rp.path) return rp;
     const base = rp.path;
     try {
-      const out = String(execSync(
+      const out = String(await execCommand(
         `rg --files --glob ${JSON.stringify(pat)} ${JSON.stringify(base)}`,
-        { encoding: "utf8", timeout: 10_000, cwd: process.cwd() },
+        { encoding: "utf8", timeout: 10_000, cwd: toolWorkspace() },
       ));
       const sorted = out.trim().split("\n").filter(Boolean).sort().join("\n");
       return ok(sorted.slice(0, 20_000) || "(no files)");
@@ -491,6 +557,8 @@ export function parseTestCounts(output: string, framework: string): TestCounts {
       r.passed  = num(/ℹ\s+pass\s+(\d+)/);
       r.failed  = num(/ℹ\s+fail\s+(\d+)/);
       r.skipped = num(/ℹ\s+skipped\s+(\d+)/);
+      if (r.passed === 0 && r.failed === 0) { r.passed = num(/^#\s+pass\s+(\d+)/m); r.failed = num(/^#\s+fail\s+(\d+)/m); r.skipped = num(/^#\s+skipped\s+(\d+)/m); }
+      if (r.passed === 0 && r.failed === 0) { const line = output.match(/^\s*Tests:?\s+(.+)$/m)?.[1] ?? ""; r.passed = Number(line.match(/(\d+)\s+passed/)?.[1] ?? 0); r.failed = Number(line.match(/(\d+)\s+failed/)?.[1] ?? 0); }
       // Fallback: mocha-style "N passing"
       if (r.passed === 0 && r.failed === 0) {
         r.passed = num(/(\d+)\s+passing/);
@@ -540,7 +608,7 @@ const RunTests: ToolDef = {
   needsApproval: false,
   roles: new Set(["Leader", "Worker"]),
   async execute(a) {
-    const dir = path.resolve(String(a.project_dir ?? a.dir ?? "."));
+    const dir = resolveWorkspaceToolPath(String(a.project_dir ?? a.dir ?? "."));
     const detected = detectTestCommand(dir);
     if (!detected) {
       return err(
@@ -552,7 +620,7 @@ const RunTests: ToolDef = {
     let rawOutput = "";
     let exitedOk = false;
     try {
-      const raw = execSync(winCmd, { encoding: "buffer", timeout: 180_000, cwd: dir, shell: true as any });
+      const raw = await execCommand(winCmd, { encoding: "buffer", timeout: Number(a.timeout_ms ?? 180_000), cwd: dir, shell: true as any });
       rawOutput = decodeBuffer(raw as unknown as Buffer);
       exitedOk = true;
     } catch (e: any) {
@@ -563,11 +631,13 @@ const RunTests: ToolDef = {
       exitedOk = false;
     }
     const counts = parseTestCounts(rawOutput, framework);
+    if (a.strict === true && (counts.passed === 0 || /\[no test files\]|no tests to run/i.test(rawOutput) || (framework === "go" && !/^(?:ok\s+\S+\s+\d|--- PASS)/m.test(rawOutput)))) return err(`Strict acceptance requires at least one parsed passing test, not just a zero exit code.\n${rawOutput.slice(-4000)}`);
     // If we couldn't parse counts from output, fall back to exit code
     if (counts.passed === 0 && counts.failed === 0) {
       if (exitedOk) counts.passed = 1;
       else counts.failed = 1;
     }
+    if (!exitedOk) counts.failed = Math.max(1, counts.failed);
     const status = counts.failed === 0 ? "✅ PASS" : "❌ FAIL";
     const summary =
       `${status}  passed: ${counts.passed}  failed: ${counts.failed}  skipped: ${counts.skipped}\n` +
@@ -586,12 +656,12 @@ const TypeCheck: ToolDef = {
   needsApproval: false,
   roles: new Set(["Leader", "Worker"]),
   async execute(a) {
-    const dir = path.resolve(String(a.project_dir ?? a.dir ?? "."));
+    const dir = resolveWorkspaceToolPath(String(a.project_dir ?? a.dir ?? "."));
 
     // TypeScript
     if (fs.existsSync(path.join(dir, "tsconfig.json"))) {
       try {
-        const out = String(execSync("npx tsc --noEmit 2>&1", {
+        const out = String(await execCommand("npx tsc --noEmit 2>&1", {
           encoding: "utf8", timeout: 60_000, cwd: dir, shell: true as any,
         }));
         return ok(`TypeScript: clean${out.trim() ? `\n${out.slice(0, 2000)}` : ""}`);
@@ -607,7 +677,7 @@ const TypeCheck: ToolDef = {
       fs.existsSync(path.join(dir, "setup.py"))
     ) {
       try {
-        const out = String(execSync("python -m mypy . --ignore-missing-imports 2>&1", {
+        const out = String(await execCommand("python -m mypy . --ignore-missing-imports 2>&1", {
           encoding: "utf8", timeout: 60_000, cwd: dir, shell: true as any,
         }));
         return ok(`mypy: ${out.slice(0, 2000)}`);
@@ -619,7 +689,7 @@ const TypeCheck: ToolDef = {
     // Go vet
     if (fs.existsSync(path.join(dir, "go.mod"))) {
       try {
-        execSync("go vet ./...", { encoding: "utf8", timeout: 30_000, cwd: dir, shell: true as any });
+        await execCommand("go vet ./...", { encoding: "utf8", timeout: 30_000, cwd: dir, shell: true as any });
         return ok("go vet: clean");
       } catch (e: any) {
         return { ok: false, output: `go vet errors:\n${String(e.stderr ?? "").slice(0, 5000)}` };
@@ -676,7 +746,7 @@ const CodeMap: ToolDef = {
   needsApproval: false,
   roles: new Set(["Leader", "Worker"]),
   async execute(a) {
-    const dir = path.resolve(String(a.dir ?? "."));
+    const dir = resolveWorkspaceToolPath(String(a.dir ?? "."));
     const depth = typeof a.depth === "number" ? Math.min(Math.max(a.depth, 1), 4) : 2;
     const tree = buildDirTree(dir, depth);
 
@@ -723,7 +793,7 @@ const FindReferences: ToolDef = {
       .replace(/\s+/g, " ")
       .trim();
     try {
-      const out = String(execSync(cmd, { encoding: "utf8", timeout: 10_000, cwd: process.cwd() }));
+      const out = String(await execCommand(cmd, { encoding: "utf8", timeout: 10_000, cwd: toolWorkspace() }));
       return ok(out.slice(0, 20_000) || "(no references found)");
     } catch (e: any) {
       return (
@@ -789,7 +859,7 @@ const BrowserControl: ToolDef = {
 
 // ── 注册表（Map 保证 O(1) 查找）─────────────────────────────────────────────
 
-const ALL_TOOLS: ToolDef[] = [
+const ALL_TOOLS: ToolDef[] = [SessionRecall, TaskStatus, TaskRetry, TaskReview, TaskPolicy, TaskReconcile, BudgetStatus, WorkspaceStatus, WorkspaceResolve, WorkspacePublish,
   Read, Write, Edit, Bash, Grep, Glob, LS, Think, WebFetch, WebSearch,
   RunTests, TypeCheck, CodeMap, FindReferences, BrowserControl,
 ];
@@ -799,8 +869,19 @@ export const TOOL_REGISTRY = new Map<string, ToolDef>(
 );
 
 export const TOOL_ARG_SPECS: ReadonlyMap<string, ToolArgSpec> = new Map<string, ToolArgSpec>([
-  ["Read", {
+  ["SessionRecall", { query: { type: "string" }, limit: { type: "int", required: false, min: 1, max: 20, default: 10 } }],
+  ["TaskStatus", { agent: { type: "string", required: false }, task: { type: "string", required: false }, offset: { type: "number", required: false }, limit: { type: "number", required: false } }],
+  ["TaskRetry", { task: { type: "string" }, reason: { type: "string" } }],
+  ["TaskReview", { task: { type: "string" }, verdict: { type: "enum", values: ["accept", "reject"] }, evidence: { type: "string" }, rationale: { type: "string" } }],
+  ["TaskPolicy", { task: { type: "string" }, mode: { type: "enum", values: ["auto", "manual"] } }],
+  ["BudgetStatus", {}],
+  ["WorkspaceStatus", { task: { type: "string" } }],
+  ["WorkspaceResolve", { task: { type: "string" }, path: { type: "string" }, expected: { type: "string" }, choice: { type: "enum", values: ["ours", "theirs"] } }],
+  ["WorkspacePublish", { task: { type: "string" } }],
+  ["TaskReconcile", { task: { type: "string" }, operation: { type: "string" }, evidence: { type: "string" }, reason: { type: "string" } }],
+    ["Read", {
     path: { type: "string", aliases: ["file_path"] },
+    task: { type: "string", required: false },
     offset: { type: "int", required: false, min: 0 },
     limit: { type: "int", required: false, min: 1, max: 10_000, default: 200 },
   }],
@@ -843,9 +924,13 @@ export const TOOL_ARG_SPECS: ReadonlyMap<string, ToolArgSpec> = new Map<string, 
     count: { type: "int", required: false, min: 1, max: 10, default: 5 },
   }],
   ["RunTests", {
+    task: { type: "string", required: false },
     project_dir: { type: "string", required: false, aliases: ["dir"], default: "." },
+    strict: { type: "boolean", required: false },
+    timeout_ms: { type: "int", required: false, min: 1, max: 180000 },
   }],
   ["TypeCheck", {
+    task: { type: "string", required: false },
     project_dir: { type: "string", required: false, aliases: ["dir"], default: "." },
   }],
   ["CodeMap", {
@@ -876,10 +961,17 @@ const MAX_TOOL_OUTPUT = 12_000; // chars; keep single result small to control co
 
 interface ExecuteToolOptions {
   agentId?: string;
+  revision?: number;
+  callId?: string;
 }
 
 /** 执行工具 — 替换原 index.tsx 里的 switch-case */
 export async function executeTool(name: string, args: unknown, options: ExecuteToolOptions = {}): Promise<ToolResult> {
+  try { if (options.agentId) await waitForSessionControl(options.agentId); }
+  catch (error) { return { ok: false, code: "recovery_blocked", output: `Tool blocked until orphan cleanup is confirmed: ${String(error)}` }; }
+  if (options.agentId && !sessionJournal().isCurrent(options.agentId, options.revision)) {
+    return { ok: false, code: "superseded_revision", output: "Tool blocked: requirement revision is obsolete" };
+  }
   const tool = TOOL_REGISTRY.get(name);
   if (!tool) {
     return {
@@ -912,10 +1004,32 @@ export async function executeTool(name: string, args: unknown, options: ExecuteT
     };
   }
   try {
-    const result = await tool.execute(validated.args);
+    if (options.agentId && options.callId) {
+      const journal = sessionJournal(), binding = journal.binding(options.agentId);
+      const state = binding && journal.current(binding.conversation);
+      const prior = state?.tools[`${options.agentId}:${options.callId}`];
+      if (prior && prior.revision === (options.revision ?? binding?.revision)) {
+        if (prior.name !== name || JSON.stringify(prior.args) !== JSON.stringify(args)) return { ok: false, code: "call_id_conflict", output: "Tool call ID already belongs to different arguments; use a new ID" };
+        if (prior.status === "completed") {
+          if (prior.verifiedExecution === false) return { ok: false, code: "unverified_result", output: "A protocol result without a real tool execution cannot count as evidence. Inspect the task; use a fresh tool call ID for an independent check." };
+          return { ok: prior.ok ?? true, output: `Previously completed (cached excerpt):\n${prior.output ?? ""}` };
+        }
+        if (prior.status === "uncertain") return { ok: false, code: "uncertain_effect", output: "Interrupted operation has an unknown outcome. Inspect current files or external state before issuing a deliberate new operation with a new ID; do not blindly replay it." };
+      }
+    }
+    if (options.agentId) consumeSessionTool(options.agentId, name);
+    const operation = options.agentId ? beginTaskOperation(options.agentId, options.callId, name, validated.args) : {};
+    if (operation.blocked) return { ok: false, code: "task_control_blocked", output: operation.blocked };
+    if (operation.cached) return { ok: true, output: operation.cached };
+    const result = await withToolCancellation(options.agentId, () => withWorkspace(options.agentId, name, validated.args, () => tool.execute({ ...validated.args, __sessionAgent: options.agentId })));
+    if (options.agentId && operation.key) finishTaskOperation(options.agentId, operation.key, name, validated.args, result);
+    if (options.agentId) {
+      const journal = sessionJournal(), binding = journal.binding(options.agentId);
+      if (binding) journal.append("tool.output", binding.conversation, options.agentId, options.revision ?? binding.revision, { name, id: options.callId, ok: result.ok, output: result.output });
+    }
     return { ...result, output: middleTruncate(result.output, MAX_TOOL_OUTPUT) };
   } catch (e: any) {
-    return { ok: false, output: `Error in ${name}: ${e.message?.slice(0, 500) ?? "unknown"}` };
+    return { ok: false, code: e.message?.includes("SESSION_BUDGET") ? "session_budget_exhausted" : undefined, output: `Error in ${name}: ${e.message?.slice(0, 500) ?? "unknown"}` };
   }
 }
 

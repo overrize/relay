@@ -36,7 +36,7 @@ describe("pm-rules: Worker cannot spawn", () => {
 
   beforeEach(() => {
     _resetForTest();
-    pm = new ProcessManager();
+    pm = new ProcessManager("hierarchical");
   });
 
   it("Worker → Worker spawn is blocked", () => {
@@ -63,7 +63,7 @@ describe("pm-rules: PM (depth=0) cannot spawn Worker", () => {
 
   beforeEach(() => {
     _resetForTest();
-    pm = new ProcessManager();
+    pm = new ProcessManager("hierarchical");
   });
 
   it("PM → Worker is blocked", () => {
@@ -85,7 +85,7 @@ describe("pm-rules: TL spawn rules", () => {
 
   beforeEach(() => {
     _resetForTest();
-    pm = new ProcessManager();
+    pm = new ProcessManager("hierarchical");
   });
 
   it("TL (depth=1) → Worker is allowed", () => {
@@ -116,7 +116,7 @@ describe("pm-rules: dispatch validation", () => {
 
   beforeEach(() => {
     _resetForTest();
-    pm = new ProcessManager();
+    pm = new ProcessManager("hierarchical");
   });
 
   it("missing dispatch is blocked", () => {
@@ -150,7 +150,7 @@ describe("pm-rules: duplicate goal detection", () => {
 
   beforeEach(() => {
     _resetForTest();
-    pm = new ProcessManager();
+    pm = new ProcessManager("hierarchical");
   });
 
   it("second spawn with identical goal is blocked", () => {

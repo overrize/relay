@@ -51,6 +51,10 @@ describe("SuppressFilter", () => {
     assert.match(r!, /children/);
   });
 
+  it("allows substantive PM replies while children are active", () => {
+    assert.equal(shouldSuppress(msg({ text: "SSO 方案可以保留邮箱登录，我会调整任务。" }), ctx({ hasActiveChildren: true })), null);
+  });
+
   it("does NOT suppress when no active children", () => {
     const r = shouldSuppress(
       msg({ text: "分析完成，请查收报告。" }),

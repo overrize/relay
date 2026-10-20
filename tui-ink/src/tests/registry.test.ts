@@ -78,10 +78,11 @@ describe("toolNeedsApproval — Bash command classification", () => {
 // ── getToolsForRole ──────────────────────────────────────────────────────────
 
 describe("getToolsForRole", () => {
-  it("Leader and Worker receive the same tool set", () => {
+  it("only Leaders receive task retry, policy and independent review controls", () => {
     const leader = getToolsForRole("Leader").map(t => t.name).sort();
     const worker = getToolsForRole("Worker").map(t => t.name).sort();
-    assert.deepEqual(leader, worker);
+    assert.deepEqual(leader.filter((name) => !["TaskRetry", "TaskReview", "TaskPolicy", "TaskReconcile", "WorkspaceResolve", "WorkspacePublish"].includes(name)), worker);
+    for (const name of ["TaskRetry", "TaskReview", "TaskPolicy", "TaskReconcile", "WorkspaceResolve", "WorkspacePublish"]) assert.ok(leader.includes(name) && !worker.includes(name));
   });
 
   it("includes all core tools", () => {
@@ -138,7 +139,7 @@ describe("tool argument schema", () => {
 
   it("buildToolSchemaBlock renders parameter text from structured specs", () => {
     const block = buildToolSchemaBlock("Leader");
-    assert.ok(block.includes("path(string), offset?(int), limit?(int default:200)"));
+    assert.ok(block.includes("path(string), task?(string), offset?(int), limit?(int default:200)"));
     assert.ok(block.includes("action?(enum:'navigate'|'screenshot'|'text' default:navigate)"));
   });
 });

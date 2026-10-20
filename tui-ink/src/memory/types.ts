@@ -36,7 +36,7 @@ export interface Tombstone {
   last_todo?: string;  // JSON serialized last todo.set items
   /** M1-8: tool.calls in flight (no tool.result yet) when the agent was interrupted.
    *  Injected on resume so the "现场" (pending work / approvals) is restored, not just memory. */
-  pending_tool_calls?: Array<{ id: string; name: string; needs_approval?: boolean }>;
+  pending_tool_calls?: Array<{ id: string; name: string; args?: unknown; needs_approval?: boolean }>;
   /** Bus log offset at last Secretary flush — replay log from here to reconstruct state delta. */
   log_cursor?: number;
   /** Bus epoch at flush time — if mismatched on load, the cursor is from a dead process and must be discarded. */

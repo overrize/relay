@@ -6,6 +6,9 @@ export type TodoState = "todo" | "run" | "done" | "warn" | "err";
 
 // S1: DispatchSpec — 每次 spawn 必须携带，Leader 在 spawn 前验证
 export interface DispatchSpec {
+  worker_profile?: "implement" | "research" | "review" | "verify";
+  recovery?: { mode?: "auto" | "manual"; max_attempts?: number; max_turns?: number; max_requests?: number; max_tools?: number; total_ms?: number };
+  acceptance_checks?: Array<{ criterion: number; type: "file_contains" | "file_sha256" | "test_suite"; path: string; value?: string }>;
   background: string;                  // 上下文背景（必填）
   constraints: string[];               // 执行约束
   acceptance_criteria: string[];       // 验收标准（至少 1 条）
@@ -67,13 +70,14 @@ export interface Message {
   tool_name?: string;
   tool_args?: unknown;
   tool_id?: string;
+  session_revision?: number;
   needs_approval?: boolean;
   approved?: boolean;
   level?: "debug" | "info" | "warn" | "error";
 }
 
 // agent → TUI
-export type TuiEvent =
+export type TuiEvent = (
   | { v: 1; type: "todo.set"; agent: string; items: TodoItem[] }
   | { v: 1; type: "step"; agent: string; text: string }
   | {
@@ -116,7 +120,7 @@ export type TuiEvent =
   | { v: 1; type: "token.usage"; agent: string; prompt: number; completion: number;
       ttft_ms?: number;   // time-to-first-token: request start → first content chunk (ms)
       total_ms?: number;  // total call duration: request start → stream end (ms)
-    };
+    }) & { session_revision?: number };
 
 // TUI → agent  (写到 agent.stdin)
 export type AgentCommand =

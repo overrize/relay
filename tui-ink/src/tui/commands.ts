@@ -1,3 +1,11 @@
+import { resolveModelRoute, type ModelProfile } from "../models/routing.js";
+import { saveModelRouting } from "../config.js";
+import { loadConfig as loadBillingConfig, saveModelConfig, validateBillingConfig } from "../config.js";
+import { sessionJournal } from "../session/Journal.js";
+import { listBackups } from "../session/Backup.js";
+import { workItems } from "../session/Tasks.js";
+import { taskMode, recordTaskCancellation } from "../runtime/TaskRecovery.js";
+import { budgetReport, addSessionBudget } from "../session/Budget.js";
 /**
  * commands.ts — the slash-command table, extracted from App() (spawn-1.0 M1-6e).
  * buildCommands(ctx) returns the CmdDef[]; cross-module deps are imported directly,
@@ -90,7 +98,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
   const feishuSessions = { size: feishuSessionCount() };
   const __dirname = path.dirname(new URL(import.meta.url).pathname);
   const COMMANDS: CmdDef[] = [
-    { name: "pause",   desc: "kill the selected agent",     handler: () => { const sel = getState().selectedAgent; agents.get(sel)?.kill(); } },
+    { name: "pause",   desc: "kill the selected agent",     handler: () => { const sel = getState().selectedAgent; agents.get(sel)?.kill(); if (sessionJournal().binding(sel)?.parent) { killedAgents.add(sel); recordTaskCancellation(sel, "TUI pause"); } } },
     { name: "effort",  desc: "/effort [min|mid|high|max] — set or open effort selector", handler: (args) => {
       const lvl = args[0] as Effort | undefined;
       if (lvl && (EFFORT_LEVELS as readonly string[]).includes(lvl)) {
@@ -142,6 +150,62 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
       clearPendingRating();
       applyEvent({ v: 1, type: "message", agent: "pm", to: "user",
         text: `评分已记录：${verdict === "good" ? "👍" : "👎"}${comment ? `  "${comment}"` : ""}` });
+    } },
+    { name: "route", desc: "/route [pm|leader|implement|research|review|verify|secretary <模型名...>|api-fallback on|off] — 定位与候选模型链", handler: (args) => {
+      try {
+        const cfg = loadBillingConfig(), profiles = ["pm","leader","implement","research","review","verify","secretary"];
+        if (!args.length) { emitCommandMessage(JSON.stringify(cfg.routing ?? {profiles:{},allowApiFallback:false},null,2)); return; }
+        if(args[0] === "api-fallback") { if(args.length!==2 || !["on","off"].includes(args[1]!)) throw new Error("用法 /route api-fallback on|off"); saveModelRouting({...cfg.routing,allowApiFallback:args[1]==="on"}); }
+        else {
+          const profile=args[0] as ModelProfile, names=args.slice(1); if(!profiles.includes(profile)||!names.length) throw new Error("用法 /route <定位> <注册模型名...>；使用 off 恢复角色默认模型");
+          const routing={...cfg.routing,profiles:{...cfg.routing?.profiles}};
+          if(names.length===1&&names[0]==="off") delete routing.profiles[profile];
+          else { if(names.some(n=>!cfg.models[n])) throw new Error("候选链只能使用已注册模型名"); routing.profiles[profile]=names; resolveModelRoute({...cfg,routing},profile==="secretary"?"secretary":profile==="pm"||profile==="leader"?"leader":"worker",profile); }
+          saveModelRouting(routing);
+        }
+        emitCommandMessage("模型路由已保存；新启动/恢复的 agent 生效，历史预算和任务副本保留。候选顺序决定优先级；订阅后的 API 默认不参与降级。");
+      } catch(error) { emitCommandMessage(String(error)); }
+    } },
+    { name: "billing", desc: "/billing <modelName> <api|subscription> [inputUSD/M outputUSD/M] — 配置模型计费方式", handler: (args) => {
+      try {
+        const [name, mode, input, output] = args, model = name && loadBillingConfig().models[name];
+        if (!model || !["api","subscription"].includes(mode ?? "") || args.length > 4 || (!!input !== !!output)) throw new Error("用法：/billing <已注册模型> <api|subscription> [输入美元/百万 输出美元/百万]");
+        const updated = { ...model, billing: { mode: mode as "api" | "subscription", ...(input !== undefined ? {inputUsdPerMillion:Number(input),outputUsdPerMillion:Number(output)} : {}) } };
+        validateBillingConfig(updated); saveModelConfig(name!, updated); emitCommandMessage(`模型 ${name} 计费模式为 ${mode}；下一次启动/恢复的 agent 使用新配置。不会重置已消费预算。`);
+      } catch(error) { emitCommandMessage(String(error)); }
+    } },
+    { name: "budget", desc: "/budget [add requests=N tokens=N tools=N usd=N] — 离线查询或显式增加会话总额度", handler: (args) => {
+      try {
+        if (args[0] === "add") { const additions: Record<string, number> = {}; for (const arg of args.slice(1)) { const [key, value] = arg.split("="); if (!key || !["requests", "tokens", "tools", "usd"].includes(key) || value === undefined) throw new Error("用法：/budget add requests=20 tokens=100000 tools=40"); additions[key] = Number(value); } const j = sessionJournal(), agent = j.binding(getState().selectedAgent)?.conversation ?? j.bindings().find((b) => !b.parent)?.id ?? "pm"; addSessionBudget(agent, additions); }
+        emitCommandMessage(JSON.stringify(budgetReport(), null, 2));
+      } catch (error) { emitCommandMessage(String(error)); }
+    } },
+    { name: "tasks", desc: "/tasks [pause|resume] [taskId] — 查看任务预算或暂停/恢复后续自动续派", handler: (args) => {
+      const j = sessionJournal(), selected = j.binding(getState().selectedAgent), owner = selected?.conversation ?? "pm";
+      const tasks = workItems(j, owner).filter((t) => t.revision === j.current(owner)?.revision);
+      if (args[0] === "pause" || args[0] === "resume") {
+        try { for (const t of tasks.filter((t) => !args[1] || t.id === args[1])) taskMode(owner, t.id, args[0] === "pause" ? "manual" : "auto"); emitCommandMessage("后续自动续派策略已更新，正在运行的 Worker 继续执行；预算不重置。"); }
+        catch (error) { emitCommandMessage(String(error)); }
+      } else emitCommandMessage(tasks.map((t) => `${t.id} · ${t.profile} · ${t.status} · ${t.mode}\n尝试 ${t.attempts.length}/${t.maxAttempts}，轮数 ${t.usedTurns}/${t.maxTurns}，请求 ${t.usedRequests}/${t.maxRequests}，工具 ${t.usedTools}/${t.maxTools}\n${t.reason}`).join("\n\n") || "当前没有受管理的 Worker 任务。");
+    } },
+    { name: "backup", desc: "/backup [list] — 在线备份记忆或列出恢复点", handler: (args) => {
+      if (args[0] && args[0] !== "list") { emitCommandMessage("用法：/backup 或 /backup list。恢复需退出程序后使用 npm run backup:session -- restore。"); return; }
+      emitCommandMessage("备份操作已开始，期间可以继续与 PM 沟通。");
+      const work = args[0] === "list" ? listBackups(process.cwd()).then((items) => items.map((m) => `${m.id} · seq=${m.seq} · ${new Date(m.createdAt).toLocaleString()}`).join("\n") || "尚无恢复点") : sessionJournal().backup().then((r) => `备份已校验：${r.id}\n位置：${r.directory}`);
+      void work.then(emitCommandMessage).catch((e) => emitCommandMessage(`备份操作失败：${String(e)}`));
+    } },
+    { name: "storage", desc: "/storage [clean] — 查看配额或异步清理日志、重建索引", handler: (args) => {
+      if (args[0] === "clean") {
+        emitCommandMessage("存储维护已开始，期间可以继续与 PM 沟通。");
+        void sessionJournal().maintain().then((r) => emitCommandMessage(`存储维护完成：日志 ${(r.logBytes / 1048576).toFixed(2)} MiB，受管理存储 ${(r.totalBytes / 1048576).toFixed(2)} MiB，整理 ${r.compactedSegments} 段。${r.overQuota ? "仍有配额压力：已保留受保护记忆和恢复状态。" : ""}${r.errors.length ? `\n${r.errors.join("\n")}` : ""}`)).catch((e) => emitCommandMessage(`存储维护失败，未确认安全的数据已保留：${String(e)}`));
+      } else {
+        try {
+          const s = JSON.parse(fs.readFileSync(path.join(process.cwd(), ".spawn/events/storage-status.json"), "utf8"));
+          const mib = (n: number) => (Number(n ?? 0) / 1048576).toFixed(2);
+          emitCommandMessage(`原始日志：${mib(s.logBytes)} / ${mib(s.policy.maxLogBytes)} MiB\n受管理存储：${mib(s.totalBytes)} / ${mib(s.policy.maxTotalBytes)} MiB\n检索索引：${mib(s.indexBytes)} / ${mib(s.policy.maxIndexBytes)} MiB\n最近维护：${new Date(s.updatedAt).toLocaleString()}\n${s.overQuota ? "仍超出配额，受保护记忆已保留。" : "配额正常。"}\n/storage clean 立即维护；期间可继续与 PM 沟通。`);
+        }
+        catch { emitCommandMessage("尚无维护报告；使用 /storage clean 运行维护。配额通过 SPAWN_LOG_MAX_BYTES / SPAWN_LOG_RETENTION_MS 等环境变量配置。"); }
+      }
     } },
     { name: "sessions", desc: "列出所有未完成会话及 session hash", handler: () => {
       const sessions = listUnfinishedAgents();
@@ -260,6 +324,10 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
         return;
       }
       const id = mem.agent_id;
+      if (!sessionJournal().isCurrent(id)) {
+        emitCommandMessage("该任务属于已失效的需求版本。请恢复 PM，按当前目标重新派发任务。");
+        return;
+      }
       replaceAgentForResume(id, { agents, secretaries, killedAgents });
       selectAgent(id);
       applyEvent({ v: 1, type: "message", agent: "pm", to: "user",
@@ -409,7 +477,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
       applyEvent({ v: 1, type: "message", agent: "pm", to: "user", text: `📊 告警 (${alerts.length} 条):\n${text}\n\n/alerts ack <code> 确认` });
     } },
     { name: "quit",    desc: "exit the TUI",                handler: () => requestExit() },
-    { name: "budget", desc: "/budget [Nk|N|off] — set/clear token budget", handler: (args) => {
+    { name: "contextbudget", desc: "/contextbudget [Nk|N|off] — set/clear token budget", handler: (args) => {
       const raw = args[0];
       if (!raw || raw === "off") {
         setTokenBudget(0);
@@ -421,7 +489,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
       const n = parseFloat(lower) * multiplier;
       if (isNaN(n) || n <= 0) {
         applyEvent({ v: 1, type: "message", agent: "pm", to: "user",
-          text: "用法: /budget 100k  /budget 50000  /budget off" });
+          text: "用法: /contextbudget 100k  /contextbudget 50000  /contextbudget off" });
         return;
       }
       setTokenBudget(Math.round(n));

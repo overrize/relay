@@ -46,7 +46,7 @@ beforeEach(() => _resetForTest());
 
 describe("ProcessManager — PM 深度规则", () => {
   it("depth=0 PM 直接 spawn Worker → pm_cannot_spawn_worker 拒绝", () => {
-    const pm = new ProcessManager();
+    const pm = new ProcessManager("hierarchical");
     ensureAgent({ id: "pm", name: "pm", role: "Leader", state: "run", depth: 0 });
 
     const ev: Extract<TuiEvent, { type: "spawn" }> = {
@@ -65,7 +65,7 @@ describe("ProcessManager — PM 深度规则", () => {
   });
 
   it("depth=0 PM spawn Leader（Tech Lead）→ ok", () => {
-    const pm = new ProcessManager();
+    const pm = new ProcessManager("hierarchical");
     ensureAgent({ id: "pm", name: "pm", role: "Leader", state: "run", depth: 0 });
 
     const ev: Extract<TuiEvent, { type: "spawn" }> = {
@@ -85,7 +85,7 @@ describe("ProcessManager — PM 深度规则", () => {
   });
 
   it("depth≥2 spawn Leader → depth_role_violation 拒绝", () => {
-    const pm = new ProcessManager();
+    const pm = new ProcessManager("hierarchical");
     ensureAgent({ id: "pm",    name: "pm",    role: "Leader", state: "run", depth: 0 });
     ensureAgent({ id: "tl-01", name: "tl-01", role: "Leader", state: "run", parent: "pm", depth: 1 });
     ensureAgent({ id: "w-01",  name: "w-01",  role: "Worker", state: "run", parent: "tl-01", depth: 2 });
@@ -110,7 +110,7 @@ describe("ProcessManager — PM 深度规则", () => {
   });
 
   it("Tech Lead (depth=1) spawn Worker → ok", () => {
-    const pm = new ProcessManager();
+    const pm = new ProcessManager("hierarchical");
     ensureAgent({ id: "pm",    name: "pm",    role: "Leader", state: "run", depth: 0 });
     ensureAgent({ id: "tl-01", name: "tl-01", role: "Leader", state: "run", parent: "pm", depth: 1 });
 
@@ -135,13 +135,13 @@ describe("ProcessManager — PM 深度规则", () => {
 
 describe("ProcessManager — setFanout", () => {
   it("默认 maxFanout=4，getMaxFanout 返回 4", () => {
-    const pm = new ProcessManager();
+    const pm = new ProcessManager("hierarchical");
     assert.equal(pm.getMaxFanout(), 4);
     pm.destroy();
   });
 
   it("setFanout(6) → getMaxFanout()=6，允许 6 个并发子节点", () => {
-    const pm = new ProcessManager();
+    const pm = new ProcessManager("hierarchical");
     pm.setFanout(6);
     assert.equal(pm.getMaxFanout(), 6);
 
@@ -165,7 +165,7 @@ describe("ProcessManager — setFanout", () => {
   });
 
   it("setFanout(1) → 只允许 1 个并发子节点", () => {
-    const pm = new ProcessManager();
+    const pm = new ProcessManager("hierarchical");
     pm.setFanout(1);
     assert.equal(pm.getMaxFanout(), 1);
 
@@ -187,7 +187,7 @@ describe("ProcessManager — setFanout", () => {
   });
 
   it("setFanout 边界裁剪：0 → 1，17 → 16", () => {
-    const pm = new ProcessManager();
+    const pm = new ProcessManager("hierarchical");
     pm.setFanout(0);
     assert.equal(pm.getMaxFanout(), 1, "最小值裁剪为 1");
     pm.setFanout(17);
@@ -208,7 +208,7 @@ describe("ProcessManager — health metrics", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-health-metrics-"));
     const store = new HealthMetricsStore(dir);
     setHealthMetricsStoreForTests(store);
-    const pm = new ProcessManager();
+    const pm = new ProcessManager("hierarchical");
 
     try {
       for (let i = 0; i < 10; i++) {
@@ -462,7 +462,7 @@ describe("SecretaryProxy — health metrics", () => {
     assert.ok(hits.length >= 9, `expected >=9/10 CJK duplicate recall, got ${hits.length}/10`);
   });
 
-  it("Chinese near-duplicate facts merge through SecretaryProxy", () => {
+  it("Chinese near-duplicate facts remain separate through SecretaryProxy", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "secretary-health-cjk-merge-"));
     const store = new HealthMetricsStore(dir);
     setHealthMetricsStoreForTests(store);
@@ -481,9 +481,9 @@ describe("SecretaryProxy — health metrics", () => {
       sec.observe({ v: 1, type: "tool.result", agent: "w-cjk-merge", id: "tc-2", ok: true, output: "src/config.ts 的配置文件必须保留 baseUrl" });
 
       const facts = sec.getMemory().working_set.facts;
-      assert.equal(facts.length, 1);
-      assert.equal(facts[0]!.weight, 2);
-      assert.equal(store.readMetrics()[0]?.event_type, "memory_fact_merged");
+      assert.equal(facts.length, 2);
+      assert.equal(facts[0]!.weight, 1);
+      assert.equal(store.readMetrics().some((m) => m.event_type === "memory_fact_merged"), false);
     } finally {
       sec.destroy();
       setHealthMetricsStoreForTests(null);

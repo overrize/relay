@@ -1,8 +1,9 @@
+import type { ModelRouting } from "./models/routing.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
-const CONFIG_DIR  = path.join(os.homedir(), ".config", "multi-agent-tui");
+const CONFIG_DIR = process.env.SPAWN_CONFIG_DIR ?? path.join(os.homedir(), ".config", "multi-agent-tui");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 
 export type PaletteName = "paper" | "green" | "amber";
@@ -13,7 +14,15 @@ export interface ProviderCapabilities {
   structuredOutput: boolean;  // supports structured / JSON-schema output
 }
 
+export interface BillingConfig {
+  mode: "api" | "subscription";
+  /** USD per million tokens; estimates, not an invoice. Subscription usage has no local per-token USD charge. */
+  inputUsdPerMillion?: number;
+  outputUsdPerMillion?: number;
+}
 export interface ProviderConfig {
+  transport?: "http" | "claude-cli" | "codex-cli";
+  billing?: BillingConfig;
   provider: "anthropic" | "openai";
   model: string;
   apiKey: string;
@@ -94,6 +103,8 @@ export function resolveProviderConfigInput(
   modelOrKey: string,
   maybeApiKey?: string,
 ): ProviderConfig | null {
+  if (preset === "codex-subscription") return { provider: "openai", model: modelOrKey, apiKey: "", transport: "codex-cli", billing: { mode: "subscription" } };
+  if (preset === "claude-subscription") return { provider: "anthropic", model: modelOrKey, apiKey: "", transport: "claude-cli", billing: { mode: "subscription" } };
   const base = PROVIDER_PRESETS[preset] ?? { provider: "openai" as const, baseUrl: preset };
   const model = maybeApiKey ? modelOrKey : base.model;
   const apiKey = maybeApiKey ?? modelOrKey;
@@ -135,6 +146,7 @@ export interface WebConfig {
 }
 
 export interface Config {
+  routing?: ModelRouting;
   palette: PaletteName;
   layout: "v1" | "v3";
   models: Record<string, ProviderConfig>;
@@ -318,4 +330,19 @@ export function saveWebSearchSelection(providerName: string): boolean {
   } catch {
     return false;
   }
+}
+
+
+export function validateBillingConfig(config: ProviderConfig): void {
+  const b = config.billing;
+  if (b && !["api", "subscription"].includes(b.mode)) throw new Error("Billing mode must be api or subscription");
+  for (const rate of [b?.inputUsdPerMillion,b?.outputUsdPerMillion]) if (rate !== undefined && (!Number.isFinite(rate) || rate < 0)) throw new Error("Prices must be finite nonnegative USD per million tokens");
+  if (config.transport && !["http","claude-cli","codex-cli"].includes(config.transport)) throw new Error("Unknown model transport");
+  if (config.transport === "codex-cli" && (config.provider !== "openai" || b?.mode !== "subscription" || config.apiKey || config.baseUrl)) throw new Error("codex-cli requires ChatGPT subscription mode without API key/baseUrl");
+  if (config.transport === "claude-cli" && (config.provider !== "anthropic" || b?.mode !== "subscription" || config.apiKey || config.baseUrl)) throw new Error("claude-cli requires Claude subscription mode without API key/baseUrl");
+}
+
+export function saveModelRouting(routing: ModelRouting): void {
+  const existing = loadConfig(); fs.mkdirSync(CONFIG_DIR,{recursive:true});
+  fs.writeFileSync(CONFIG_FILE,JSON.stringify({...existing,routing},null,2));
 }

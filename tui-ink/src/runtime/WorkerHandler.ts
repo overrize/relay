@@ -1,3 +1,10 @@
+import { resolveModelRoute } from "../models/routing.js";
+import { sessionJournal } from "../session/Journal.js";
+import { registerSessionAgent, waitForSessionControl } from "../session/Control.js";
+import { taskNotice } from "./TaskNotice.js";
+import { consumeTaskTurn, taskFor } from "../session/Tasks.js";
+import { prepareWorkspace } from "../session/Workspaces.js";
+import { cancelAgentToolsAndWait } from "../tools/command.js";
 /** WorkerHandler — startWorker (spawn-1.0 M1-6e). golden 25 covers it. */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -66,6 +73,7 @@ export function startWorker(
     // Must happen AFTER startLeaderAgent so the child is in the agents Map.
     const tlHandle = pm.registerSpawn(e.child, e.parent);
     tlHandle.promise.then((syncResult) => {
+      if (!sessionJournal().isCurrent(e.child, e.session_revision)) return;
       if (syncResult === null) {
         const parentAgent = agents.get(e.parent);
         if (parentAgent instanceof HttpConvAgent) {
@@ -80,14 +88,17 @@ export function startWorker(
   }
 
   const cfg = loadConfig();
-  const baseWorkerProviderCfg = getAgentProviderConfig(cfg, "worker");
-  const workerModel = e.model ?? baseWorkerProviderCfg.model;
+  let modelRoute;
+  try { modelRoute = resolveModelRoute(cfg,"worker",e.dispatch?.worker_profile ?? "implement",e.model); }
+  catch(error) { applyEvent({v:1,type:"agent.error",agent:e.parent,code:"model_route",detail:String(error)}); return; }
+  const baseWorkerProviderCfg = modelRoute.candidates[0]!.config;
+  const workerModel = baseWorkerProviderCfg.model;
   if (!workerModel) {
     applyEvent({ v: 1, type: "agent.error", agent: e.parent,
       code: "no_worker_model", detail: "No model configured for worker — use /model worker <model-name>" });
     return;
   }
-  const workerProviderCfg = { ...baseWorkerProviderCfg, ...(e.model ? { model: e.model } : {}) };
+  const workerProviderCfg = baseWorkerProviderCfg;
 
   // Compute parent depth for child's memory
   const parentDepth = getState().agents.get(e.parent) ?
@@ -114,13 +125,23 @@ export function startWorker(
   const systemPrompt = buildSystemPrompt(
     e.role, e.child, e.goal, opts.resumedMemoryId,
     e.dispatch?.prompt_file ?? undefined,
-  );
+  ) + `\n[任务定位] ${taskFor(e.child)?.profile ?? "implement"}。research/review 只允许读与检索；verify 负责检查并给出可核对证据；implement 执行修改。所有定位都使用同一 Worker 生命周期与共享预算，不创建额外管理层。`;
+  const journal = sessionJournal();
+  journal.bind(e.child, e.role, e.parent, e.goal, e.dispatch);
+  if (!journal.isCurrent(e.child, e.session_revision)) return;
+  if (opts.resumedMemoryId) journal.append("agent.recovered", journal.binding(e.child)!.conversation, e.child, journal.currentRevision(e.child)!, {});
   const a = new HttpConvAgent({
     id: e.child,
     role: e.role,
+    sessionManaged: true,
     providerCfg: workerProviderCfg,
+    modelCandidates: modelRoute.candidates, routingProfile: modelRoute.profile,
     systemPrompt,
     resumeFrom: opts.resumedMemoryId,
+  });
+  const unregisterSession = registerSessionAgent(e.child, () => {
+    killAgent(e.child, "superseded requirement");
+    updateAgentInfo(e.child, { state: "err", sub: "superseded" });
   });
   agents.set(e.child, a);
   globalBus.registerAgent(e.child, a);
@@ -145,6 +166,8 @@ export function startWorker(
     }),
   );
 
+  secretary.once("destroy", unregisterSession);
+
   // Pending tool calls emitted during one send() round — batched and executed on idle
   const toolQueue: Array<Extract<TuiEvent, { type: "tool.call" }>> = [];
   let workerActedThisTurn = false;
@@ -156,6 +179,10 @@ export function startWorker(
   let wSameToolCount = 0;
   let wDoneNotified = false; // guard: only send completion notification to parent once
   let workerTerminal = false; // once agent.done is accepted, drop delayed/prose/tool events
+  let outstandingTools = 0;
+  let finishingFailure = false;
+  let missingTerminalNudges = 0;
+  let rejectedTodoCompletions = 0;
   const workerTurnShadow = new TurnController();
   const logWorkerTurnShadow = (): void => {
     if (process.env.SPAWN_SHADOW_TURN !== "1") return;
@@ -245,9 +272,32 @@ export function startWorker(
     } as TuiEvent);
   };
 
+  const controlled = taskFor(e.child);
+  const deadlineTimer = controlled && setTimeout(() => fireHardCircuit("task-deadline"), Math.max(1, controlled.deadline - Date.now()));
+  deadlineTimer?.unref();
+  secretary.once("destroy", () => { if (deadlineTimer) clearTimeout(deadlineTimer); });
+
   a.on("event", (ev: TuiEvent) => {
+    if (finishingFailure && ev.type !== "token.usage") return;
     if (workerTerminal && ev.type !== "token.usage") {
       logDiag(`[${e.child}] dropped ${ev.type} after terminal agent.done\n`);
+      return;
+    }
+    if (ev.type === "agent.state" && ev.state === "run" && !consumeTaskTurn(e.child)) { fireHardCircuit("shared-turn-or-time-budget"); return; }
+    const hasPendingTools = ev.type === "agent.done" && ev.success && Object.values(sessionJournal().current(sessionJournal().binding(e.child)!.conversation)!.tools).some((t) => t.agent === e.child && t.revision === (e.session_revision ?? sessionJournal().binding(e.child)!.revision) && t.status === "pending");
+    if (ev.type === "agent.done" && ev.success && (toolQueue.length || outstandingTools || hasPendingTools)) {
+      const j = sessionJournal(), b = j.binding(e.child)!;
+      j.append("completion.rejected", b.conversation, e.child, b.revision, { reason: "tools-pending", queued: toolQueue.length, running: outstandingTools });
+      return; // Let the queued tools finish and feed their actual results first.
+    }
+    if (ev.type === "agent.done" && ev.success && (getState().todosByAgent.get(e.child) ?? []).some((t) => t.state === "todo" || t.state === "run")) {
+      if (rejectedTodoCompletions++ < 2) setImmediate(() => { if (!workerTerminal && sessionJournal().isCurrent(e.child, e.session_revision)) a.sendCommand({ type: "user.message", text: "[系统-验收未闭环] TODO 仍未完成，不能报告成功。继续完成并更新 TODO；若阻塞，请 handup 给出未完成项、证据和原因。" }); });
+      else fireHardCircuit("unresolved-todo-completion");
+      return;
+    }
+    if (ev.type === "agent.done" && !ev.success && outstandingTools) {
+      finishingFailure = true; toolQueue.length = 0;
+      void cancelAgentToolsAndWait(e.child).then(() => { outstandingTools = 0; finishingFailure = false; a.emit("event", ev); });
       return;
     }
 
@@ -277,7 +327,6 @@ export function startWorker(
       workerTurnShadow.markAction();
       applyEvent(normalizedEv);
       pm.observe(normalizedEv);
-      secretary.observe(normalizedEv);
       startWorker(normalizedEv);
       return;
     }
@@ -286,14 +335,10 @@ export function startWorker(
     if (ev.type === "agent.error") {
       applyEvent(ev);
       pm.observe(ev);
-      secretary.observe(ev);
-      const parentAgent = agents.get(e.parent);
-      if (parentAgent instanceof HttpConvAgent) {
-        parentAgent.sendCommand({
-          type: "user.message",
-          text: `[系统-错误] ${e.child} 发生错误 [${ev.code}]${ev.detail ? ": " + ev.detail : ""}。\n请立即 message→user 说明情况，并提供选项让用户选择：\n① 重试（重新 spawn 同目标 worker）\n② 换策略（spawn 新 worker 用不同方法）\n③ 放弃该子任务，继续其他工作\n④ 人工介入（请用户手动操作后告知你）`,
-        });
-      }
+      if (ev.code === "http_error" || ev.code === "context_error" || ev.code === "session_budget") {
+        wLastFailOutput = `${ev.code}: ${ev.detail ?? ""}`;
+        fireHardCircuit("model-request-failed");
+      } else taskNotice(e.parent, e.child, `[系统-诊断] ${e.child} [${ev.code}] ${ev.detail ?? ""}。先核对 TaskStatus 与现场，判断是否需要接管；不要仅因一条诊断就要求用户选择重试。`, agents, killedAgents);
       return;
     }
 
@@ -329,6 +374,7 @@ export function startWorker(
           applyEvent({ v: 1, type: "agent.error", agent: ev.agent, code: "illegal_message", detail });
           pm.observe(ev);
           setImmediate(() => {
+            if (!sessionJournal().isCurrent(e.child, e.session_revision)) return;
             if (getState().agents.get(e.child)?.state === "done" || killedAgents.has(e.child)) return;
             a.sendCommand({
               type: "user.message",
@@ -409,7 +455,6 @@ export function startWorker(
 
     applyEvent(ev);
     pm.observe(ev);
-    secretary.observe(ev);
 
     // ── per-event debug logging ──────────────────────────────────────────────
     if (ev.type === "agent.state") {
@@ -441,15 +486,7 @@ export function startWorker(
       if (workerNudgePending) wQualNudges++;
       wQualTurns++;
       // Hard turn limit — force handup so worker can't loop indefinitely
-      if (wQualTurns >= MAX_WORKER_TURNS) {
-        setImmediate(() => {
-          if (getState().agents.get(e.child)?.state === "done" || killedAgents.has(e.child)) return;
-          a.sendCommand({
-            type: "user.message",
-            text: `[系统-轮数上限] 你已使用 ${wQualTurns} 轮，达到上限 ${MAX_WORKER_TURNS} 轮。必须在本轮内完成任务或立即 unit.handup 给 ${e.parent}（含当前进展和卡点），不允许继续下一轮。`,
-          });
-        });
-      }
+      if (wQualTurns > MAX_WORKER_TURNS) { fireHardCircuit("turn-budget-exhausted"); return; }
     }
     if (ev.type === "unit.handup") wQualHandup = true;
     if (ev.type === "agent.done") {
@@ -477,37 +514,29 @@ export function startWorker(
       );
       // Resolve foreground tracking so parent's pm.getForegroundChildren() reflects completion
       pm.completeForeground(e.child, { success: ev.success, reason: ev.reason, evidence: ev.evidence });
-      const parentAgent = agents.get(e.parent);
-      // Don't wake a killed/finished parent.
-      const parentSt = getState().agents.get(e.parent)?.state;
       // Guard: only notify parent once — workers can emit agent.done multiple times if nudged
-      if (!wDoneNotified && !killedAgents.has(e.parent) && parentSt !== "done" && parentAgent instanceof HttpConvAgent) {
+      if (!wDoneNotified) {
         wDoneNotified = true;
         if (ev.success) {
           const evidenceLines = ev.evidence?.length
             ? "\n证据:\n" + ev.evidence.map((s) => `  - ${s}`).join("\n")
             : "";
-          parentAgent.sendCommand({
-            type: "user.message",
-            text: `[系统] ${e.child} 成功完成${ev.reason ? ": " + ev.reason : ""}。${evidenceLines}\n请继续推进你的任务。`,
-          });
+          taskNotice(e.parent, e.child, `[系统] ${e.child} 自报完成${ev.reason ? ": " + ev.reason : ""}。${evidenceLines}\n请核对验收证据并继续推进任务。`, agents, killedAgents);
         } else {
-          parentAgent.sendCommand({
-            type: "user.message",
-            text: `[系统-失败] ${e.child} 任务失败${ev.reason ? ": " + ev.reason : ""}。\n请立即 message→user 说明情况，并提供选项让用户选择：\n① 重试（重新 spawn 同目标 worker）\n② 换策略（spawn 新 worker 用不同方法）\n③ 放弃该子任务，继续其他工作\n④ 人工介入（请用户手动操作后告知你）`,
-          });
+          taskNotice(e.parent, e.child, `[系统-失败] ${e.child} 停止${ev.reason ? ": " + ev.reason : ""}。请依据持久交接决定补充上下文、续派或换策略。不要把未完成当作成功；只有确需用户决策时才中断用户。`, agents, killedAgents);
         }
       }
       globalBus.unregisterAgent(e.child);
-      // M2-9: destroy secretary (stop snapshot timer) before deleting the .json so a
-      // periodic snapshot can't re-write the file we just removed.
+      // Stop observation after the final snapshot, retaining completed history.
+      secretaries.get(e.parent)?.ingestChildMemory(secretary.getMemory() as any);
       destroySecretary(secretaries, e.child);
-      deleteAgentMemory(e.child);
+      a.kill(); // Drop queued internal prompts after the durable terminal event.
+      // Keep the completed snapshot for history and explicit resume.
     }
     if (ev.type === "unit.handup") {
       workerTurnShadow.markParentReport();
       const parentAgent = agents.get(e.parent);
-      if (parentAgent instanceof HttpConvAgent) {
+      if (!outstandingTools && !wHardCircuitFired && parentAgent instanceof HttpConvAgent) {
         const findingLines = ev.findings?.length
           ? "\n发现（按级别）:\n" + ev.findings.map((f) => `  [${f.level}] ${f.text}`).join("\n")
           : "";
@@ -567,7 +596,7 @@ export function startWorker(
         const approverId = getState().agents.get(e.parent)?.id ?? e.parent;
         if (approverAgent) {
           leaderApprovalQueue.set(ev.id, {
-            workerAgent: a, toolName: ev.name, toolArgs: ev.args, workerChildId: e.child,
+            workerAgent: a, toolName: ev.name, toolArgs: ev.args, workerChildId: e.child, revision: ev.session_revision,
           });
           approverAgent.sendCommand({
             type: "user.message",
@@ -609,19 +638,24 @@ export function startWorker(
           logDiag(`[${e.child}] loop-detect: ${loopTool} called same args ${wSameToolCount}x\n`);
           const warnMsg = `【系统-循环检测】你已连续 ${wSameToolCount} 次调用相同的 ${loopTool}，得到相同结果。换一个不同的工具或不同参数。`;
           setImmediate(() => {
+            if (!sessionJournal().isCurrent(e.child, e.session_revision)) return;
             if (getState().agents.get(e.child)?.state === "done" || killedAgents.has(e.child)) return;
             a.sendCommand({ type: "user.message", text: warnMsg });
           });
         }
         const batch = toolQueue.splice(0);
+        outstandingTools += batch.length;
         setImmediate(async () => {
           // Guard: agent may have reached terminal state while this callback was queued.
-          if (getState().agents.get(e.child)?.state === "done" || killedAgents.has(e.child)) return;
+          if (getState().agents.get(e.child)?.state === "done" || killedAgents.has(e.child)) { outstandingTools = Math.max(0, outstandingTools - batch.length); return; }
           const results = await runToolBatch(batch, e.child);
+          if (!sessionJournal().isCurrent(e.child, e.session_revision)) return;
           // Defer delivery via setImmediate so the I/O phase can drain SSE events (including
           // agent.done from the LLM stream) before we re-check and deliver. A microtask
           // continuation here would fire BEFORE pending SSE I/O, missing a concurrent agent.done.
           setImmediate(() => {
+            outstandingTools = Math.max(0, outstandingTools - batch.length);
+            if (!sessionJournal().isCurrent(e.child, e.session_revision)) return;
             if (getState().agents.get(e.child)?.state === "done" || killedAgents.has(e.child)) {
               logDiag(`[${e.child}] dropped tool.result for ${batch.length} tool(s) — agent done during execution\n`);
               return;
@@ -671,7 +705,7 @@ export function startWorker(
                   wTestAttemptedButNoResult = true; // wLastTestFailed 保持 null
                 }
               }
-              applyEvent({ v: 1, type: "tool.result", agent: e.child, id, ok, output });
+              applyEvent({ v: 1, type: "tool.result", agent: e.child, id, ok, output, session_revision: batch[i]!.session_revision });
             }
             // Use user.message so the [tool_result id=...] headers in `combined` aren't
             // double-wrapped (sendCommand type:"tool.result" would add an extra header).
@@ -697,20 +731,20 @@ export function startWorker(
         const todos = getState().todosByAgent.get(e.child) ?? [];
         const hasRun  = todos.some((t) => t.state === "run");
         const hasTodo = todos.some((t) => t.state === "todo");
-        if (hasRun && !hasTodo) {
-          const closed = todos.map((t) => ({ ...t, state: t.state === "run" ? "done" : t.state }));
-          applyEvent({ v: 1, type: "todo.set", agent: e.child, items: closed as any });
-        } else if (hasTodo && workerContinuations < 3) {
+        if ((hasRun || hasTodo) && workerContinuations < 3) {
           workerContinuations++;
-          const pendingTodos = todos.filter((t) => t.state === "todo").map((t) => t.text).join("; ");
+          const pendingTodos = todos.filter((t) => t.state === "todo" || t.state === "run").map((t) => t.text).join("; ");
           workerNudgePending = true;
           setImmediate(() => {
+            if (!sessionJournal().isCurrent(e.child, e.session_revision)) return;
             if (getState().agents.get(e.child)?.state === "done" || killedAgents.has(e.child)) return;
             a.sendCommand({
               type: "user.message",
               text: `【系统-自检】你执行了部分操作但 todo 列表仍有未完成项：${pendingTodos}。立刻继续执行下一步：输出 step + tool.call。`,
             });
           });
+        } else if (hasRun || hasTodo) {
+          fireHardCircuit("unfinished-todos");
         }
       } else if (!workerActedThisTurn && !workerGaveUp) {
         // Worker planned but didn't act — nudge to continue
@@ -720,6 +754,7 @@ export function startWorker(
           workerContinuations++;
           workerNudgePending = true;
           setImmediate(() => {
+            if (!sessionJournal().isCurrent(e.child, e.session_revision)) return;
             if (getState().agents.get(e.child)?.state === "done" || killedAgents.has(e.child)) return;
             a.sendCommand({ type: "user.message", text: "【系统】你有未完成的 todo。立刻执行下一步：输出 step + tool.call，不要只规划。" });
           });
@@ -733,6 +768,7 @@ export function startWorker(
           workerContinuations++;
           workerNudgePending = true;
           setImmediate(() => {
+            if (!sessionJournal().isCurrent(e.child, e.session_revision)) return;
             if (getState().agents.get(e.child)?.state === "done" || killedAgents.has(e.child)) return;
             a.sendCommand({
               type: "user.message",
@@ -743,6 +779,12 @@ export function startWorker(
           workerGaveUp = true;
           fireHardCircuit("silent-no-output");
         }
+      }
+      if (!workerTerminal && !finishingFailure && !toolQueue.length && !outstandingTools && workerActedThisTurn && !workerNudgePending) {
+        if (missingTerminalNudges++ < 2) {
+          workerNudgePending = true;
+          setImmediate(() => { if (!workerTerminal && !killedAgents.has(e.child) && sessionJournal().isCurrent(e.child, e.session_revision)) a.sendCommand({ type: "user.message", text: "[系统-任务未闭环] 你已汇报但未明确结束。满足验收则 agent.done 并附证据；否则继续执行或 unit.handup 说明未完成事项，不要静默停在 idle。" }); });
+        } else fireHardCircuit("missing-terminal-report");
       }
     }
   });
@@ -779,7 +821,7 @@ export function startWorker(
       initMsg += `\n\n【父级已确认事实 (TL working_set)】\n${factsBlock}`;
     }
   }
-  a.sendCommand({ type: "user.message", text: initMsg });
+  void waitForSessionControl(e.child).then(() => prepareWorkspace(e.child)).then(() => { if (!killedAgents.has(e.child) && sessionJournal().isCurrent(e.child, e.session_revision)) a.sendCommand({ type: "user.message", text: initMsg + "\n[文件隔离] 工具使用任务副本；使用相对路径。禁止通过绝对路径或父目录修改原工作区。发布由控制器进行，遇到冲突应交给 PM。" }); }).catch((error) => a.emit("event", { v: 1, type: "agent.error", agent: e.child, code: "context_error", detail: `Workspace preparation failed: ${String(error)}` }));
 
   // ── Auto-background: register foreground spawn for parent → child tracking ──
   const parentInfo = getState().agents.get(e.parent);
@@ -788,6 +830,7 @@ export function startWorker(
     const handle = pm.registerSpawn(e.child, e.parent);
     // When the foreground promise resolves (30s sync or 2min bg switch):
     handle.promise.then((syncResult) => {
+      if (!sessionJournal().isCurrent(e.child, e.session_revision)) return;
       if (syncResult === null) {
         // Switched to background: notify parent
         const parentAgent = agents.get(e.parent);
@@ -803,4 +846,3 @@ export function startWorker(
     });
   }
 }
-

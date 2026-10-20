@@ -21,7 +21,7 @@ export function shouldSuppress(msg: OutboundMsg, ctx: OutboundContext): string |
 
   // 3. Intermediate status while children are running (only in conversationMode)
   //    e.g. "已派 tl-01 去处理，稍后汇报" sent while tl-01 is still active.
-  if (ctx.conversationMode && ctx.hasActiveChildren) {
+  if (ctx.conversationMode && ctx.hasActiveChildren && /^(已派|已安排|正在处理)[^\n]{0,100}(稍后|汇报|等待)/.test(msg.text)) {
     return "intermediate progress while children active";
   }
 

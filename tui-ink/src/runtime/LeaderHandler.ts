@@ -1,3 +1,11 @@
+import { resolveModelRoute } from "../models/routing.js";
+import { sessionJournal } from "../session/Journal.js";
+import { registerSessionAgent, beginSessionRecovery } from "../session/Control.js";
+import { registerRuntimeOwner } from "../session/RuntimeOwner.js";
+import { taskNotice } from "./TaskNotice.js";
+import { admitWorker } from "../session/Tasks.js";
+import { recoverTasks } from "./TaskRecovery.js";
+import { cancelAgentToolsAndWait } from "../tools/command.js";
 /** LeaderHandler — startLeaderAgent (spawn-1.0 M1-6e). golden 25 covers it. */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -40,8 +48,11 @@ export function startLeaderAgent(opts: LeaderOpts): void {
   }
 
   const cfg = loadConfig();
-  const leaderProviderCfg = getAgentProviderConfig(cfg, "leader");
-  const model = opts.model ?? leaderProviderCfg.model ?? MODEL;
+  let modelRoute;
+  try { modelRoute = resolveModelRoute(cfg,"leader",opts.parentId ? "leader" : "pm",opts.model); }
+  catch(error) { applyEvent({v:1,type:"agent.error",agent:opts.id,code:"model_route",detail:String(error)}); return; }
+  const leaderProviderCfg = modelRoute.candidates[0]!.config;
+  const model = leaderProviderCfg.model ?? MODEL;
   const isRoot = !opts.parentId;
   const promptFile = opts.promptFile ?? (isRoot ? "pm" : "leader");
 
@@ -72,19 +83,31 @@ export function startLeaderAgent(opts: LeaderOpts): void {
   // Phase B: forked tasks share the exact system prompt from the base PM for Anthropic cache reuse.
   const systemPrompt = opts.sharedSystemPrompt
     ?? buildSystemPrompt("Leader", opts.id, opts.goal, opts.resumedMemoryId, promptFile);
+  const journal = sessionJournal();
+  if (isRoot) registerRuntimeOwner();
+  const existed = journal.binding(opts.id);
+  journal.bind(opts.id, "Leader", opts.parentId, opts.goal ?? "", opts.dispatch);
+  if (isRoot) beginSessionRecovery(journal.binding(opts.id)!.conversation);
+  if (existed && isRoot) journal.append("session.recovered", existed.conversation, opts.id, journal.currentRevision(opts.id)!, {});
   const a = new HttpConvAgent({
     id: opts.id,
     role: "Leader",
+    sessionManaged: true,
     providerCfg: { ...leaderProviderCfg, model },
+    modelCandidates: modelRoute.candidates, routingProfile: modelRoute.profile,
     systemPrompt,
     resumeFrom: opts.isForkedTask ? undefined : opts.resumedMemoryId,
     initialMessages: opts.initialMessages,
   });
+  const unregisterSession = registerSessionAgent(opts.id, () => {
+    if (opts.parentId) { killAgent(opts.id, "superseded requirement"); updateAgentInfo(opts.id, { state: "err", sub: "superseded" }); }
+    else { a.kill(); abortAgent(opts.id); toolQueue.length = 0; }
+  });
   agents.set(opts.id, a);
   globalBus.registerAgent(opts.id, a);
 
-  // Secretary — skipped for forked tasks (single-use, no memory persistence needed).
-  const secretary: SecretaryProxy | null = opts.isForkedTask ? null : initSecretary(
+  // Every conversation, including concurrent forks, has a durable secretary.
+  const secretary: SecretaryProxy = initSecretary(
     secretaries, opts.id, opts.resumedMemoryId,
     () => ({
       agentId: opts.id,
@@ -102,6 +125,8 @@ export function startLeaderAgent(opts: LeaderOpts): void {
     }),
   );
 
+  secretary.once("destroy", unregisterSession);
+
   // Per-turn state
   const toolQueue: Array<Extract<TuiEvent, { type: "tool.call" }>> = [];
   let actedThisTurn = false;
@@ -113,6 +138,8 @@ export function startLeaderAgent(opts: LeaderOpts): void {
   let lastToolCallKey = "";       // loop detection: last "tool:argsJSON" key
   let sameToolCallCount = 0;      // how many consecutive times same tool+args was called
   let terminalEventAccepted = false; // non-root leaders/forks ignore delayed events after agent.done
+  let outstandingTools = 0;
+  let finishingFailure = false;
   const turnShadow = new TurnController();
   const logTurnShadow = (): void => {
     if (process.env.SPAWN_SHADOW_TURN !== "1") return;
@@ -207,6 +234,12 @@ export function startLeaderAgent(opts: LeaderOpts): void {
   };
 
   a.on("event", (e: TuiEvent) => {
+    if (finishingFailure && e.type !== "token.usage") return;
+    if (e.type === "agent.done" && e.success && (toolQueue.length || outstandingTools || [...getState().agents.values()].some((child) => child.parent === opts.id && child.state !== "done" && child.state !== "err"))) return;
+    if (e.type === "agent.done" && !e.success && outstandingTools) {
+      finishingFailure = true; toolQueue.length = 0;
+      void cancelAgentToolsAndWait(opts.id).then(() => { outstandingTools = 0; finishingFailure = false; a.emit("event", e); }); return;
+    }
     if (terminalEventAccepted && e.type !== "token.usage") {
       logDiag(`[${opts.id}] dropped ${e.type} after terminal agent.done\n`);
       return;
@@ -233,18 +266,20 @@ export function startLeaderAgent(opts: LeaderOpts): void {
         applyEvent({ v: 1, type: "agent.error", agent: opts.id, code: check.code, detail: check.detail });
         return;
       }
+      try { admitWorker(normalized); }
+      catch (error) { a.sendCommand({ type: "user.message", text: `[任务控制] 派工被拒绝：${String(error)}。请用 TaskStatus 检查，不得换 ID 重置预算。` }); return; }
       actedThisTurn = true;
       turnShadow.markAction();
       applyEvent(normalized);
       pm.observe(normalized);
-      secretary?.observe(normalized);
       logDiag(`[${opts.id}] spawn child=${normalized.child} role=${normalized.role ?? "?"} goal="${(normalized.goal ?? "").slice(0, 80)}"\n`);
       startWorker(normalized); // foreground tracking registered inside startWorker for both Leader+Worker
       return;
     }
 
     if (e.type === "agent.error") {
-      applyEvent(e); pm.observe(e); secretary?.observe(e);
+      applyEvent(e); pm.observe(e);
+      if (opts.parentId && (e.code === "http_error" || e.code === "context_error" || e.code === "session_budget")) a.emit("event", { v: 1, type: "agent.done", agent: opts.id, success: false, reason: `model-request-failed: ${e.code}`, session_revision: e.session_revision });
       return;
     }
 
@@ -269,7 +304,6 @@ export function startLeaderAgent(opts: LeaderOpts): void {
       logDiag(`[${opts.id}] redirected message.to=user → ${opts.parentId}\n`);
       applyEvent(redirected);
       pm.observe(redirected);
-      secretary?.observe(redirected);
       reportedToParent = true;
       turnShadow.markParentReport();
       const parentAgent = agents.get(opts.parentId);
@@ -288,7 +322,8 @@ export function startLeaderAgent(opts: LeaderOpts): void {
       if (pending) {
         leaderApprovalQueue.delete(e.id);
         if (e.type === "tool.approved") {
-          executeTool(pending.toolName, pending.toolArgs, { agentId: pending.workerChildId }).then((r) => {
+          executeTool(pending.toolName, pending.toolArgs, { agentId: pending.workerChildId, revision: pending.revision }).then((r) => {
+            if (!sessionJournal().isCurrent(pending.workerChildId, pending.revision)) return;
             if (getState().agents.get(pending.workerChildId)?.state === "done" || killedAgents.has(pending.workerChildId)) {
               logDiag(`[${pending.workerChildId}] dropped Bash-approval tool.result — agent done during execution\n`);
               return;
@@ -307,7 +342,6 @@ export function startLeaderAgent(opts: LeaderOpts): void {
 
     applyEvent(e);
     pm.observe(e);
-    secretary?.observe(e);
 
     // ── per-event debug logging ──────────────────────────────────────────────
     if (e.type === "agent.state") {
@@ -447,32 +481,21 @@ export function startLeaderAgent(opts: LeaderOpts): void {
     }
     // Tech Lead completion — notify parent PM + ingest memory upward
     if (e.type === "agent.done" && opts.parentId) {
-      const pmSec = secretaries.get("pm");
+      const pmSec = secretaries.get(opts.parentId);
       if (pmSec && secretary) pmSec.ingestChildMemory(secretary.getMemory() as any);
       // Resolve foreground tracking so parent's pm.getForegroundChildren() reflects completion
       pm.completeForeground(opts.id, { success: e.success, reason: e.reason, evidence: e.evidence });
-      const parentAgent = agents.get(opts.parentId);
-      // Don't wake a killed/finished parent — child completion should not restart it.
-      const parentState = getState().agents.get(opts.parentId)?.state;
-      if (!killedAgents.has(opts.parentId) && parentState !== "done" && parentAgent instanceof HttpConvAgent) {
         if (e.success) {
           const evidenceLines = e.evidence?.length
             ? "\n证据:\n" + e.evidence.map((s) => `  - ${s}`).join("\n") : "";
-          parentAgent.sendCommand({
-            type: "user.message",
-            text: `[系统] ${opts.id} 成功完成${e.reason ? ": " + e.reason : ""}。${evidenceLines}\n请继续推进你的任务。`,
-          });
+          taskNotice(opts.parentId, opts.id, `[系统] ${opts.id} 自报完成${e.reason ? ": " + e.reason : ""}。${evidenceLines}\n请核对验收证据并继续推进任务。`, agents, killedAgents);
         } else {
-          parentAgent.sendCommand({
-            type: "user.message",
-            text: `[系统-失败] ${opts.id} 任务失败${e.reason ? ": " + e.reason : ""}。\n请立即 message→user 说明情况，并提供选项：\n① 重试 ② 换策略 ③ 放弃 ④ 人工介入`,
-          });
+          taskNotice(opts.parentId, opts.id, `[系统-失败] ${opts.id} 任务停止${e.reason ? ": " + e.reason : ""}。依据持久交接决定补充上下文、续派或换策略；仅在确需用户决策时询问。`, agents, killedAgents);
         }
-      }
       globalBus.unregisterAgent(opts.id);
-      // M2-9: stop the secretary (kills its snapshot timer) BEFORE deleting the .json,
-      // otherwise a periodic snapshot re-writes the file we just removed.
-      if (!opts.isForkedTask) { destroySecretary(secretaries, opts.id); deleteAgentMemory(opts.id); }
+      // Stop the secretary while retaining the completed snapshot for resume.
+      destroySecretary(secretaries, opts.id); // Keep completed snapshots available for resume.
+      a.kill();
     }
 
     if (e.type === "unit.handup") {
@@ -514,19 +537,24 @@ export function startLeaderAgent(opts: LeaderOpts): void {
           logDiag(`[${opts.id}] loop-detect: ${loopTool} called same args ${sameToolCallCount}x\n`);
           const warnMsg = `【系统-循环检测】你已连续 ${sameToolCallCount} 次调用相同的 ${loopTool}，得到相同结果。换一个不同的工具或不同参数，否则任务将无法推进。`;
           setImmediate(() => {
+            if (!sessionJournal().isCurrent(opts.id, e.session_revision)) return;
             if (getState().agents.get(opts.id)?.state === "done" || killedAgents.has(opts.id)) return;
             a.sendCommand({ type: "user.message", text: warnMsg });
           });
           sameToolCallCount = 0;
         }
         const batch = toolQueue.splice(0);
+        outstandingTools += batch.length;
         setImmediate(async () => {
-          if (getState().agents.get(opts.id)?.state === "done" || killedAgents.has(opts.id)) return;
+          if (getState().agents.get(opts.id)?.state === "done" || killedAgents.has(opts.id)) { outstandingTools = Math.max(0, outstandingTools - batch.length); return; }
           const results = await runToolBatch(batch, opts.id);
+          if (!sessionJournal().isCurrent(opts.id, e.session_revision)) return;
           // Defer delivery via setImmediate so the I/O phase can drain SSE events (including
           // agent.done from the LLM stream) before we re-check and deliver. A microtask
           // continuation here would fire BEFORE pending SSE I/O, missing a concurrent agent.done.
           setImmediate(() => {
+            outstandingTools = Math.max(0, outstandingTools - batch.length);
+            if (!sessionJournal().isCurrent(opts.id, e.session_revision)) return;
             if (getState().agents.get(opts.id)?.state === "done" || killedAgents.has(opts.id)) {
               logDiag(`[${opts.id}] dropped tool.result for ${batch.length} tool(s) — agent done during execution\n`);
               return;
@@ -534,7 +562,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
             for (let i = 0; i < batch.length; i++) {
               const { id } = batch[i]!;
               const { ok, output } = results[i]!;
-              applyEvent({ v: 1, type: "tool.result", agent: opts.id, id, ok, output });
+              applyEvent({ v: 1, type: "tool.result", agent: opts.id, id, ok, output, session_revision: batch[i]!.session_revision });
             }
             // Feed combined results back to the LLM — without this the PM hangs indefinitely.
             // Use user.message so the [tool_result id=...] headers in `combined` aren't
@@ -548,7 +576,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
         const hasRun = todos.some((t) => t.state === "run");
         const hasTodo = todos.some((t) => t.state === "todo");
         const activeChildren = Array.from(getState().agents.values())
-          .filter((ag) => ag.parent === opts.id && (ag.state === "run" || ag.state === "idle"));
+          .filter((ag) => ag.parent === opts.id && ag.role !== "Secretary" && (ag.state === "run" || ag.state === "idle"));
         logDiag(`[${opts.id}] idle/acted hasTodo=${hasTodo} hasRun=${hasRun} activeChildren=${activeChildren.length} sentUser=${sentToUserThisTurn} reportedParent=${reportedToParent} convMode=${!!opts.conversationMode} cont=${continuations}\n`);
         // Belt-and-suspenders: also check foreground spawn handles (registered synchronously,
         // not subject to the spawn→run state transition race that activeChildren can miss)
@@ -556,6 +584,8 @@ export function startLeaderAgent(opts: LeaderOpts): void {
         const hasActiveChildren = activeChildren.length > 0 || foregroundChildren.length > 0;
         if (hasActiveChildren) {
           logDiag(`[${opts.id}] idle → waiting for children: store=[${activeChildren.map(c => c.id).join(",")}] fg=[${foregroundChildren.join(",")}]\n`);
+          // Background execution must not hold the user conversation lock.
+          if (opts.conversationMode && sentToUserThisTurn) drainConvModePM(false);
         } else if (reportedToParent && !hasTodo) {
           logDiag(`[${opts.id}] idle → reportedToParent+done, closing run items\n`);
           if (hasRun) {
@@ -601,6 +631,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
           logDiag(`[${opts.id}] idle → nudge cont=${continuations} pending="${pendingTodos.slice(0,80)}"\n`);
           nudgePending = true;
           setImmediate(() => {
+            if (!sessionJournal().isCurrent(opts.id, e.session_revision)) return;
             if (getState().agents.get(opts.id)?.state === "done" || killedAgents.has(opts.id)) return;
             a.sendCommand({
               type: "user.message",
@@ -622,6 +653,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
           continuations++;
           nudgePending = true;
           setImmediate(() => {
+            if (!sessionJournal().isCurrent(opts.id, e.session_revision)) return;
             if (getState().agents.get(opts.id)?.state === "done" || killedAgents.has(opts.id)) return;
             a.sendCommand({
               type: "user.message",
@@ -646,7 +678,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
         const todos = getState().todosByAgent.get(opts.id) ?? [];
         const hasPending = todos.some((t) => t.state === "todo" || t.state === "run");
         const activeChildren2 = Array.from(getState().agents.values())
-          .filter((ag) => ag.parent === opts.id && (ag.state === "run" || ag.state === "idle"));
+          .filter((ag) => ag.parent === opts.id && ag.role !== "Secretary" && (ag.state === "run" || ag.state === "idle"));
         logDiag(`[${opts.id}] idle/no-action hasPending=${hasPending} activeChildren=${activeChildren2.length} cont=${continuations}\n`);
         if (hasPending && activeChildren2.length > 0) {
           logDiag(`[${opts.id}] idle → waiting for children: ${activeChildren2.map(c => c.id).join(",")}\n`);
@@ -656,6 +688,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
           logDiag(`[${opts.id}] idle → nudge(no-action) cont=${continuations} pending="${pendingTodos.slice(0,80)}"\n`);
           nudgePending = true;
           setImmediate(() => {
+            if (!sessionJournal().isCurrent(opts.id, e.session_revision)) return;
             if (getState().agents.get(opts.id)?.state === "done" || killedAgents.has(opts.id)) return;
             const pending2 = todos.filter((t: {state:string;text:string}) => t.state === "todo" || t.state === "run").map((t: {text:string}) => t.text).join("; ");
             a.sendCommand({ type: "user.message", text: `【系统-强制执行】你已经规划了 todo 但没有采取任何行动。现在必须立刻输出以下之一：\n1. spawn 指令（如果需要 TL 执行）\n2. tool.call 指令（如果 PM 自己能处理）\n3. message.to=user（如果可以直接回答）\n未完成项：${pending2}\n不允许再次只输出 todo.set 或 step。` });
@@ -684,6 +717,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
           continuations++;
           nudgePending = true;
           setImmediate(() => {
+            if (!sessionJournal().isCurrent(opts.id, e.session_revision)) return;
             if (getState().agents.get(opts.id)?.state === "done" || killedAgents.has(opts.id)) return;
             a.sendCommand({
               type: "user.message",
@@ -702,7 +736,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
         // falls through BOTH chains above (acted chain and !acted&&!gaveUp chain). Converge it
         // with gave-up semantics (relay an explicit "abandoned" notice, not stale prose).
         const hasKids = Array.from(getState().agents.values())
-          .some((ag) => ag.parent === opts.id && (ag.state === "run" || ag.state === "idle"))
+          .some((ag) => ag.parent === opts.id && ag.role !== "Secretary" && (ag.state === "run" || ag.state === "idle"))
           || pm.getForegroundChildren(opts.id).length > 0;
         if (!hasKids) convergeChildLeader("gaveup-deadzone", { gaveUp: true });
       }
@@ -733,6 +767,8 @@ export function startLeaderAgent(opts: LeaderOpts): void {
       initMsg = opts.goal ?? "等待用户指令";
     }
   }
-  a.sendCommand({ type: "user.message", text: initMsg });
+  if (opts.resumedMemoryId) a.resumeSession();
+  else if (isRoot) a.receiveUserInput(initMsg, opts.inputId);
+  else a.sendCommand({ type: "user.message", text: initMsg });
+  if (isRoot) setImmediate(() => { if (agents.get(opts.id) === a && !killedAgents.has(opts.id)) recoverTasks(journal.binding(opts.id)!.conversation); });
 }
-
