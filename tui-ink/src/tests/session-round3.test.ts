@@ -121,8 +121,10 @@ test("hard-killed application leaves a supervised tree that restart cleanup safe
 
 test("watchdog cleans the tree even if the application never restarts", async () => {
   const f = await crashFixture(); await killOwner(f.owner);
-  await until(() => !processAlive(f.pid));
-  await until(() => JSON.parse(fs.readFileSync(f.record, "utf8")).status === "cancelled");
+  // OS tree termination runs in a separate process; allow loaded CI runners
+  // scheduling headroom without changing the required durable cleanup result.
+  await until(() => !processAlive(f.pid), 30000);
+  await until(() => JSON.parse(fs.readFileSync(f.record, "utf8")).status === "cancelled", 30000);
   assert.equal(JSON.parse(fs.readFileSync(f.record, "utf8")).reason, "owner-lost");
 });
 

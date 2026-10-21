@@ -45,7 +45,7 @@ export async function writeBuffer(file: string, content: Buffer) {
     await fs.promises.unlink(temporary).catch((e) => { if (e.code !== "ENOENT") throw e; });
   }
 }
-export function loadRetention(directory: string): RetentionBase | undefined {
+export function loadRetention(directory: string,onArchiveStat?:(file:string,stat:fs.Stats)=>void): RetentionBase | undefined {
   const valid: RetentionBase[] = [],checkedSizes=new Map<string,number>(); let existed = false;
   for (const name of ["retention.json", "retention.backup.json"]) {
     try {
@@ -57,7 +57,7 @@ export function loadRetention(directory: string): RetentionBase | undefined {
       for (const ref of refs) {
         if (!/^\d{16}-\d{16}\.mem\.gz$/.test(ref.name) || ref.from !== next || ref.to < next) throw new Error("Invalid memory archive sequence");
         next = ref.to + 1;
-        const archive=path.join(directory,'memory',ref.name);let size=checkedSizes.get(archive);if(size===undefined){size=fs.statSync(archive).size;checkedSizes.set(archive,size);}
+        const archive=path.join(directory,'memory',ref.name);let size=checkedSizes.get(archive);if(size===undefined){const stat=fs.statSync(archive);size=stat.size;checkedSizes.set(archive,size);onArchiveStat?.(archive,stat);}
         if (size !== ref.bytes) throw new Error("Missing or incomplete memory archive");
       }
       if (next !== value.state.seq + 1 || refs.at(-1)?.lastHash !== value.state.lastHash) continue;

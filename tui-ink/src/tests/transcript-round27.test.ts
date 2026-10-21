@@ -27,7 +27,7 @@ test('baseline copies share per-file metadata checks; ordered prefetch preserves
 test('reused readers perform one fresh catalog pass, skip old data and revalidate in-place source changes and restore boundaries',async()=>{
  const {folder}=await fixture('reader');const cold=await transcriptPage(folder,undefined,20);assert.ok(cold.index!.readBatches!>0);assert.ok(cold.index!.maxPrefetch!<=4);
  const archives=fs.readdirSync(path.join(folder,'.spawn/events/memory')).filter(n=>n.endsWith('.mem.gz'));
- const warm=await transcriptPage(folder,cold.nextBefore,20);assert.equal(warm.index?.metadataChecks,archives.length);assert.equal(warm.index?.visited,0);assert.equal(warm.index?.readBatches,0);assert.equal(warm.index?.projectionBytesRead,0);
+ const warm=await transcriptPage(folder,cold.nextBefore,20);assert.ok(['watched','full'].includes(warm.index!.metadataMode!));assert.ok(warm.index!.metadataChecks!<=archives.length);assert.equal(warm.index?.visited,0);assert.equal(warm.index?.readBatches,0);assert.equal(warm.index?.projectionBytesRead,0);
  const file=path.join(folder,'.spawn/events/memory',archives[0]!),bytes=fs.readFileSync(file),bad=Buffer.from(bytes);bad[0]^=1;fs.writeFileSync(file,bad);await assert.rejects(transcriptPage(folder),/校验/);fs.writeFileSync(file,bytes);assert.ok((await transcriptPage(folder)).rows.length);
  const marker=path.join(folder,'.spawn/restore-transaction.json');fs.writeFileSync(marker,'{}');await assert.rejects(transcriptPage(folder),/校验/);fs.unlinkSync(marker);assert.ok((await transcriptPage(folder)).rows.length);
  await closeTranscriptReaders(folder);const restarted=await transcriptPage(folder);assert.equal(restarted.index?.visited,0);assert.equal(restarted.index?.mode,'incremental');

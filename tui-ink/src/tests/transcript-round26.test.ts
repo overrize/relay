@@ -4,12 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {SessionJournal} from '../session/Journal.js';
-import {transcriptPage} from '../session/Transcript.js';
+import {transcriptPage,closeTranscriptReaders} from '../session/Transcript.js';
 import {VirtualTranscript} from '../tui/native/VirtualTranscript.js';
 import {SessionScreen} from '../tui/native/SessionScreen.js';
 import {stripTerminalSequences,type Terminal} from '@code-yeongyu/senpi-tui';
 fs.mkdirSync('.test-tmp',{recursive:true});const root=fs.mkdtempSync(path.resolve('.test-tmp/transcript26-'));
-after(()=>fs.rmSync(root,{recursive:true,force:true}));
+after(async()=>{await closeTranscriptReaders(root);fs.rmSync(root,{recursive:true,force:true});});
 
 test('persistent sequence index pages without replay, appends incrementally, survives compaction and rebuilds lost or corrupt caches',async()=>{
  const j=new SessionJournal(root,{automatic:false,segmentBytes:4096});j.bind('pm','Leader');for(let i=0;i<200;i++)j.append('message.recorded','pm','pm',0,{role:'user',content:`INDEX_${i} `+'档案🙂 '.repeat(80)});
@@ -44,6 +44,6 @@ test('UI unloads excess historical pages, preserves drafts and supports returnin
  try{for(let i=0;i<16;i++)await ui.loadOlder();assert.ok((ui as any).archiveRows.length<=1024);assert.ok(ui.viewport.stats.cachedBlocks<=24);assert.equal(ui.editor.getText(),'未发送草稿🙂');
   const top=ui.viewport.scrollTop;term.input('\x1b[<65;8;5M');ui.tui.renderNow();assert.ok(ui.viewport.scrollTop>top,'toolkit mouse dispatch must reach the virtual component');
   ui.submit('/latest');ui.tui.renderNow();assert.equal((ui as any).archiveRows.length,0);assert.match(ui.tui.getScreenLines().map(stripTerminalSequences).join('\n'),/LATEST_REALTIME/);assert.equal(ui.editor.getText(),'未发送草稿🙂');
-  let release:(p:any)=>void=()=>{};c.transcript=()=>new Promise(r=>release=r);const pending=ui.loadOlder();ui.latest();release({rows:[{seq:1,role:'user',revision:0,text:'STALE_PAGE'}],through:1,throughAt:0});await pending;ui.tui.renderNow();assert.ok(!ui.tui.getScreenLines().join('').includes('STALE_PAGE'));
+  let release:(p:any)=>void=()=>{},progress:(p:any)=>void=()=>{};c.transcript=(_before:any,report:any)=>{progress=report;return new Promise(r=>release=r);};const pending=ui.loadOlder();progress({phase:'重建索引',visited:100,through:1000});ui.tui.renderNow();assert.match(ui.tui.getScreenLines().map(stripTerminalSequences).join(''),/已校验 100 条/);assert.equal(ui.editor.getText(),'未发送草稿🙂');ui.latest();progress({phase:'STALE_PROGRESS',visited:200,through:1000});release({rows:[{seq:1,role:'user',revision:0,text:'STALE_PAGE'}],through:1,throughAt:0});await pending;ui.tui.renderNow();assert.ok(!ui.tui.getScreenLines().join('').includes('STALE_PAGE'));assert.ok(!ui.tui.getScreenLines().join('').includes('STALE_PROGRESS'));
  }finally{await ui.close();}
 });

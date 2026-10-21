@@ -15,14 +15,14 @@ import {interruptSession} from '../session/Control.js';
 import {waitForIndexing} from '../session/SearchIndex.js';
 import {backgroundAuditReport} from '../session/BackgroundAudit.js';
 import type {AuditFilter} from '../session/Audit.js';
-import {transcriptPage,closeTranscriptReaders} from '../session/Transcript.js';
+import {transcriptPage,closeTranscriptReaders,type TranscriptProgress} from '../session/Transcript.js';
 
 export class SessionController {
  private started=false;private stopping?:Promise<void>;private server?:Server;private root=process.cwd();private communicationAttach=false;
  private reads=new Set<Promise<unknown>>();
  private read<T>(job:Promise<T>):Promise<T>{this.reads.add(job);void job.finally(()=>this.reads.delete(job)).catch(()=>{});return job;}
  audit(filter:AuditFilter={}){this.ready();return this.read(backgroundAuditReport(this.root,filter));}
- transcript(before?:number){this.ready();return this.read(transcriptPage(this.root,before));}
+ transcript(before?:number,progress?:(p:TranscriptProgress)=>void){this.ready();return this.read(transcriptPage(this.root,before,80,progress));}
  private model(){const cfg=loadConfig();try{return agents.get('pm')?.cfg.providerCfg.model??resolveModelRoute(cfg,'leader','pm').candidates[0]!.config.model;}catch{return getAgentProviderConfig(cfg,'leader').model;}}
  start(options:{http?:boolean}={}){
   if(this.started)return;registerRuntimeOwner(this.root);this.started=true;

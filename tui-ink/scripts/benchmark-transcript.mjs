@@ -7,7 +7,7 @@ import {SessionJournal} from '../dist/session/Journal.js';
 import {transcriptPage,closeTranscriptReaders} from '../dist/session/Transcript.js';
 import {VirtualTranscript} from '../dist/tui/native/VirtualTranscript.js';
 const count=Number(process.argv[2]??3000);if(!Number.isSafeInteger(count)||count<200||count>100000)throw Error('count must be 200..100000');
-const segmentBytes=Number(process.argv[3]??65536);if(!Number.isSafeInteger(segmentBytes)||segmentBytes<1024||segmentBytes>4*1024*1024)throw Error('segmentBytes must be 1024..4194304');
+const segmentBytes=Number(process.argv[3]??65536);if(!Number.isSafeInteger(segmentBytes)||segmentBytes<1024||segmentBytes>128*1024*1024)throw Error('segmentBytes must be 1024..134217728');
 fs.mkdirSync('.test-tmp',{recursive:true});const root=fs.mkdtempSync(path.resolve('.test-tmp/transcript26-benchmark-'));
 const j=new SessionJournal(root,{automatic:false,segmentBytes});j.bind('pm','Leader');j.append('requirement.changed','pm','pm',1,{text:'BENCHMARK_CURRENT'});
 for(let i=0;i<count;i++)j.append('message.recorded','pm','pm',1,{role:i%2?'assistant':'user',content:`ARCHIVE_MESSAGE_${i} `+'历史记录，作为只读证据。 '.repeat(150)});

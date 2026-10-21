@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import type {HistoryMetadata} from "./HistoryMetadata.js";
+import {archiveEntries} from "./ArchiveStream.js";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { writeSnapshot } from "../memory/atomic.js";
@@ -72,10 +74,10 @@ export class SessionJournal {
   private effectivePolicy?: StoragePolicy;
   lastMaintenance?: MaintenanceReport;
   lastSearch: SearchStats = { sourcesVisited: 0, indexHits: 0, candidateEvents: 0, bytesRead: 0, rebuilt: 0 };
-  readonly stats = { checkpointUsed: false, replayedEvents: 0, bytesRead: 0, sourceMetadataChecks:0,sourceLookupSteps:0,historyBatches:0,maxPrefetch:0 };
+  readonly stats = { checkpointUsed: false, replayedEvents: 0, bytesRead: 0, sourceMetadataChecks:0,sourceLookupSteps:0,historyBatches:0,maxPrefetch:0,archiveStreams:0 };
   readonly file: string;
   private readonly segmentDirectory: string;
-  constructor(readonly root = process.cwd(), private readonly options: { segmentBytes?: number; verifyHistory?: boolean; automatic?: boolean; policy?: Partial<StoragePolicy>; allowRestoreTransaction?: boolean; cacheCheckpoint?:boolean } = {}) {
+  constructor(readonly root = process.cwd(), private readonly options: { segmentBytes?: number; verifyHistory?: boolean; automatic?: boolean; policy?: Partial<StoragePolicy>; allowRestoreTransaction?: boolean; cacheCheckpoint?:boolean;historyMetadata?:HistoryMetadata } = {}) {
     if (!options.allowRestoreTransaction && fs.existsSync(path.join(root, ".spawn", "restore-transaction.json"))) throw new Error("Interrupted restore detected; finish restore repair before starting the application");
     this.file = path.join(root, ".spawn", "events", "journal.jsonl");
     this.segmentDirectory = path.join(path.dirname(this.file), "segments");
@@ -163,7 +165,7 @@ export class SessionJournal {
     const activeStamp = this.stamp(this.file);
     const baseStamp = this.stamp(path.join(path.dirname(this.file), "retention.json")) + this.stamp(path.join(path.dirname(this.file), "retention.backup.json"));
     if (!this.initialized || directoryStamp !== this.directoryStamp || baseStamp !== this.baseStamp) {
-      this.base = loadRetention(path.dirname(this.file)); this.baseStamp = baseStamp;
+      this.base = loadRetention(path.dirname(this.file),(file,stat)=>this.options.historyMetadata?.remember(file,stat)); this.baseStamp = baseStamp;
       this.restore(this.readSegments()); this.directoryStamp = directoryStamp; this.initialized = true;
     }
     // Windows can defer directory timestamp updates after rename. The active
@@ -267,16 +269,19 @@ export class SessionJournal {
   }
   /** Capture byte/sequence bounds briefly under the writer lock. Immutable
    * source metadata is checked outside it, with bounded filesystem concurrency. */
-  async historySourcesAsync(concurrency=8):Promise<ReturnType<SessionJournal['historySources']>>{
+  async historySourcesAsync(concurrency=8,metadata?:HistoryMetadata,requiredSequences:number[]=[]):Promise<ReturnType<SessionJournal['historySources']>>{
     if(!Number.isSafeInteger(concurrency)||concurrency<1||concurrency>16)throw Error('Catalog concurrency must be 1..16');
+    if(metadata)await metadata.prepare([path.join(path.dirname(this.file),'memory'),this.segmentDirectory]);
     const snapshot=this.locked(()=>{
       const sources:Omit<Source,'fingerprint'>[]=(this.base?.archives??[]).map(a=>({file:path.join(path.dirname(this.file),'memory',a.name),key:`m-${a.name}`,from:a.from,to:a.to,archive:a,size:a.bytes,persistent:true}));
       for(const segment of this.segments){const match=segmentPattern.exec(segment.name)!;sources.push({file:path.join(this.segmentDirectory,segment.name),key:`s-${segment.name}`,from:Number(match[1]),to:Number(match[2]),size:segment.size,persistent:true});}
       if(this.offset)sources.push({file:this.file,key:'active',from:this.segmentStart,to:this.state.seq,size:this.offset,persistent:false});
       return {...this.sequence(),sources,budget:structuredClone(this.state.budget)};
     },false);
+    if(metadata)metadata.forget(this.file);
+    if(metadata)for(const seq of requiredSequences){let low=0,high=snapshot.sources.length;while(low<high){const mid=(low+high)>>1;if(snapshot.sources[mid]!.to<seq)low=mid+1;else high=mid;}const source=snapshot.sources[low];if(source&&source.from<=seq)metadata.forget(source.file);}
     const sources:ReturnType<SessionJournal['historySources']>['sources']=new Array(snapshot.sources.length);let next=0;
-    const checks=Array.from({length:Math.min(concurrency,sources.length)},async()=>{for(;;){const i=next++;if(i>=snapshot.sources.length)return;const source=snapshot.sources[i]!;this.stats.sourceMetadataChecks++;const stat=await fs.promises.stat(source.file);
+    const checks=Array.from({length:Math.min(concurrency,sources.length)},async()=>{for(;;){const i=next++;if(i>=snapshot.sources.length)return;const source=snapshot.sources[i]!;const check=()=>{this.stats.sourceMetadataChecks++;};const stat=metadata?await metadata.stat(source.file,check):(check(),await fs.promises.stat(source.file));
       const size=source.archive?source.archive.bytes:source.key==='active'?source.size:stat.size;
       const fingerprint=source.archive?`${source.key}:${source.archive.bytes}:${source.archive.digest}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`:`${source.key}:${size}:${stat.mtimeMs}:${stat.ctimeMs}:`;
       sources[i]={...source,size,fingerprint,archive:source.archive};
@@ -286,7 +291,7 @@ export class SessionJournal {
   }
   /** Stable asynchronous history scan. An incremental caller must first verify
    * the retained prefix's source manifest and hash, as AuditIndex does. */
-  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string},onSource?:(through:number,lastHash:string)=>void,options:{capture?:ReturnType<SessionJournal['historySources']>;prefetch?:number}={}) {
+  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string},onSource?:(through:number,lastHash:string)=>void,options:{capture?:ReturnType<SessionJournal['historySources']>;prefetch?:number;streamArchives?:boolean}={}) {
     const snapshot = options.capture??this.locked(() => ({ ...this.sequence(), sources: this.sources(), budget:structuredClone(this.state.budget) }), false);
     const prefetch=options.prefetch??1;if(!Number.isSafeInteger(prefetch)||prefetch<1||prefetch>4)throw Error('History prefetch must be 1..4');
     let visited = after?.seq??0, previousHash: string | undefined = after?.lastHash??"";
@@ -295,12 +300,12 @@ export class SessionJournal {
       const requests=remaining.slice(start,start+prefetch),opened:{source:Source;fd:number}[]=[];
       this.locked(()=>{try{for(const request of requests){const source=this.sourceFor(request);if(!source)throw Error('Retained history source disappeared; refusing an incomplete recall');opened.push({source,fd:fs.openSync(source.file,'r')});}}catch(error){for(const o of opened)fs.closeSync(o.fd);throw error;}},false);
       this.stats.historyBatches++;this.stats.maxPrefetch=Math.max(this.stats.maxPrefetch,opened.length);
-      const reads=opened.map(async({source,fd})=>{const bytes=Buffer.alloc(source.size);let offset=0;while(offset<bytes.length){const count=await new Promise<number>((resolve,reject)=>fs.read(fd,bytes,offset,bytes.length-offset,offset,(error,n)=>error?reject(error):resolve(n)));if(!count)throw Error('History source was truncated during recall');offset+=count;}return source.archive?(await decodeArchive(bytes,source.archive)).entries:parseEvents(bytes);});
+      const reads=opened.map(async({source,fd})=>{if(options.streamArchives&&source.archive&&(source.size>=65536||source.archive.events>=512)){this.stats.archiveStreams++;return archiveEntries(fd,source.size,source.archive);}const bytes=Buffer.alloc(source.size);let offset=0;while(offset<bytes.length){const count=await new Promise<number>((resolve,reject)=>fs.read(fd,bytes,offset,bytes.length-offset,offset,(error,n)=>error?reject(error):resolve(n)));if(!count)throw Error('History source was truncated during recall');offset+=count;}if(source.archive&&options.streamArchives&&bytes.length>=4&&bytes.readUInt32LE(bytes.length-4)>1024*1024){this.stats.archiveStreams++;return archiveEntries(fd,source.size,source.archive);}return source.archive?(await decodeArchive(bytes,source.archive)).entries:parseEvents(bytes);});
       // Observe every rejection immediately; a later prefetch may fail before
       // the ordered consumer reaches it. Descriptors close only after all reads.
       for(const read of reads)void read.catch(()=>{});
       try{for(let i=0;i<opened.length;i++){const request=requests[i]!,source=opened[i]!.source;
-        for (const entry of await reads[i]!) {
+        for await (const entry of await reads[i]!) {
           if (entry.seq < request.from || entry.seq > request.to || entry.seq > snapshot.seq || entry.seq <= visited) continue;
           if(!source.archive){const {hash:actual,...body}=entry;if(previousHash===undefined||entry.version!==1||hash(body,previousHash)!==actual)throw new Error("Audit history integrity failure; refusing partial accounting");previousHash=actual;}
           await use(entry); visited = entry.seq;
