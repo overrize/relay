@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import type {HistoryMetadata} from "./HistoryMetadata.js";
+import {acquireJournalLock,prepareJournalLock} from "./JournalLock.js";
 import {archiveEntries} from "./ArchiveStream.js";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -200,42 +201,18 @@ export class SessionJournal {
     this.offset = 0; this.activeStamp = ""; this.directoryStamp = this.stamp(this.segmentDirectory);
     this.scheduleMaintenance(1000);
   }
-  private locked<T>(work: () => T, durable = true): T {
+  private locked<T>(work: () => T, durable = true,prepared?:ReturnType<typeof prepareJournalLock>): T {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
-    const lock = `${this.file}.lock`;
-    let fd: number;
-    const deadline=Date.now()+1000,wait=new Int32Array(new SharedArrayBuffer(4));
-    for(;;){
-      try{fd=fs.openSync(lock,"wx",0o600);break;}
-      catch(error:any){
-        if(error.code!=="EEXIST")throw error;
-        let owner=0;
-        try{owner=Number(fs.readFileSync(lock,"utf8"));}catch{/* A writer can release between open and read. */}
-        if(Number.isSafeInteger(owner)&&owner>0){
-          try{process.kill(owner,0);}catch(e:any){
-            if(e.code!=="ESRCH")throw e;
-            try{if(fs.readFileSync(lock,"utf8")===String(owner))fs.unlinkSync(lock);}catch(e:any){if(e.code!=="ENOENT")throw e;}
-            if(Date.now()<deadline)continue;
-          }
-        }
-        if(Date.now()>=deadline)throw new Error("Another process is writing this session; retry later");
-        // Worker-thread readers may briefly hold this lock. Wait only a bounded
-        // interval; a live/invalid owner is never force-unlocked.
-        Atomics.wait(wait,0,0,5);
-      }
-    }
-    try {
-      fs.writeFileSync(fd, String(process.pid)); if (durable) fs.fsyncSync(fd);
+    const release=prepared?prepared.acquire():acquireJournalLock(this.file,durable);
+    try{
       this.refresh();
-      // Preserve the torn bytes for inspection before removing an incomplete append.
-      const size = fs.existsSync(this.file) ? fs.statSync(this.file).size : 0;
-      if (durable && size > this.offset) {
-        fs.writeFileSync(`${this.file}.torn-${randomUUID()}`, fs.readFileSync(this.file).subarray(this.offset));
-        fs.truncateSync(this.file, this.offset);
-      }
+      // Preserve incomplete append bytes for inspection before repair.
+      const size=fs.existsSync(this.file)?fs.statSync(this.file).size:0;
+      if(durable&&size>this.offset){fs.writeFileSync(`${this.file}.torn-${randomUUID()}`,fs.readFileSync(this.file).subarray(this.offset));fs.truncateSync(this.file,this.offset);}
       return work();
-    } finally { fs.closeSync(fd); fs.unlinkSync(lock); }
+    }finally{release();}
   }
+
   append(kind: string, conversation: string, agent: string, revision: number, data: any, guard?:(state:Readonly<Projection>)=>void): Entry {
     return this.locked(() => {
       guard?.(this.state);
@@ -291,14 +268,14 @@ export class SessionJournal {
   }
   /** Stable asynchronous history scan. An incremental caller must first verify
    * the retained prefix's source manifest and hash, as AuditIndex does. */
-  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string},onSource?:(through:number,lastHash:string)=>void,options:{capture?:ReturnType<SessionJournal['historySources']>;prefetch?:number;streamArchives?:boolean}={}) {
+  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string},onSource?:(through:number,lastHash:string)=>unknown,options:{capture?:ReturnType<SessionJournal['historySources']>;prefetch?:number;streamArchives?:boolean}={}) {
     const snapshot = options.capture??this.locked(() => ({ ...this.sequence(), sources: this.sources(), budget:structuredClone(this.state.budget) }), false);
     const prefetch=options.prefetch??1;if(!Number.isSafeInteger(prefetch)||prefetch<1||prefetch>4)throw Error('History prefetch must be 1..4');
     let visited = after?.seq??0, previousHash: string | undefined = after?.lastHash??"";
-    const remaining=snapshot.sources.filter(s=>s.to>visited);
-    for(let start=0;start<remaining.length;start+=prefetch){
+    const remaining=snapshot.sources.filter(s=>s.to>visited),gate=remaining.length?prepareJournalLock(this.file,false):undefined;
+    try{for(let start=0;start<remaining.length;start+=prefetch){
       const requests=remaining.slice(start,start+prefetch),opened:{source:Source;fd:number}[]=[];
-      this.locked(()=>{try{for(const request of requests){const source=this.sourceFor(request);if(!source)throw Error('Retained history source disappeared; refusing an incomplete recall');opened.push({source,fd:fs.openSync(source.file,'r')});}}catch(error){for(const o of opened)fs.closeSync(o.fd);throw error;}},false);
+      this.locked(()=>{try{for(const request of requests){const source=this.sourceFor(request);if(!source)throw Error('Retained history source disappeared; refusing an incomplete recall');opened.push({source,fd:fs.openSync(source.file,'r')});}}catch(error){for(const o of opened)fs.closeSync(o.fd);throw error;}},false,gate);
       this.stats.historyBatches++;this.stats.maxPrefetch=Math.max(this.stats.maxPrefetch,opened.length);
       const reads=opened.map(async({source,fd})=>{if(options.streamArchives&&source.archive&&(source.size>=65536||source.archive.events>=512)){this.stats.archiveStreams++;return archiveEntries(fd,source.size,source.archive);}const bytes=Buffer.alloc(source.size);let offset=0;while(offset<bytes.length){const count=await new Promise<number>((resolve,reject)=>fs.read(fd,bytes,offset,bytes.length-offset,offset,(error,n)=>error?reject(error):resolve(n)));if(!count)throw Error('History source was truncated during recall');offset+=count;}if(source.archive&&options.streamArchives&&bytes.length>=4&&bytes.readUInt32LE(bytes.length-4)>1024*1024){this.stats.archiveStreams++;return archiveEntries(fd,source.size,source.archive);}return source.archive?(await decodeArchive(bytes,source.archive)).entries:parseEvents(bytes);});
       // Observe every rejection immediately; a later prefetch may fail before
@@ -312,12 +289,13 @@ export class SessionJournal {
           if (visited % 32 === 0) await yieldIO();
         }
         if(source.archive)previousHash=source.to===request.to?source.archive.lastHash:undefined;
-        if(previousHash!==undefined)onSource?.(request.to,previousHash);
+        if(previousHash!==undefined)await onSource?.(request.to,previousHash);
       }}finally{await Promise.allSettled(reads);for(const o of opened)fs.closeSync(o.fd);}
       await yieldIO();
     }
     if(previousHash!==snapshot.lastHash)throw new Error("Audit boundary changed during retention; retry the query");
     return { seq: snapshot.seq, lastHash: snapshot.lastHash, budget:snapshot.budget };
+    }finally{gate?.dispose();}
   }
   async backup() {
     const capture = this.locked(() => {

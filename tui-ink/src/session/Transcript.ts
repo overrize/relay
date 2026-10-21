@@ -1,7 +1,7 @@
 import path from 'node:path';
 import {Worker} from 'node:worker_threads';
 import type {TranscriptPage} from './TranscriptWorker.js';
-export interface TranscriptProgress {phase:string;visited:number;through:number}
+export interface TranscriptProgress {phase:string;visited:number;through:number;checkpoint?:number;resumedFrom?:number}
 interface Reader {worker:Worker;pending:Map<number,{resolve:(p:TranscriptPage)=>void;reject:(e:Error)=>void;progress?:(p:TranscriptProgress)=>void}>;timer?:ReturnType<typeof setTimeout>;closed:boolean}
 const readers=new Map<string,Reader>();let requestId=0;
 async function closeReader(root:string,reader:Reader){if(reader.closed)return;reader.closed=true;if(readers.get(root)===reader)readers.delete(root);clearTimeout(reader.timer);for(const p of reader.pending.values())p.reject(Error('历史读取已关闭'));reader.pending.clear();await reader.worker.terminate();}
@@ -20,6 +20,7 @@ function createReader(root:string){
 }
 export function transcriptPage(root:string,before=Number.MAX_SAFE_INTEGER,limit=80,progress?:(p:TranscriptProgress)=>void):Promise<TranscriptPage>{
  if(!Number.isSafeInteger(before)||before<1)throw Error('INVALID_HISTORY_CURSOR');if(!Number.isSafeInteger(limit)||limit<1||limit>200)throw Error('INVALID_HISTORY_LIMIT');
+ const batchSources=Number(process.env.SPAWN_TRANSCRIPT_BUILD_BATCH_SOURCES??64);if(!Number.isSafeInteger(batchSources)||batchSources<1||batchSources>1024)throw Error('INVALID_HISTORY_BATCH_SIZE');
  const key=path.resolve(root),reader=readers.get(key)??createReader(key),id=++requestId;clearTimeout(reader.timer);reader.worker.ref();
- return new Promise((resolve,reject)=>{reader.pending.set(id,{resolve,reject,progress});try{reader.worker.postMessage({id,before,limit,maxBytes:Number(process.env.SPAWN_TRANSCRIPT_INDEX_MAX_BYTES??256*1024*1024)});}catch{reader.pending.delete(id);reject(Error('历史读取请求未发送'));void closeReader(key,reader);}});
+ return new Promise((resolve,reject)=>{reader.pending.set(id,{resolve,reject,progress});try{reader.worker.postMessage({id,before,limit,batchSources,maxBytes:Number(process.env.SPAWN_TRANSCRIPT_INDEX_MAX_BYTES??256*1024*1024)});}catch{reader.pending.delete(id);reject(Error('历史读取请求未发送'));void closeReader(key,reader);}});
 }

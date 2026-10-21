@@ -29,6 +29,7 @@ async function tailAnchor(file:string,size:number,through:number){
 }
 export class AuditIndex{
   private messageCache=false;
+  private buildCount=0;private buildDigest="";
   private db:DatabaseSync;
   private maxBytes:number;
   private statements=new Map<string,StatementSync>();
@@ -49,7 +50,18 @@ export class AuditIndex{
     try{
       if(!stored)return;
       const value=JSON.parse(stored.json);
-      if(![1,2].includes(value.version)||digest(value)!==stored.hash||value.seq>boundary.seq) return;
+      if(![1,2,3].includes(value.version)||digest(value)!==stored.hash||value.seq>boundary.seq) return;
+      if(value.version===3){
+        if(!this.messageCache||value.state?.kind!=='transcript-build-v1'||!Number.isSafeInteger(value.sourceCount)||value.sourceCount<1||!Number.isSafeInteger(value.state.count)||value.state.count<0||!Number.isSafeInteger(value.seq)||value.seq<1||!Number.isFinite(value.state.throughAt)||value.state.throughAt<0||!Number.isSafeInteger(value.state.targetSeq)||value.state.targetSeq<value.seq)return;
+        const manifest:Manifest[]=[];let chain='',next=1;
+        for(const row of this.statement('SELECT position,json,hash FROM transcript_build_sources ORDER BY position').iterate() as Iterable<{position:number;json:string;hash:string}>){
+          const source=JSON.parse(row.json) as Manifest;
+          if(row.position!==manifest.length||digest(source)!==row.hash||source.from!==next||!Number.isSafeInteger(source.to)||source.to<source.from||source.to>value.seq||!source.lastHash||!/^[a-f0-9]{64}$/.test(source.lastHash))return;
+          chain=digest([chain,row.hash]);manifest.push(source);next=source.to+1;
+        }
+        if(manifest.length!==value.sourceCount||chain!==value.sourceDigest||next!==value.seq+1||manifest.at(-1)?.lastHash!==value.lastHash)return;
+        value.manifest=manifest;
+      }
       if(value.seq===boundary.seq&&value.lastHash!==boundary.lastHash)return;
       const sources=new Map(boundary.sources.map(s=>[s.key,s])),byStart=new Map(boundary.sources.map(s=>[s.from,s]));
       let previousHash="",rebasedSources=0;
@@ -82,6 +94,7 @@ export class AuditIndex{
         previousHash=old.lastHash;rebasedSources++;
       }
       value.rebasedSources=rebasedSources;
+      if(value.version===3){if(rebasedSources||value.upgraded)this.clearBuild();else{this.buildCount=value.sourceCount;this.buildDigest=value.sourceDigest;}}
       return value;
     }catch{return;}
   }
@@ -105,10 +118,35 @@ export class AuditIndex{
   }
   *unpriced(){for(const r of this.statement("SELECT json FROM requests WHERE unpriced=1").iterate() as Iterable<{json:string}>){const row=JSON.parse(r.json) as AuditRow;if(row.billing!=="subscription"&&!row.pricingKnown)yield row;}}
   async save(boundary:Boundary,state:unknown,anchors:Map<number,string>){
+    if(this.messageCache)this.clearBuild();
     const manifest:Manifest[]=[];
     for(const source of boundary.sources)manifest.push({...source,lastHash:anchors.get(source.to),contentHash:source.key==="active"?await prefixHash(source.file,source.size):""});
     const value={version:2,seq:boundary.seq,lastHash:boundary.lastHash,manifest,state};
     this.statement("INSERT OR REPLACE INTO meta VALUES(1,?,?)").run(JSON.stringify(value),digest(value));
+  }
+  private clearBuild(){this.db.exec('DELETE FROM transcript_build_sources');this.buildCount=0;this.buildDigest='';}
+  /** Add only the newly verified source suffix. Rows and the checkpoint root
+   * share the same SQLite transaction, so a crash cannot publish half a batch. */
+  async saveBuild(boundary:Boundary,state:{kind:'transcript-build-v1';count:number;throughAt:number;targetSeq:number},anchors:Map<number,string>){
+    if(!this.messageCache)throw Error('Build checkpoints require a transcript cache');
+    if(boundary.sources.length<this.buildCount)throw Error('Build checkpoint moved backwards');
+    if(!this.buildCount)this.clearBuild();
+    for(let position=this.buildCount;position<boundary.sources.length;position++){
+      const source=boundary.sources[position]!,lastHash=anchors.get(source.to);if(!lastHash)throw Error('Build checkpoint requires a verified source anchor');
+      const value:Manifest={...source,lastHash,contentHash:source.key==='active'?await prefixHash(source.file,source.size):''},hash=digest(value);
+      this.statement('INSERT INTO transcript_build_sources VALUES(?,?,?)').run(position,JSON.stringify(value),hash);this.buildDigest=digest([this.buildDigest,hash]);this.buildCount++;
+    }
+    const value={version:3,seq:boundary.seq,lastHash:boundary.lastHash,sourceCount:this.buildCount,sourceDigest:this.buildDigest,state};
+    this.statement('INSERT OR REPLACE INTO meta VALUES(1,?,?)').run(JSON.stringify(value),digest(value));
+  }
+  checkpoint(){
+    if(!this.messageCache)throw Error('Build checkpoints require a transcript cache');
+    const pages=this.statement('PRAGMA page_count').get() as {page_count:number},size=this.statement('PRAGMA page_size').get() as {page_size:number};
+    const bytes=pages.page_count*size.page_size,retained=this.maxBytes>0&&bytes<=this.maxBytes;
+    // A quota miss must not erase the in-progress result. Keep this transaction
+    // uncommitted; final commit retains the existing quota/eviction behavior.
+    if(retained){this.db.exec('COMMIT');this.db.exec('BEGIN IMMEDIATE');}
+    return {retained,bytes,maxBytes:this.maxBytes};
   }
   commit(){
     const pages=this.statement("PRAGMA page_count").get() as {page_count:number},size=this.statement("PRAGMA page_size").get() as {page_size:number};
@@ -120,12 +158,13 @@ export class AuditIndex{
   }
   close(){this.db.close();}
   initMessages(){this.db.exec(`CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY,json TEXT NOT NULL,hash TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS transcript_build_sources(position INTEGER PRIMARY KEY,json TEXT NOT NULL,hash TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS message_stats(id INTEGER PRIMARY KEY CHECK(id=1),n INTEGER NOT NULL);
     INSERT OR IGNORE INTO message_stats SELECT 1,(SELECT count(*) FROM messages) WHERE NOT EXISTS(SELECT 1 FROM message_stats WHERE id=1);
     CREATE TRIGGER IF NOT EXISTS message_added AFTER INSERT ON messages BEGIN UPDATE message_stats SET n=n+1 WHERE id=1; END;
     CREATE TRIGGER IF NOT EXISTS message_removed AFTER DELETE ON messages BEGIN UPDATE message_stats SET n=n-1 WHERE id=1; END;`);}
   messageCount(){return (this.statement('SELECT n FROM message_stats WHERE id=1').get() as {n:number}).n;}
-  clearMessages(){this.db.exec('DELETE FROM messages');}
+  clearMessages(){this.db.exec('DELETE FROM messages');this.clearBuild();}
   message<T extends {seq:number}>(row:T){this.statement('INSERT INTO messages VALUES(?,?,?) ON CONFLICT(seq) DO UPDATE SET json=excluded.json,hash=excluded.hash').run(row.seq,JSON.stringify(row),digest(row));}
   messages<T>(before:number,limit:number):T[]{return (this.statement('SELECT json,hash FROM messages WHERE seq<? ORDER BY seq DESC LIMIT ?').all(before,limit) as {json:string;hash:string}[]).map(r=>{const row=JSON.parse(r.json);if(digest(row)!==r.hash)throw Error('Transcript cache row integrity failure');return row as T;});}
 }

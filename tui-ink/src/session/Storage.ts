@@ -123,6 +123,11 @@ export async function cleanAbandonedDrafts(root: string, directory: string, now:
       const file = path.join(parent, name), stat = await fs.promises.lstat(file);
       // Never race a fresh atomic writer. These files are uncommitted drafts;
       // committed baselines and archives have different, fixed names.
+      const lockDraft=/^journal\.jsonl\.lock\.(\d+)\.[a-f0-9-]{36}\.tmp$/.exec(name);
+      if(lockDraft&&stat.isDirectory()&&!stat.isSymbolicLink()&&now-stat.mtimeMs>Math.max(86400000,retentionMs)){
+        let dead=false;try{process.kill(Number(lockDraft[1]),0);}catch(e:any){if(e.code==='ESRCH')dead=true;else throw e;}
+        if(dead){const entries=await fs.promises.readdir(file);if(entries.every(n=>n==='owner')){if(entries.length)await unlinkManaged(root,path.join(file,'owner'));await fs.promises.rmdir(file);}}
+      }
       if (stat.isFile() && !stat.isSymbolicLink() && now - stat.mtimeMs > Math.max(86400000, retentionMs)) await unlinkManaged(root, file);
     }
   }

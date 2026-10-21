@@ -87,3 +87,5 @@
 首次索引重建、分段元数据与线程复用已优化，见 [性能与验证](transcript-rebuild-performance.md)。
 
 分段元数据缓存、大归档流式校验与重建进度见 [实现与验证](history-streaming-metadata.md)。
+
+首次索引重建的分批持久断点、强杀续建与锁发布修复见 [本轮实现与验证](transcript-resumable-build.md)。
