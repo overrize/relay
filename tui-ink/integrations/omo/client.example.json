@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "enabled": false,
+  "tenant": "PENDING_TENANT_KEY",
+  "employee": "employee1",
+  "store": "E:/RelaySecretary/client-store",
+  "scopes": [
+    {
+      "root": "E:/spawn-work",
+      "project": "relay",
+      "exclude": [
+        "private",
+        "personal",
+        "tui-ink/.test-tmp",
+        "tui-ink/.spawn"
+      ]
+    }
+  ],
+  "server": {
+    "url": "http://127.0.0.1:43190",
+    "tokenEnv": "RELAY_SECRETARY_EMPLOYEE_TOKEN"
+  }
+}

@@ -63,7 +63,7 @@ export function acceptSessionInput(agent: string, original: string, inputId: str
   const text = original.replace(/^\/(?:revise|goal|constraint)\s+/i, "").trim();
   const affected = journal.tasks(binding.conversation).filter((a) => a.revision === state.revision && (a.status === "running" || a.status === "interrupted"));
   if (kind === "change" || !state.goal) {
-    journal.append("requirement.changed", binding.conversation, agent, state.revision + 1, { text, previousRevision: state.revision });
+    journal.append("requirement.changed", binding.conversation, agent, state.revision + 1, { text, previousRevision: state.revision, inputKind:kind });
     // Durably invalidate first, then stop runtime work before accepting new execution.
     stopAffected(binding.conversation, [binding.id, ...affected.map((a) => a.id)]);
     state = journal.current(binding.conversation)!;
@@ -71,7 +71,7 @@ export function acceptSessionInput(agent: string, original: string, inputId: str
   if (kind === "constraint") {
     journal.append("constraint.added", binding.conversation, agent, state.revision, { text });
     // A new constraint also invalidates work that did not know it.
-    journal.append("requirement.changed", binding.conversation, agent, state.revision + 1, { text: state.goal, previousRevision: state.revision });
+    journal.append("requirement.changed", binding.conversation, agent, state.revision + 1, { text: state.goal, previousRevision: state.revision, inputKind:kind });
     stopAffected(binding.conversation, [binding.id, ...affected.map((a) => a.id)]);
     state = journal.current(binding.conversation)!;
   }

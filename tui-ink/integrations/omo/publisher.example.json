@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "tenant": "PENDING_TENANT_KEY",
+  "store": "E:/RelaySecretary/server-store",
+  "timeZone": "Asia/Hong_Kong",
+  "dailyAt": "18:00",
+  "weeklyDay": 1,
+  "appId": "PENDING_APP_ID",
+  "secretEnv": "RELAY_FEISHU_APP_SECRET",
+  "employees": [
+    {
+      "id": "employee1",
+      "openId": "PENDING_EMPLOYEE_OPEN_ID",
+      "folder": "PENDING_EMPLOYEE_FOLDER",
+      "leaders": [
+        "PENDING_LEADER_OPEN_ID"
+      ]
+    }
+  ],
+  "auditFolder": "PENDING_AUDIT_FOLDER",
+  "ingest": {
+    "host": "127.0.0.1",
+    "port": 43190,
+    "clients": [
+      {
+        "employee": "employee1",
+        "tokenEnv": "RELAY_SECRETARY_EMPLOYEE_TOKEN",
+        "projects": [
+          "relay"
+        ]
+      }
+    ]
+  }
+}

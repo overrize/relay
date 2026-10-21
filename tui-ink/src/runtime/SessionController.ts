@@ -1,3 +1,5 @@
+import {worklogCommand} from '../worklog/Commands.js';
+import {signalWorklog,closeWorklog} from '../worklog/RelayBridge.js';
 import {randomUUID} from 'node:crypto';
 import {agents,secretaries,killedAgents,killAgent,shutdownRuntime} from './SessionRuntime.js';
 import {startLeaderAgent} from './AgentHandlers.js';
@@ -23,9 +25,10 @@ export class SessionController {
  private read<T>(job:Promise<T>):Promise<T>{this.reads.add(job);void job.finally(()=>this.reads.delete(job)).catch(()=>{});return job;}
  audit(filter:AuditFilter={}){this.ready();return this.read(backgroundAuditReport(this.root,filter));}
  transcript(before?:number,progress?:(p:TranscriptProgress)=>void){this.ready();return this.read(transcriptPage(this.root,before,80,progress));}
+ worklog(command="status"){this.ready();return worklogCommand(command);}
  private model(){const cfg=loadConfig();try{return agents.get('pm')?.cfg.providerCfg.model??resolveModelRoute(cfg,'leader','pm').candidates[0]!.config.model;}catch{return getAgentProviderConfig(cfg,'leader').model;}}
  start(options:{http?:boolean}={}){
-  if(this.started)return;registerRuntimeOwner(this.root);this.started=true;
+  if(this.started)return;registerRuntimeOwner(this.root);this.started=true;signalWorklog();
   ensureAgent({id:'pm',name:'pm',role:'Leader',state:'idle',model:this.model()});
   if(options.http){
    this.server=startHttpServer({enabled:process.env.SERVER_ENABLED!=='false',port:Number(process.env.SERVER_PORT??3001),onMessage:(text,id)=>{this.send(text,{inputId:id,echo:false});}})??undefined;
@@ -81,6 +84,6 @@ export class SessionController {
   return structuredClone({revision:current?.revision??0,goal:current?.goal??'',inputs:current?.inputs??[],activeTools,agents:[...state.agents.values()].map(a=>({...a,activity:activeTools.some(t=>t.agent===a.id)?'tool-running':killedAgents.has(a.id)?'stopped':a.state==='run'?'model-running':state.pendingInputAgents.has(a.id)?'queued':a.state})),messages:(state.messagesByAgent.get('pm')??[]).slice(-150),history:j.history('pm').slice(-20),tasks:workItems(),budget:budgetReport(),recoverable:!!j.binding('pm')&&(!agents.has('pm')||this.communicationAttach),model:this.model()});
  }
  subscribe(listener:(snapshot:ReturnType<SessionController['snapshot']>)=>void){this.ready();const deliver=()=>{if(!this.stopping)try{listener(this.snapshot());}catch{process.stderr.write('[session-ui] subscriber failed\n');}};const off=subscribe(deliver);deliver();return off;}
- async shutdown(){if(this.stopping)return this.stopping;this.stopping=(async()=>{this.server?.closeAllConnections();if(this.server)await new Promise<void>(r=>this.server!.close(()=>r()));await shutdownRuntime();await closeTranscriptReaders(this.root);await Promise.allSettled([...this.reads]);await waitForIndexing();})();return this.stopping;}
+ async shutdown(){if(this.stopping)return this.stopping;this.stopping=(async()=>{this.server?.closeAllConnections();if(this.server)await new Promise<void>(r=>this.server!.close(()=>r()));await shutdownRuntime();await closeWorklog();await closeTranscriptReaders(this.root);await Promise.allSettled([...this.reads]);await waitForIndexing();})();return this.stopping;}
 }
 export const sessionController=new SessionController();

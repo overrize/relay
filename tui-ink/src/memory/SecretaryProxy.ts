@@ -2,6 +2,7 @@
 // 订阅 agent event stream，自动维护 .spawn/memory/<agent_id>.json
 // 不是 LLM，不消耗 token，只做确定性的记录工作
 
+import {signalWorklog} from '../worklog/RelayBridge.js';
 import { EventEmitter } from "node:events";
 import type { TuiEvent } from "../protocol.js";
 import type { AgentMemory, MemoryFact, MemoryDecision } from "./types.js";
@@ -34,7 +35,7 @@ export class SecretaryProxy extends EventEmitter {
   private _logCursor: number = 0;
 
   constructor(memory: AgentMemory, opts: { startNewSession?: boolean } = {}) {
-    super();
+    super();signalWorklog();
     this.memory = memory;
     // Resume: init seqs from existing data to avoid ID collisions
     this.factSeq = Math.max(0, ...memory.working_set.facts.map((f) => Number(f.id.match(/^f(\d+)$/)?.[1] ?? 0)), Date.now());
@@ -69,6 +70,7 @@ export class SecretaryProxy extends EventEmitter {
   /** 观察 agent 发出的 TuiEvent，按规则更新 memory */
   observe(ev: TuiEvent): void {
     if (this.destroyed) return;
+    signalWorklog();
     const id = this.memory.agent_id;
 
     switch (ev.type) {

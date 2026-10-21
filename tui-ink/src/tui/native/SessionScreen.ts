@@ -7,10 +7,10 @@ import {NativeKeys} from './NativeKeys.js';
 import {VirtualTranscript} from './VirtualTranscript.js';
 import {taskPanel,budgetPanel,auditPanel,parseAuditFilter,readableHistory} from './Panels.js';
 import type {AuditFilter,auditReport} from '../../session/Audit.js';
-type Port=Pick<SessionController,'send'|'revise'|'continue'|'resume'|'interrupt'|'snapshot'|'subscribe'|'shutdown'|'detach'|'modelChoices'|'selectModel'|'audit'|'transcript'>;
+type Port=Pick<SessionController,'send'|'revise'|'continue'|'resume'|'interrupt'|'snapshot'|'subscribe'|'shutdown'|'detach'|'modelChoices'|'selectModel'|'audit'|'transcript'>&{worklog?:(command?:string)=>string};
 const muted=(s:string)=>`\x1b[90m${s}\x1b[39m`,accent=(s:string)=>`\x1b[35m${s}\x1b[39m`;
 const selectList:SelectListTheme={selectedPrefix:accent,selectedText:accent,description:muted,scrollInfo:muted,noMatch:muted};
-const commands=[{name:'login',description:'登录供应商 / API Key'},{name:'model',description:'选择模型 · 仅本次 / 保存默认'},{name:'history',description:'跨会话历史搜索 · Ctrl+R'},{name:'editor',description:'外部编辑器 · Ctrl+G'},{name:'revise',description:'明确变更目标，取消旧版本任务',requiresArgs:true},{name:'resume',description:'恢复持久会话与当前目标'},{name:'continue',description:'明确继续当前目标'},{name:'interrupt',description:'停止执行，保留当前目标'},{name:'audit',description:'长期审计面板'},{name:'chat',description:'返回聊天'},{name:'older',description:'加载更早会话历史'},{name:'latest',description:'卸载旧页并返回最近记录'},{name:'keys',description:'重载自定义键位'},{name:'status',description:'查看当前状态'},{name:'tasks',description:'查看任务与停止原因'},{name:'budget',description:'查看预算'},{name:'detach',description:'断开界面，进程内后台继续运行'},{name:'exit',description:'停止本进程任务并退出，保留恢复记录'}];
+const commands=[{name:'worklog',description:'工作秘书 · status / pause / resume / sync'},{name:'login',description:'登录供应商 / API Key'},{name:'model',description:'选择模型 · 仅本次 / 保存默认'},{name:'history',description:'跨会话历史搜索 · Ctrl+R'},{name:'editor',description:'外部编辑器 · Ctrl+G'},{name:'revise',description:'明确变更目标，取消旧版本任务',requiresArgs:true},{name:'resume',description:'恢复持久会话与当前目标'},{name:'continue',description:'明确继续当前目标'},{name:'interrupt',description:'停止执行，保留当前目标'},{name:'audit',description:'长期审计面板'},{name:'chat',description:'返回聊天'},{name:'older',description:'加载更早会话历史'},{name:'latest',description:'卸载旧页并返回最近记录'},{name:'keys',description:'重载自定义键位'},{name:'status',description:'查看当前状态'},{name:'tasks',description:'查看任务与停止原因'},{name:'budget',description:'查看预算'},{name:'detach',description:'断开界面，进程内后台继续运行'},{name:'exit',description:'停止本进程任务并退出，保留恢复记录'}];
 export class SessionScreen {
  readonly tui:TuiAltScreen;readonly editor:Editor;readonly keys=new NativeKeys();readonly viewport:VirtualTranscript;
  private transcript:VirtualTranscript;private stateLine=new Text('',1,0);private footer=new Text('',1,0);private notice=new Text('',1,0);
@@ -131,6 +131,7 @@ export class SessionScreen {
     else if(name==='older'){void this.loadOlder();return true;}
     else if(name==='latest'){this.latest();return true;}
     else if(name==='keys'){this.keys.reload();this.openPanel('keys');return true;}
+    else if(name==='worklog'){if(!this.controller.worklog)throw Error('WORKLOG_UNAVAILABLE');this.notice.setText(this.controller.worklog(args??'status'));this.tui.requestRender();return true;}
     else if(name==='status'){const s=this.controller.snapshot();this.notice.setText(`目标 v${s.revision} · ${s.goal} · 可恢复 ${s.recoverable}`);}
     else if(name==='exit'||name==='detach'){void this.close(name==='exit'?'shutdown':'detach');return true;}
     else throw new Error('未知命令；输入 / 后用方向键查看可用命令。');

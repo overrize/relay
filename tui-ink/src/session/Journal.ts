@@ -79,7 +79,7 @@ export class SessionJournal {
   readonly stats = { checkpointUsed: false, replayedEvents: 0, bytesRead: 0, sourceMetadataChecks:0,sourceLookupSteps:0,historyBatches:0,maxPrefetch:0,archiveStreams:0 };
   readonly file: string;
   private readonly segmentDirectory: string;
-  constructor(readonly root = process.cwd(), private readonly options: { segmentBytes?: number; verifyHistory?: boolean; automatic?: boolean; policy?: Partial<StoragePolicy>; allowRestoreTransaction?: boolean; cacheCheckpoint?:boolean;historyMetadata?:HistoryMetadata } = {}) {
+  constructor(readonly root = process.cwd(), private readonly options: { segmentBytes?: number; verifyHistory?: boolean; automatic?: boolean; policy?: Partial<StoragePolicy>; allowRestoreTransaction?: boolean; cacheCheckpoint?:boolean;historyMetadata?:HistoryMetadata;readOnly?:boolean } = {}) {
     if (!options.allowRestoreTransaction && fs.existsSync(path.join(root, ".spawn", "restore-transaction.json"))) throw new Error("Interrupted restore detected; finish restore repair before starting the application");
     this.file = path.join(root, ".spawn", "events", "journal.jsonl");
     this.segmentDirectory = path.join(path.dirname(this.file), "segments");
@@ -155,7 +155,7 @@ export class SessionJournal {
     // Imported history or a lost checkpoint should pay the sealed replay cost
     // once. This disposable checkpoint has the same source/anchor validation
     // as checkpoints written during ordinary rotation.
-    if(this.options.cacheCheckpoint&&segments.length&&skip===0){
+    if(this.options.cacheCheckpoint&&!this.options.readOnly&&segments.length&&skip===0){
       const body={version:3 as const,baseGeneration:this.base?.generation??0,segments,state};
       writeSnapshot(path.join(path.dirname(this.file),"checkpoint.json"),JSON.stringify({...body,digest:checksum(body)}));
     }
@@ -203,6 +203,7 @@ export class SessionJournal {
     this.scheduleMaintenance(1000);
   }
   private locked<T>(work: () => T, durable = true,prepared?:ReturnType<typeof prepareJournalLock>): T {
+    if(this.options.readOnly){if(durable)throw Error('READ_ONLY_SESSION_JOURNAL');this.refresh();return work();}
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const release=prepared?prepared.acquire():acquireJournalLock(this.file,durable);
     try{
@@ -276,7 +277,7 @@ export class SessionJournal {
     const snapshot = options.capture??this.locked(() => ({ ...this.sequence(), sources: this.sources(), budget:structuredClone(this.state.budget) }), false);
     const prefetch=options.prefetch??1;if(!Number.isSafeInteger(prefetch)||prefetch<1||prefetch>4)throw Error('History prefetch must be 1..4');
     let visited = after?.seq??0, previousHash: string | undefined = after?.lastHash??"";
-    const remaining=snapshot.sources.filter(s=>s.to>visited),gate=remaining.length?prepareJournalLock(this.file,false):undefined;
+    const remaining=snapshot.sources.filter(s=>s.to>visited),gate=remaining.length&&!this.options.readOnly?prepareJournalLock(this.file,false):undefined;
     try{for(let start=0;start<remaining.length;start+=prefetch){
       const requests=remaining.slice(start,start+prefetch),opened:{source:Source;fd:number}[]=[];
       this.locked(()=>{try{for(const request of requests){const source=this.sourceFor(request);if(!source)throw Error('Retained history source disappeared; refusing an incomplete recall');opened.push({source,fd:fs.openSync(source.file,'r')});}}catch(error){for(const o of opened)fs.closeSync(o.fd);throw error;}},false,gate);
