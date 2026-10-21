@@ -1,28 +1,30 @@
-import {Container,Editor,Text,TuiAltScreen,ScrollView,VStack,CombinedAutocompleteProvider,matchesKey,stripTerminalSequences,type Terminal,type SelectListTheme} from '@code-yeongyu/senpi-tui';
+import {Container,Editor,Text,TuiAltScreen,VStack,CombinedAutocompleteProvider,matchesKey,stripTerminalSequences,type Terminal,type SelectListTheme} from '@code-yeongyu/senpi-tui';
 import type {SessionController} from '../../runtime/SessionController.js';
 import {NativeWorkflow} from './Workflow.js';
 import {rememberPrompt} from '../PromptHistory.js';
 import {editExternally,cancelExternalEditor,terminalOwnership} from '../ExternalEditor.js';
 import {NativeKeys} from './NativeKeys.js';
+import {VirtualTranscript} from './VirtualTranscript.js';
 import {taskPanel,budgetPanel,auditPanel,parseAuditFilter,readableHistory} from './Panels.js';
 import type {AuditFilter,auditReport} from '../../session/Audit.js';
 type Port=Pick<SessionController,'send'|'revise'|'continue'|'resume'|'interrupt'|'snapshot'|'subscribe'|'shutdown'|'detach'|'modelChoices'|'selectModel'|'audit'|'transcript'>;
 const muted=(s:string)=>`\x1b[90m${s}\x1b[39m`,accent=(s:string)=>`\x1b[35m${s}\x1b[39m`;
 const selectList:SelectListTheme={selectedPrefix:accent,selectedText:accent,description:muted,scrollInfo:muted,noMatch:muted};
-const commands=[{name:'login',description:'登录供应商 / API Key'},{name:'model',description:'选择模型 · 仅本次 / 保存默认'},{name:'history',description:'跨会话历史搜索 · Ctrl+R'},{name:'editor',description:'外部编辑器 · Ctrl+G'},{name:'revise',description:'明确变更目标，取消旧版本任务',requiresArgs:true},{name:'resume',description:'恢复持久会话与当前目标'},{name:'continue',description:'明确继续当前目标'},{name:'interrupt',description:'停止执行，保留当前目标'},{name:'audit',description:'长期审计面板'},{name:'chat',description:'返回聊天'},{name:'older',description:'加载更早会话历史'},{name:'keys',description:'重载自定义键位'},{name:'status',description:'查看当前状态'},{name:'tasks',description:'查看任务与停止原因'},{name:'budget',description:'查看预算'},{name:'detach',description:'断开界面，进程内后台继续运行'},{name:'exit',description:'停止本进程任务并退出，保留恢复记录'}];
+const commands=[{name:'login',description:'登录供应商 / API Key'},{name:'model',description:'选择模型 · 仅本次 / 保存默认'},{name:'history',description:'跨会话历史搜索 · Ctrl+R'},{name:'editor',description:'外部编辑器 · Ctrl+G'},{name:'revise',description:'明确变更目标，取消旧版本任务',requiresArgs:true},{name:'resume',description:'恢复持久会话与当前目标'},{name:'continue',description:'明确继续当前目标'},{name:'interrupt',description:'停止执行，保留当前目标'},{name:'audit',description:'长期审计面板'},{name:'chat',description:'返回聊天'},{name:'older',description:'加载更早会话历史'},{name:'latest',description:'卸载旧页并返回最近记录'},{name:'keys',description:'重载自定义键位'},{name:'status',description:'查看当前状态'},{name:'tasks',description:'查看任务与停止原因'},{name:'budget',description:'查看预算'},{name:'detach',description:'断开界面，进程内后台继续运行'},{name:'exit',description:'停止本进程任务并退出，保留恢复记录'}];
 export class SessionScreen {
- readonly tui:TuiAltScreen;readonly editor:Editor;readonly keys=new NativeKeys();readonly viewport:ScrollView;
- private transcript=new Text('',1,0);private stateLine=new Text('',1,0);private footer=new Text('',1,0);private notice=new Text('',1,0);
+ readonly tui:TuiAltScreen;readonly editor:Editor;readonly keys=new NativeKeys();readonly viewport:VirtualTranscript;
+ private transcript:VirtualTranscript;private stateLine=new Text('',1,0);private footer=new Text('',1,0);private notice=new Text('',1,0);
  private unsubscribe?:()=>void;private removeInput?:()=>void;private closed=false;private started=false;
  private dock=new Container();private workflow?:NativeWorkflow;private editing=false;private editorTask?:Promise<void>;
  private panel?:'tasks'|'budget'|'audit'|'keys';private panelIndex=0;private auditResult?:Awaited<ReturnType<typeof auditReport>>;private auditFilter:AuditFilter={limit:40};private readGeneration=0;private loading=false;
  private archiveRows:Awaited<ReturnType<SessionController['transcript']>>['rows']=[];private olderBefore?:number;private historyLoaded=false;private archiveThroughAt=0;private historyLoading=false;private expandedTools=false;
+ private archiveEvicted=false;private historyGeneration=0;private archiveText=new Map<number,{max:number;text:string}>();
  constructor(private terminal:Terminal,private controller:Port,private onClose:(mode:'shutdown'|'detach')=>void=()=>{},logDirectory?:string){
   this.tui=new TuiAltScreen(terminal,true,logDirectory,{mouse:true,scrollToEndIndicator:()=>`↓ 最新 · ${this.keys.hint('app.viewport.end')}`});
   this.editor=new Editor(this.tui,{borderColor:muted,selectList},{paddingX:2});
   this.editor.setAutocompleteProvider(new CombinedAutocompleteProvider(commands,process.cwd(),null));
   this.editor.onSubmit=(text,details)=>{if(this.submit(text))this.editor.setText('');else this.editor.setText(details?.rawText??text);};
-  this.dock.addChild(this.editor);this.viewport=new ScrollView(this.transcript,{follow:'end',primary:true,scrollbar:'auto',overscroll:'contain'});
+  this.dock.addChild(this.editor);this.viewport=new VirtualTranscript(width=>Math.max(1,this.terminal.rows-1-Math.min(2,this.stateLine.render(width).length)-Math.min(2,this.notice.render(width).length)-Math.max(3,this.dock.render(width).length)-Math.min(2,this.footer.render(width).length)),()=>this.tui.requestRender());this.transcript=this.viewport;
   this.tui.setLayoutRoot(new VStack([
    {component:new Text(accent('Relay · Native · 真实 PM'),1,0),shrink:1,minSize:0,maxSize:1},
    {component:this.viewport,basis:0,grow:1,shrink:1,minSize:1},
@@ -51,7 +53,7 @@ export class SessionScreen {
    if(this.panel){this.panel=undefined;this.readGeneration++;this.update(this.controller.snapshot());this.viewport.scrollToEnd();}else this.controller.interrupt();return consumed;
   }
   if(action==='app.viewport.up'||action==='app.viewport.down'){this.viewport.scrollBy((action==='app.viewport.up'?-1:1)*Math.max(1,this.viewport.viewportHeight-2));return consumed;}
-  if(action==='app.viewport.end'){this.viewport.scrollToEnd();return consumed;}
+  if(action==='app.viewport.end'){if(this.archiveEvicted)this.latest();this.viewport.scrollToEnd();return consumed;}
   if(action==='app.panel.previous'||action==='app.panel.next'){this.panelIndex=Math.max(0,this.panelIndex+(action==='app.panel.previous'?-1:1));this.update(this.controller.snapshot());this.viewport.scrollTo(0,{disableFollow:true});return consumed;}
   if(action==='app.panel.more'){if(this.panel==='audit')void this.loadAudit(true);else if(!this.panel)void this.loadOlder();return consumed;}
   if(action==='app.panel.refresh'){if(this.panel==='audit')void this.loadAudit();else this.update(this.controller.snapshot());return consumed;}
@@ -77,10 +79,11 @@ export class SessionScreen {
   finally{if(generation===this.readGeneration)this.loading=false;}
  }
  async loadOlder(){
-  if(this.closed||this.panel||this.historyLoading||(this.historyLoaded&&!this.olderBefore))return;this.historyLoading=true;
-  try{const page=await this.controller.transcript(this.olderBefore);if(this.closed)return;if(!this.historyLoaded)this.archiveThroughAt=page.throughAt;this.archiveRows=[...page.rows,...this.archiveRows];this.olderBefore=page.nextBefore;this.historyLoaded=true;this.update(this.controller.snapshot());this.tui.renderNow();if(!this.panel)this.viewport.scrollTo(0,{disableFollow:true});this.notice.setText(`已加载历史 ${this.archiveRows.length} 条${page.nextBefore?'；可继续加载更早记录':'；已到保留历史开头'}`);this.tui.requestRender();}
-  catch{if(!this.closed){this.notice.setText('历史读取失败；请检查归档完整性后重试。');this.tui.requestRender();}}finally{this.historyLoading=false;}
+  if(this.closed||this.panel||this.historyLoading||(this.historyLoaded&&!this.olderBefore))return;this.historyLoading=true;const generation=this.historyGeneration;
+  try{const page=await this.controller.transcript(this.olderBefore);if(this.closed||generation!==this.historyGeneration)return;if(!this.historyLoaded)this.archiveThroughAt=page.throughAt;const combined=[...page.rows,...this.archiveRows];this.archiveEvicted||=combined.length>1024;this.archiveRows=combined.slice(0,1024);const retained=new Set(this.archiveRows.map(r=>r.seq));for(const seq of this.archiveText.keys())if(!retained.has(seq))this.archiveText.delete(seq);this.olderBefore=page.nextBefore;this.historyLoaded=true;this.update(this.controller.snapshot());this.tui.renderNow();if(!this.panel)this.viewport.scrollTo(0,{disableFollow:true});this.notice.setText(`历史窗口 ${this.archiveRows.length} 条${page.nextBefore?'；可继续加载更早记录':'；已到保留历史开头'}${this.archiveEvicted?'；/latest 返回最近记录':''}${page.index?.retained===false?'；索引未保留，请检查索引配额':''}`);this.tui.requestRender();}
+  catch{if(!this.closed&&generation===this.historyGeneration){this.notice.setText('历史读取失败；请检查归档完整性后重试。');this.tui.requestRender();}}finally{if(generation===this.historyGeneration)this.historyLoading=false;}
  }
+ latest(){this.historyGeneration++;this.historyLoading=false;this.archiveRows=[];this.archiveText.clear();this.historyLoaded=false;this.archiveEvicted=false;this.olderBefore=undefined;this.update(this.controller.snapshot());this.viewport.scrollToEnd();}
  openWorkflow(kind:'login'|'model'|'history'){
   if(this.closed||this.editing||this.workflow)return;
   const workflow=new NativeWorkflow(()=>this.tui.requestRender(),message=>{
@@ -106,7 +109,7 @@ export class SessionScreen {
   else if(this.panel==='budget')this.transcript.setText(stripTerminalSequences(budgetPanel(s)));
   else if(this.panel==='keys')this.transcript.setText('自定义快捷键 · keybindings.json · /keys 重新读取\n'+this.keys.bindings.report());
   else if(this.panel==='audit'){if(this.auditResult){this.panelIndex=Math.min(this.panelIndex,Math.max(0,this.auditResult.rows.length-1));this.transcript.setText(stripTerminalSequences(auditPanel(this.auditResult,this.panelIndex)));}}
-  else this.transcript.setText([...this.archiveRows.map(r=>`[历史 #${r.seq} · v${r.revision}] ${r.role}：${stripTerminalSequences(readableHistory(r.text)).slice(-max)}`),...messages].join('\n\n'));
+  else this.transcript.setBlocks([...this.archiveRows.map(r=>{let cached=this.archiveText.get(r.seq);if(cached?.max!==max){cached={max,text:`[历史 #${r.seq} · v${r.revision}] ${r.role}：${stripTerminalSequences(readableHistory(r.text)).slice(-max)}`};this.archiveText.set(r.seq,cached);}return cached.text;}),...(this.archiveEvicted?['[较新的历史已从显示窗口卸载；/latest 或 Alt+End 返回最近记录，持久记录仍保留]']:[]),...messages]);
   const active=s.agents.filter(a=>a.activity==='model-running'||a.activity==='tool-running').map(a=>`${a.id} (${a.activity==='tool-running'?'工具执行中':'模型响应中'})`).join(', ')||'无';
   const pending=s.inputs.filter(i=>i.status==='pending').length,started=s.inputs.filter(i=>i.status==='started').length;
   const stateText=`执行中：${active} · 输入处理中 ${started} / 排队 ${pending}${s.recoverable?' · /resume 恢复':''}\n目标 v${s.revision}：${stripTerminalSequences(s.goal).replace(/\s+/g,' ').slice(0,160)||'等待首条任务'}`;
@@ -126,6 +129,7 @@ export class SessionScreen {
     else if(name==='tasks'||name==='budget'||name==='audit'){this.openPanel(name,args);return true;}
     else if(name==='chat'){this.panel=undefined;this.readGeneration++;this.update(this.controller.snapshot());this.viewport.scrollToEnd();return true;}
     else if(name==='older'){void this.loadOlder();return true;}
+    else if(name==='latest'){this.latest();return true;}
     else if(name==='keys'){this.keys.reload();this.openPanel('keys');return true;}
     else if(name==='status'){const s=this.controller.snapshot();this.notice.setText(`目标 v${s.revision} · ${s.goal} · 可恢复 ${s.recoverable}`);}
     else if(name==='exit'||name==='detach'){void this.close(name==='exit'?'shutdown':'detach');return true;}

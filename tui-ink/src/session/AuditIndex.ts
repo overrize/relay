@@ -9,8 +9,8 @@ import type {AuditFilter,AuditRow} from "./Audit.js";
 type Boundary=ReturnType<SessionJournal["historySources"]>;
 type Manifest=Boundary["sources"][number]&{contentHash:string;lastHash?:string};
 const queues=new Map<string,Promise<unknown>>();
-/** Serialize same-process queries; a separate process gets an explicit busy error.
- * This database is disposable and contains sanitized accounting rows only. */
+/** Serialize accounting queries; a separate process gets an explicit busy error.
+ * Transcript readers reuse the source validation in a separate private database. */
 export async function withAuditIndex<T>(root:string,use:(index:AuditIndex)=>Promise<T>):Promise<T>{
   const key=path.resolve(root),previous=queues.get(key)??Promise.resolve();
   const next=previous.catch(()=>{}).then(async()=>{const index=new AuditIndex(key);try{return await use(index);}finally{index.close();}});
@@ -28,17 +28,20 @@ async function tailAnchor(file:string,size:number,through:number){
   }}finally{await fd.close();}
 }
 export class AuditIndex{
+  private messageCache=false;
   private db:DatabaseSync;
   private maxBytes:number;
   private statements=new Map<string,StatementSync>();
   private statement(sql:string){let statement=this.statements.get(sql);if(!statement){statement=this.db.prepare(sql);this.statements.set(sql,statement);}return statement;}
-  constructor(root:string){
-    this.maxBytes=Number(process.env.SPAWN_AUDIT_INDEX_MAX_BYTES??256*1024*1024);
+  constructor(root:string,options:{directory?:'transcript-cache';maxBytes?:number}={}){
+    this.messageCache=options.directory==='transcript-cache';
+    this.maxBytes=options.maxBytes??Number(process.env.SPAWN_AUDIT_INDEX_MAX_BYTES??256*1024*1024);
     if(!Number.isSafeInteger(this.maxBytes)||this.maxBytes<0)throw Error("SPAWN_AUDIT_INDEX_MAX_BYTES must be a nonnegative integer");
-    const directory=path.join(root,".spawn","audit-cache");fs.mkdirSync(directory,{recursive:true});
+    const directory=path.join(root,".spawn",options.directory??"audit-cache");fs.mkdirSync(directory,{recursive:true,mode:0o700});
     const file=path.join(directory,"index.sqlite");
     const open=()=>{const db=new DatabaseSync(file);try{db.exec("PRAGMA temp_store=MEMORY; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS meta(id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL, hash TEXT NOT NULL); CREATE TABLE IF NOT EXISTS rows(seq INTEGER PRIMARY KEY, model TEXT, task TEXT, json TEXT NOT NULL); CREATE INDEX IF NOT EXISTS rows_model ON rows(model,seq); CREATE INDEX IF NOT EXISTS rows_task ON rows(task,seq); CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, json TEXT NOT NULL, unpriced INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS requests_unpriced ON requests(unpriced);");return db;}catch(e){db.close();throw e;}};
     try{this.db=open();}catch(e:any){if(!/malformed|not a database/i.test(String(e)))throw e;fs.unlinkSync(file);this.db=open();}
+    if(this.messageCache&&process.platform!=='win32')fs.chmodSync(file,0o600);
     try{this.db.exec("BEGIN IMMEDIATE");}catch(e){this.db.close();throw Error("Audit index busy; retry after the other audit finishes",{cause:e});}
   }
   async load(boundary:Boundary):Promise<{state:any;seq:number;lastHash:string;manifest:Manifest[];rebasedSources:number;upgraded:boolean}|undefined>{
@@ -83,6 +86,7 @@ export class AuditIndex{
     }catch{return;}
   }
   reset(rebuild=false){
+    if(this.messageCache)this.clearMessages();
     if(rebuild)this.db.exec("DROP INDEX IF EXISTS rows_model; DROP INDEX IF EXISTS rows_task; DROP INDEX IF EXISTS requests_unpriced;");
     this.db.exec("DELETE FROM meta; DELETE FROM rows; DELETE FROM requests;");
   }
@@ -115,4 +119,13 @@ export class AuditIndex{
     return {retained,bytes,maxBytes:this.maxBytes};
   }
   close(){this.db.close();}
+  initMessages(){this.db.exec(`CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY,json TEXT NOT NULL,hash TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS message_stats(id INTEGER PRIMARY KEY CHECK(id=1),n INTEGER NOT NULL);
+    INSERT OR IGNORE INTO message_stats SELECT 1,(SELECT count(*) FROM messages) WHERE NOT EXISTS(SELECT 1 FROM message_stats WHERE id=1);
+    CREATE TRIGGER IF NOT EXISTS message_added AFTER INSERT ON messages BEGIN UPDATE message_stats SET n=n+1 WHERE id=1; END;
+    CREATE TRIGGER IF NOT EXISTS message_removed AFTER DELETE ON messages BEGIN UPDATE message_stats SET n=n-1 WHERE id=1; END;`);}
+  messageCount(){return (this.statement('SELECT n FROM message_stats WHERE id=1').get() as {n:number}).n;}
+  clearMessages(){this.db.exec('DELETE FROM messages');}
+  message<T extends {seq:number}>(row:T){this.statement('INSERT INTO messages VALUES(?,?,?) ON CONFLICT(seq) DO UPDATE SET json=excluded.json,hash=excluded.hash').run(row.seq,JSON.stringify(row),digest(row));}
+  messages<T>(before:number,limit:number):T[]{return (this.statement('SELECT json,hash FROM messages WHERE seq<? ORDER BY seq DESC LIMIT ?').all(before,limit) as {json:string;hash:string}[]).map(r=>{const row=JSON.parse(r.json);if(digest(row)!==r.hash)throw Error('Transcript cache row integrity failure');return row as T;});}
 }

@@ -490,7 +490,7 @@ export class SessionJournal {
     return report;
   }
   private makeSource(file: string, key: string, from: number, to: number, archive?: ArchiveRef, persistent = true): Source {
-    if (archive) return { file, key, from, to, archive, size: archive.bytes, persistent, fingerprint: `${key}:${archive.bytes}:${archive.digest}` };
+    if (archive) {const stat=fs.statSync(file);return { file, key, from, to, archive, size: archive.bytes, persistent, fingerprint: `${key}:${archive.bytes}:${archive.digest}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}` };}
     const s = fs.statSync(file);
     return { file, key, from, to, archive, size: s.size, persistent, fingerprint: `${key}:${s.size}:${s.mtimeMs}:${s.ctimeMs}:` };
   }
