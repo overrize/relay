@@ -72,7 +72,7 @@ export class SessionJournal {
   private effectivePolicy?: StoragePolicy;
   lastMaintenance?: MaintenanceReport;
   lastSearch: SearchStats = { sourcesVisited: 0, indexHits: 0, candidateEvents: 0, bytesRead: 0, rebuilt: 0 };
-  readonly stats = { checkpointUsed: false, replayedEvents: 0, bytesRead: 0 };
+  readonly stats = { checkpointUsed: false, replayedEvents: 0, bytesRead: 0, sourceMetadataChecks:0,sourceLookupSteps:0,historyBatches:0,maxPrefetch:0 };
   readonly file: string;
   private readonly segmentDirectory: string;
   constructor(readonly root = process.cwd(), private readonly options: { segmentBytes?: number; verifyHistory?: boolean; automatic?: boolean; policy?: Partial<StoragePolicy>; allowRestoreTransaction?: boolean; cacheCheckpoint?:boolean } = {}) {
@@ -263,17 +263,44 @@ export class SessionJournal {
   sequence() { this.refresh(); return { seq: this.state.seq, lastHash: this.state.lastHash }; }
   /** Source metadata for validating a disposable audit checkpoint. */
   historySources() {
-    return this.locked(() => ({...this.sequence(), sources:this.sources().map(s=>({key:s.key,from:s.from,to:s.to,size:s.size,fingerprint:s.fingerprint,file:s.file,archive:s.archive})),budget:structuredClone(this.state.budget)}),false);
+    return this.locked(() => ({...this.sequence(), sources:this.sources().map(s=>({key:s.key,from:s.from,to:s.to,size:s.size,fingerprint:s.fingerprint,file:s.file,archive:s.archive,persistent:s.persistent})),budget:structuredClone(this.state.budget)}),false);
+  }
+  /** Capture byte/sequence bounds briefly under the writer lock. Immutable
+   * source metadata is checked outside it, with bounded filesystem concurrency. */
+  async historySourcesAsync(concurrency=8):Promise<ReturnType<SessionJournal['historySources']>>{
+    if(!Number.isSafeInteger(concurrency)||concurrency<1||concurrency>16)throw Error('Catalog concurrency must be 1..16');
+    const snapshot=this.locked(()=>{
+      const sources:Omit<Source,'fingerprint'>[]=(this.base?.archives??[]).map(a=>({file:path.join(path.dirname(this.file),'memory',a.name),key:`m-${a.name}`,from:a.from,to:a.to,archive:a,size:a.bytes,persistent:true}));
+      for(const segment of this.segments){const match=segmentPattern.exec(segment.name)!;sources.push({file:path.join(this.segmentDirectory,segment.name),key:`s-${segment.name}`,from:Number(match[1]),to:Number(match[2]),size:segment.size,persistent:true});}
+      if(this.offset)sources.push({file:this.file,key:'active',from:this.segmentStart,to:this.state.seq,size:this.offset,persistent:false});
+      return {...this.sequence(),sources,budget:structuredClone(this.state.budget)};
+    },false);
+    const sources:ReturnType<SessionJournal['historySources']>['sources']=new Array(snapshot.sources.length);let next=0;
+    const checks=Array.from({length:Math.min(concurrency,sources.length)},async()=>{for(;;){const i=next++;if(i>=snapshot.sources.length)return;const source=snapshot.sources[i]!;this.stats.sourceMetadataChecks++;const stat=await fs.promises.stat(source.file);
+      const size=source.archive?source.archive.bytes:source.key==='active'?source.size:stat.size;
+      const fingerprint=source.archive?`${source.key}:${source.archive.bytes}:${source.archive.digest}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`:`${source.key}:${size}:${stat.mtimeMs}:${stat.ctimeMs}:`;
+      sources[i]={...source,size,fingerprint,archive:source.archive};
+    }});
+    const completed=await Promise.allSettled(checks),failed=completed.find(r=>r.status==='rejected');if(failed?.status==='rejected')throw failed.reason;
+    return {...snapshot,sources};
   }
   /** Stable asynchronous history scan. An incremental caller must first verify
    * the retained prefix's source manifest and hash, as AuditIndex does. */
-  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string},onSource?:(through:number,lastHash:string)=>void) {
-    const snapshot = this.locked(() => ({ ...this.sequence(), sources: this.sources(), budget:structuredClone(this.state.budget) }), false);
+  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string},onSource?:(through:number,lastHash:string)=>void,options:{capture?:ReturnType<SessionJournal['historySources']>;prefetch?:number}={}) {
+    const snapshot = options.capture??this.locked(() => ({ ...this.sequence(), sources: this.sources(), budget:structuredClone(this.state.budget) }), false);
+    const prefetch=options.prefetch??1;if(!Number.isSafeInteger(prefetch)||prefetch<1||prefetch>4)throw Error('History prefetch must be 1..4');
     let visited = after?.seq??0, previousHash: string | undefined = after?.lastHash??"";
-    for (const request of snapshot.sources) {
-      if(request.to<=visited)continue;
-      await this.withSource(request, async (source, read) => {
-        for (const entry of await read()) {
+    const remaining=snapshot.sources.filter(s=>s.to>visited);
+    for(let start=0;start<remaining.length;start+=prefetch){
+      const requests=remaining.slice(start,start+prefetch),opened:{source:Source;fd:number}[]=[];
+      this.locked(()=>{try{for(const request of requests){const source=this.sourceFor(request);if(!source)throw Error('Retained history source disappeared; refusing an incomplete recall');opened.push({source,fd:fs.openSync(source.file,'r')});}}catch(error){for(const o of opened)fs.closeSync(o.fd);throw error;}},false);
+      this.stats.historyBatches++;this.stats.maxPrefetch=Math.max(this.stats.maxPrefetch,opened.length);
+      const reads=opened.map(async({source,fd})=>{const bytes=Buffer.alloc(source.size);let offset=0;while(offset<bytes.length){const count=await new Promise<number>((resolve,reject)=>fs.read(fd,bytes,offset,bytes.length-offset,offset,(error,n)=>error?reject(error):resolve(n)));if(!count)throw Error('History source was truncated during recall');offset+=count;}return source.archive?(await decodeArchive(bytes,source.archive)).entries:parseEvents(bytes);});
+      // Observe every rejection immediately; a later prefetch may fail before
+      // the ordered consumer reaches it. Descriptors close only after all reads.
+      for(const read of reads)void read.catch(()=>{});
+      try{for(let i=0;i<opened.length;i++){const request=requests[i]!,source=opened[i]!.source;
+        for (const entry of await reads[i]!) {
           if (entry.seq < request.from || entry.seq > request.to || entry.seq > snapshot.seq || entry.seq <= visited) continue;
           if(!source.archive){const {hash:actual,...body}=entry;if(previousHash===undefined||entry.version!==1||hash(body,previousHash)!==actual)throw new Error("Audit history integrity failure; refusing partial accounting");previousHash=actual;}
           await use(entry); visited = entry.seq;
@@ -281,7 +308,7 @@ export class SessionJournal {
         }
         if(source.archive)previousHash=source.to===request.to?source.archive.lastHash:undefined;
         if(previousHash!==undefined)onSource?.(request.to,previousHash);
-      });
+      }}finally{await Promise.allSettled(reads);for(const o of opened)fs.closeSync(o.fd);}
       await yieldIO();
     }
     if(previousHash!==snapshot.lastHash)throw new Error("Audit boundary changed during retention; retry the query");
@@ -490,6 +517,7 @@ export class SessionJournal {
     return report;
   }
   private makeSource(file: string, key: string, from: number, to: number, archive?: ArchiveRef, persistent = true): Source {
+    this.stats.sourceMetadataChecks++;
     if (archive) {const stat=fs.statSync(file);return { file, key, from, to, archive, size: archive.bytes, persistent, fingerprint: `${key}:${archive.bytes}:${archive.digest}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}` };}
     const s = fs.statSync(file);
     return { file, key, from, to, archive, size: s.size, persistent, fingerprint: `${key}:${s.size}:${s.mtimeMs}:${s.ctimeMs}:` };
@@ -504,12 +532,9 @@ export class SessionJournal {
     return sources;
   }
   private sourceFor(request: Source): Source | undefined {
-    const a = this.base?.archives.find((s) => s.from <= request.from && s.to >= request.to);
+    const archives=this.base?.archives??[];let low=0,high=archives.length;while(low<high){this.stats.sourceLookupSteps++;const mid=(low+high)>>1;if(archives[mid]!.to<request.from)low=mid+1;else high=mid;}const candidate=archives[low],a=candidate&&candidate.from<=request.from&&candidate.to>=request.to?candidate:undefined;
     if (a) return this.makeSource(path.join(path.dirname(this.file), "memory", a.name), `m-${a.name}`, a.from, a.to, a);
-    for (const segment of this.segments) {
-      const match = segmentPattern.exec(segment.name)!;
-      if (Number(match[1]) <= request.from && Number(match[2]) >= request.to) return this.makeSource(path.join(this.segmentDirectory, segment.name), `s-${segment.name}`, Number(match[1]), Number(match[2]));
-    }
+    low=0;high=this.segments.length;while(low<high){this.stats.sourceLookupSteps++;const mid=(low+high)>>1;if(Number(segmentPattern.exec(this.segments[mid]!.name)![2])<request.from)low=mid+1;else high=mid;}const segment=this.segments[low];if(segment){const match=segmentPattern.exec(segment.name)!;if(Number(match[1])<=request.from&&Number(match[2])>=request.to)return this.makeSource(path.join(this.segmentDirectory,segment.name),`s-${segment.name}`,Number(match[1]),Number(match[2]));}
     if (this.offset && this.segmentStart <= request.from && this.state.seq >= request.to) return this.makeSource(this.file, "active", this.segmentStart, this.state.seq, undefined, false);
   }
   private async withSource<T>(request: Source, use: (source: Source, read: () => Promise<Entry[]>) => Promise<T>, stats?: SearchStats): Promise<T> {
