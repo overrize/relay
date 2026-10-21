@@ -40,7 +40,8 @@ export class SessionController {
   killedAgents.delete(target);
   const journal=sessionJournal(),prior=journal.current(target)?.inputs.some(i=>i.id===id);
   const directive=/^\/(revise|goal|constraint)\s/i.exec(text),kind=options.kind??(directive?(directive[1]!.toLowerCase()==='constraint'?'constraint':'change'):/^(继续|接着做|continue|resume)[。！!\s]*$/i.test(text.trim())?'continue':'query');
-  agent.receiveUserInput(text,id,kind);markPendingInput(target);if(kind!=='query')this.communicationAttach=false;
+  if(!prior)markPendingInput(target);
+  agent.receiveUserInput(text,id,kind);if(kind!=='query')this.communicationAttach=false;
   if(options.echo!==false&&!prior)userMessage(target,text);return id;
  }
  revise(goal:string,inputId?:string){if(!goal.trim())throw new Error('EMPTY_GOAL');return this.send(goal,{inputId,kind:'change'});}
