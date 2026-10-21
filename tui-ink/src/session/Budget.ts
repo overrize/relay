@@ -4,9 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { writeSnapshot } from "../memory/atomic.js";
 import { digest } from "./Storage.js";
-import {priceEndpoint,priceFor} from "./Pricing.js";
+import {modelPriceEndpoint,priceFor} from "./Pricing.js";
 
-export interface BillingSelection { provider?: string; model?: string; baseUrl?:string; transport?: string; billing?: { mode: "api" | "subscription"; inputUsdPerMillion?: number; outputUsdPerMillion?: number; priceSource?:string; priceRecordedAt?:number } }
+export interface BillingSelection { provider?: string; model?: string; baseUrl?:string; transport?: string; cloud?:{region:string;project?:string}; billing?: { mode: "api" | "subscription"; inputUsdPerMillion?: number; outputUsdPerMillion?: number; priceSource?:string; priceRecordedAt?:number } }
 type BillingUsage = { requests: number; tokens: number; microUsd: number };
 export interface SessionBudget {
   unpricedApiRequests?: number;
@@ -44,7 +44,7 @@ export function reserveSessionRequest(agent: string, input: number, output: numb
 }
 function reservePricedRequest(agent: string, input: number, output: number, communication: boolean, selection: BillingSelection) {
   const mode = selection.billing?.mode ?? "api",journal=sessionJournal(),book=journal.priceBook();
-  const quote=mode==="api"&&selection.billing?.inputUsdPerMillion===undefined&&selection.billing?.outputUsdPerMillion===undefined?priceFor({provider:selection.provider,model:selection.model,endpoint:priceEndpoint(selection.provider,selection.baseUrl),at:Date.now()} as any,book.prices):undefined;
+  const quote=mode==="api"&&selection.billing?.inputUsdPerMillion===undefined&&selection.billing?.outputUsdPerMillion===undefined?priceFor({provider:selection.provider,model:selection.model,endpoint:modelPriceEndpoint(selection),at:Date.now()} as any,book.prices):undefined;
   const scope = ensure(agent,!!quote); if (!scope) return undefined;
   const { j, b, budget } = scope, { limits: l, used: u } = budget;
   const inputRate = mode === "subscription" ? 0 : selection.billing?.inputUsdPerMillion ?? quote?.inputRate ?? l.inputRate;
@@ -62,7 +62,7 @@ function reservePricedRequest(agent: string, input: number, output: number, comm
   const microUsd = Math.ceil(input * inputRate + cap * outputRate);
   if (monetaryCap && u.microUsd + microUsd > costLimit) throw new Error("SESSION_BUDGET_EXHAUSTED: configured cost estimate cap reached");
   const communicationOnly = u.requests >= l.requests - l.communicationRequests || u.tokens + input + cap > l.tokens - l.communicationTokens || !!(monetaryCap && u.microUsd + microUsd > l.microUsd - l.communicationMicroUsd);
-  const id = randomUUID(), reservation = { priceQuote:quote, priceSource:selection.billing?.priceSource??quote?.source??(pricingKnown?"call-time-config":undefined),priceRecordedAt:selection.billing?.priceRecordedAt??quote?.recordedAt, endpoint:priceEndpoint(selection.provider,selection.baseUrl), agent, role: b.parent ? b.role : "PM", conversation:b.conversation, revision:b.revision, taskId:b.workId, transport:selection.transport??"http", communication:canTalk, input, output: cap, tokens: input + cap, microUsd, billingMode: mode, pricingKnown, model: selection.model?.slice(0,160), provider: selection.provider?.slice(0,80), inputRate, outputRate };
+  const id = randomUUID(), reservation = { priceQuote:quote, priceSource:selection.billing?.priceSource??quote?.source??(pricingKnown?"call-time-config":undefined),priceRecordedAt:selection.billing?.priceRecordedAt??quote?.recordedAt, endpoint:modelPriceEndpoint(selection), agent, role: b.parent ? b.role : "PM", conversation:b.conversation, revision:b.revision, taskId:b.workId, transport:selection.transport??"http", communication:canTalk, input, output: cap, tokens: input + cap, microUsd, billingMode: mode, pricingKnown, model: selection.model?.slice(0,160), provider: selection.provider?.slice(0,80), inputRate, outputRate };
   j.append("budget.reserved", b.conversation, agent, b.revision, { id, reservation },state=>{
     if(mode!=="api"||selection.billing?.inputUsdPerMillion!==undefined||selection.billing?.outputUsdPerMillion!==undefined)return;
     const current=priceFor({provider:selection.provider,model:selection.model,endpoint:reservation.endpoint,at:Date.now()} as any,[...Object.values(state.officialPrices??{}),...(state.contractPrices??[])]);

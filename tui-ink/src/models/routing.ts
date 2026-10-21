@@ -34,7 +34,7 @@ export function resolveModelRoute(cfg: Config, role: AgentConfigRole, profile: M
     const sub = model.billing?.mode === "subscription";
     subscriptionSeen ||= sub;
     if (!sub && subscriptionSeen && !cfg.routing?.allowApiFallback) { route.skipped.push({ name, reason: "api-fallback-disabled" }); continue; }
-    if (model.transport !== "claude-cli" && model.transport !== "codex-cli" && model.transport !== "copilot-sdk" && !model.apiKey && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(model.baseUrl ?? "")) { route.skipped.push({ name, reason: "missing-api-credential" }); continue; }
+    if (model.transport !== "claude-cli" && model.transport !== "codex-cli" && model.transport !== "copilot-sdk" && model.transport !== "bedrock" && model.transport !== "vertex" && !model.apiKey && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(model.baseUrl ?? "")) { route.skipped.push({ name, reason: "missing-api-credential" }); continue; }
     route.candidates.push({ name, config: { ...model, ...(cfg.agents[role].maxTokens ? { maxTokens: cfg.agents[role].maxTokens } : {}) } });
   }
   if (!route.candidates.length) throw new Error("MODEL_ROUTE: no eligible configured model; inspect /route and provider login");

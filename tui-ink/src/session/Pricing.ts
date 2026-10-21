@@ -10,6 +10,10 @@ export function priceEndpoint(provider?:string,baseUrl?:string){
   const identity=`${url.protocol}//${url.host}${url.pathname.replace(/\/+$/,"").replace(/\/v1$/,"")}`;
   return createHash("sha256").update(identity).digest("hex");
 }
+export function modelPriceEndpoint(model:{provider?:string;baseUrl?:string;transport?:string;cloud?:{region:string;project?:string}}){
+ if(model.transport==='bedrock'||model.transport==='vertex')return createHash('sha256').update(JSON.stringify([model.transport,model.cloud?.region,model.cloud?.project??null])).digest('hex');
+ return priceEndpoint(model.provider,model.baseUrl);
+}
 export interface PriceRetirement {id:string;at:number;action:"revoke"|"replace";reason:string;replacementDigest?:string;migration?:true}
 export interface PriceRevision {target:string;targetVersions?:string[];migration?:true;action:"revoke"|"replace";reason:string;replacementDigest?:string;prices:PriceDefinition[];preview:string}
 export interface PriceDefinition{
@@ -28,8 +32,8 @@ export function validatePrice(value:PriceDefinition){
   if(value.components&&Object.values(value.components).some(n=>!Number.isFinite(n)||n<0))throw Error("Invalid price components");
   return value;
 }
-export function recordPrice(journal:SessionJournal,model:{provider:string;model:string;baseUrl?:string},inputRate:number,outputRate:number,options:{source:string;since?:number;legacy?:boolean}){
-  const price=validatePrice({provider:model.provider,model:model.model,endpoint:priceEndpoint(model.provider,model.baseUrl),inputRate,outputRate,source:options.source,since:options.since??0,recordedAt:Date.now(),legacy:options.legacy??false});
+export function recordPrice(journal:SessionJournal,model:{provider:string;model:string;baseUrl?:string;transport?:string;cloud?:{region:string;project?:string}},inputRate:number,outputRate:number,options:{source:string;since?:number;legacy?:boolean}){
+  const price=validatePrice({provider:model.provider,model:model.model,endpoint:modelPriceEndpoint(model),inputRate,outputRate,source:options.source,since:options.since??0,recordedAt:Date.now(),legacy:options.legacy??false});
   journal.append("pricing.defined","pm","user",0,price,state=>{if(state.contractPrices?.some(p=>!p.retired&&p.provider===price.provider&&p.model===price.model&&p.endpoint===price.endpoint&&(p.expiresAt??Infinity)>price.since))throw Error("PRICE_IMPORT_INTERVAL_CONFLICT");});return price;
 }
 type PriceBucket={manual:PriceDefinition[];contract:PriceDefinition[];official:PriceDefinition[]};

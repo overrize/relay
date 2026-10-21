@@ -1,4 +1,4 @@
-import React,{useEffect,useRef,useState} from 'react';
+import React,{useEffect,useLayoutEffect,useRef,useState} from 'react';
 import {Box,Text,useInput} from 'ink';
 import {terminalPaste} from './TerminalPaste.js';
 
@@ -21,7 +21,7 @@ export function MultilineEditor({value,onChange,onSubmit,placeholder,menuActive=
   const position=seen.current===value?Math.min(cursor,value.length):value.length;
   const current=useRef({text:value,cursor:position});current.current={text:value,cursor:position};
   const all=editorLines(value,width,measure),active=all.reduce((last,line,i)=>line.start<=position?i:last,0),max=Math.max(2,Math.min(8,Math.floor((process.stdout.rows??24)/3))),start=Math.max(0,active-max+1);
-  useEffect(()=>{onCursor?.(position);},[value,position,onCursor]);
+  useLayoutEffect(()=>{onCursor?.(position);},[value,position,onCursor]);
   useEffect(()=>{if(seen.current!==value){seen.current=value;setCursor(value.length);undo.current=[];redo.current=[];}},[value]);
   const change=(text:string,next:number,record=true)=>{if(record){undo.current.push({...current.current});if(undo.current.length>100)undo.current.shift();redo.current=[];}seen.current=text;onChange(text);setCursor(next);current.current={text,cursor:next};};
   const insert=(text:string)=>{const normalized=text.replace(/\r\n?/g,'\n').replace(/\t/g,'    ').replace(/[\x00-\x08\x0b-\x1f\x7f]/g,'');const {text:existing,cursor:at}=current.current;change(existing.slice(0,at)+normalized+existing.slice(at),at+normalized.length);};
@@ -59,9 +59,9 @@ export function MultilineEditor({value,onChange,onSubmit,placeholder,menuActive=
     if(text)insert(text);
   },{isActive:focused});
   return <Box flexDirection="column" flexGrow={1}>
-    {!value?<Text dimColor>{placeholder??'输入消息…'}{focused?'▏':''}</Text>:all.slice(start,start+max).map((line,i)=>{
+    {!value?<Text dimColor>{placeholder??'输入消息…'}</Text>:all.slice(start,start+max).map((line,i)=>{
       const before=value.slice(line.start,position),after=value.slice(position,line.end),at=[...segmenter.segment(after)][0]?.segment??' ';
-      return <Text key={start+i} wrap="truncate-end">{start+i===active?<>{before}<Text inverse>{at}</Text>{after.slice(at.trim()?at.length:after.startsWith(' ')?1:0)}</>:line.text||' '}</Text>;
+      return <Text key={start+i} wrap="truncate-end">{start+i===active&&focused&&(!onCursor||process.env.SPAWN_INPUT_CURSOR_ANCHOR==='0')?<>{before}<Text underline>{at}</Text>{after.slice(at.trim()?at.length:after.startsWith(' ')?1:0)}</>:line.text||' '}</Text>;
     })}
     {all.length>max?<Text dimColor>行 {active+1}/{all.length} · ↑↓ 移动</Text>:null}
   </Box>;

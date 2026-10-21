@@ -14,7 +14,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { execSync } from "node:child_process";
 import { useStore, approve, reject, switchSession, getSessionTokens, setScrollOffset } from "./store.js";
-import { setCursorAnchor } from "./runtime/CursorAnchor.js";
+import { setCursorAnchor, getCursorAnchorSequence } from "./runtime/CursorAnchor.js";
 import type {
   AgentInfo, Message, TodoItem, AgentRunState,
 } from "./protocol.js";
@@ -1115,13 +1115,16 @@ export function InputBar({
     const rows = process.stdout.rows ?? 24;
     const cols = process.stdout.columns ?? 80;
     const rowOffset = Number.parseInt(process.env.SPAWN_INPUT_CURSOR_ROW_OFFSET ?? "2", 10);
-    const colOffset = Number.parseInt(process.env.SPAWN_INPUT_CURSOR_COL_OFFSET ?? "5", 10);
+    const colOffset = Number.parseInt(process.env.SPAWN_INPUT_CURSOR_COL_OFFSET ?? "4", 10);
     const width=Math.max(1,cols-9),lines=editorLines(value,width,displayWidth),active=lines.reduce((last,line,i)=>line.start<=cursor?i:last,0),max=Math.max(2,Math.min(8,Math.floor(rows/3))),start=Math.max(0,active-max+1),visible=lines.slice(start,start+max),extra=lines.length>max?1:0;
     setCursorAnchor({
       focused: focused && useNativeCursor,
       row: Math.max(1, rows - (Number.isFinite(rowOffset) ? rowOffset : 2) - 1 - (visible.length-1-(active-start))-extra),
       col: Math.max(1, Math.min(cols, colOffset + displayWidth(value.slice(lines[active]!.start,cursor)))),
     });
+    // Moving inside unchanged text produces no Ink frame. Refresh the native
+    // caret after layout too, rather than waiting for another keystroke.
+    if(process.stdout.isTTY&&focused&&useNativeCursor)process.stdout.write(getCursorAnchorSequence());
   };
   useEffect(()=>()=>setCursorAnchor({focused:false}),[]);
   useInput((_char, key) => {

@@ -18,8 +18,15 @@ export function setCursorAnchor(patch: Partial<CursorAnchorState>): void {
 
 export function getCursorAnchorSequence(): string {
   if (!state.enabled) return "";
-  if (!state.focused) return "\x1b[?25h";
-  // Move the real terminal cursor for IME anchoring, then hide it so the user
-  // only sees ink-text-input's block cursor. This avoids double-cursor UI.
-  return `\x1b[${state.row};${state.col}H\x1b[?25l`;
+  if (!state.focused) return "\x1b[?25l";
+  // A real steady bar preserves the glyph beneath it and anchors native IMEs.
+  return `\x1b[${state.row};${state.col}H\x1b[6 q\x1b[?25h`;
+}
+
+let saved=false;
+/** Ink tracks its own end-of-frame position; never let IME anchoring change it. */
+export function cursorAnchoredFrame(content:string):string{
+ const restore=saved?'\x1b8':'';
+ saved=true;
+ return `${restore}${content}\x1b7${getCursorAnchorSequence()}`;
 }

@@ -231,7 +231,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
       try {
         const [name,input,output,...options]=args,model=name&&loadBillingConfig().models[name];
         const source=options.find(v=>v.startsWith("source="))?.slice(7),date=options.find(v=>v.startsWith("since="))?.slice(6);
-        if(!model||input===undefined||output===undefined||!source||options.some(v=>v!=="legacy"&&!v.startsWith("source=")&&!v.startsWith("since="))||(model.transport&&model.transport!=="http")||model.billing?.mode==="subscription")throw Error("用法 /price <API注册模型> <输入USD/M> <输出USD/M> source=来源标签 [since=ISO日期] [legacy]；省略日期表示明确补算全部历史；legacy 明确允许匹配旧记录中未知的端点。");
+        if(!model||input===undefined||output===undefined||!source||options.some(v=>v!=="legacy"&&!v.startsWith("source=")&&!v.startsWith("since="))||(["claude-cli","codex-cli","copilot-sdk"].includes(model.transport??""))||model.billing?.mode==="subscription")throw Error("用法 /price <API注册模型> <输入USD/M> <输出USD/M> source=来源标签 [since=ISO日期] [legacy]；省略日期表示明确补算全部历史；legacy 明确允许匹配旧记录中未知的端点。");
         const updated={...model,billing:{mode:"api" as const,inputUsdPerMillion:Number(input),outputUsdPerMillion:Number(output)}};
         validateBillingConfig(updated);
         const price=recordPrice(sessionJournal(),model,Number(input),Number(output),{source,since:date?Date.parse(date):0,legacy:options.includes("legacy")});

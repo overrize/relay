@@ -24,7 +24,8 @@ export interface BillingConfig {
   priceRecordedAt?: number;
 }
 export interface ProviderConfig {
-  transport?: "http" | "claude-cli" | "codex-cli" | "copilot-sdk";
+  transport?: "http" | "claude-cli" | "codex-cli" | "copilot-sdk" | "bedrock" | "vertex";
+  cloud?: {region:string;profile?:string;project?:string};
   billing?: BillingConfig;
   provider: "anthropic" | "openai";
   model: string;
@@ -374,7 +375,13 @@ export function validateBillingConfig(config: ProviderConfig): void {
   const b = config.billing;
   if (b && !["api", "subscription"].includes(b.mode)) throw new Error("Billing mode must be api or subscription");
   for (const rate of [b?.inputUsdPerMillion,b?.outputUsdPerMillion]) if (rate !== undefined && (!Number.isFinite(rate) || rate < 0)) throw new Error("Prices must be finite nonnegative USD per million tokens");
-  if (config.transport && !["http","claude-cli","codex-cli","copilot-sdk"].includes(config.transport)) throw new Error("Unknown model transport");
+  if (config.transport && !["http","claude-cli","codex-cli","copilot-sdk","bedrock","vertex"].includes(config.transport)) throw new Error("Unknown model transport");
+  if(config.transport==='bedrock'||config.transport==='vertex'){
+    if(config.apiKey||config.baseUrl||b?.mode!=='api'||config.provider!=='openai')throw new Error('Cloud authentication requires API billing without embedded key/baseUrl');
+    if(!config.cloud||!/^[-a-z0-9]{1,64}$/.test(config.cloud.region))throw new Error('Cloud region required');
+    if(config.cloud.profile!==undefined&&!/^[-\w.@]{1,128}$/.test(config.cloud.profile))throw new Error('Invalid AWS profile');
+    if(config.transport==='vertex'&&!/^[a-z][a-z0-9-]{4,61}[a-z0-9]$/.test(config.cloud.project??''))throw new Error('GCP project ID required');
+  }
   if (config.transport === "copilot-sdk" && (b?.mode !== "subscription" || config.apiKey || config.baseUrl)) throw new Error("copilot-sdk requires subscription mode without API key/baseUrl");
   if (config.transport === "codex-cli" && (config.provider !== "openai" || b?.mode !== "subscription" || config.apiKey || config.baseUrl)) throw new Error("codex-cli requires ChatGPT subscription mode without API key/baseUrl");
   if (config.transport === "claude-cli" && (config.provider !== "anthropic" || b?.mode !== "subscription" || config.apiKey || config.baseUrl)) throw new Error("claude-cli requires Claude subscription mode without API key/baseUrl");

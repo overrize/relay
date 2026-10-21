@@ -2,9 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import {sessionJournal} from "./Journal.js";
 import {digest} from "./Storage.js";
-import {priceEndpoint,priceFor,validatePrice,type PriceDefinition} from "./Pricing.js";
+import {modelPriceEndpoint,priceFor,validatePrice,type PriceDefinition} from "./Pricing.js";
 
-export interface PriceModel{provider:string;model:string;baseUrl?:string;transport?:string;billing?:{mode:string;inputUsdPerMillion?:number;outputUsdPerMillion?:number}}
+export interface PriceModel{provider:string;model:string;baseUrl?:string;transport?:string;cloud?:{region:string;project?:string};billing?:{mode:string;inputUsdPerMillion?:number;outputUsdPerMillion?:number}}
 export interface PriceSyncStatus{source:string;state:"fresh"|"error";checkedAt:number;retryAt:number;lastSuccess?:number;failures:number;code?:string;etag?:string;lastModified?:string;documentHash?:string;models?:string[];changes?:number}
 export const priceSources={deepseek:"https://api-docs.deepseek.com/quick_start/pricing/",kimi:"https://platform.kimi.ai/docs/pricing/chat.md",kimiCN:"https://platform.kimi.com/docs/pricing/chat.md",openrouter:"https://openrouter.ai/api/v1/models",fx:"https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"} as const;
 type Source=Exclude<keyof typeof priceSources,"fx">;
@@ -105,12 +105,12 @@ export function syncModelPrices(models:PriceModel[],root=process.cwd(),options:{
 export function formatPriceStatus(models:PriceModel[],root=process.cwd()){
   const j=sessionJournal(root),prices=j.effectivePrices(),statuses=j.priceStatus();
   return ["可信价格同步（手工配置优先，自动价格为文本推理估算；不含税费/工具调用/交易汇差）",...models.map(m=>{
-    if(m.billing?.mode==="subscription"||(m.transport&&m.transport!=="http"))return `${m.model} · 订阅，API 单价不适用`;
-    const contract=priceFor({provider:m.provider,model:m.model,endpoint:priceEndpoint(m.provider,m.baseUrl),at:Date.now()} as any,prices);
+    if(m.billing?.mode==="subscription"||["claude-cli","codex-cli","copilot-sdk"].includes(m.transport??""))return `${m.model} · 订阅，API 单价不适用`;
+    const contract=priceFor({provider:m.provider,model:m.model,endpoint:modelPriceEndpoint(m),at:Date.now()} as any,prices);
     if(contract?.origin==="contract")return `${m.model} · 合同估价 $${contract.inputRate}/$${contract.outputRate} USD/M；来源 ${contract.source}；版本 ${contract.version}；生效 ${new Date(contract.since).toISOString()} 至 ${contract.expiresAt===undefined?"无固定终止":new Date(contract.expiresAt).toISOString()}；显式模型手工价仍优先`;
-    const retired=prices.filter(p=>p.origin==="contract"&&p.provider===m.provider&&p.model===m.model&&p.endpoint===priceEndpoint(m.provider,m.baseUrl)&&p.retired).sort((a,b)=>b.retired!.at-a.retired!.at)[0];
+    const retired=prices.filter(p=>p.origin==="contract"&&p.provider===m.provider&&p.model===m.model&&p.endpoint===modelPriceEndpoint(m)&&p.retired).sort((a,b)=>b.retired!.at-a.retired!.at)[0];
     const source=priceSourceFor(m);if(!source)return `${m.model} · ${retired?`当前无有效合同价；最近修订 ${retired.retired!.action}：${retired.retired!.reason}；批次 ${retired.importDigest}；/prices history 可追溯`:"未支持/代理端点，保留手工价格"}`;
-    const status=statuses.find(s=>s.source===priceSources[source]),price=priceFor({provider:m.provider,model:m.model,endpoint:priceEndpoint(m.provider,m.baseUrl),at:Date.now()} as any,prices);
+    const status=statuses.find(s=>s.source===priceSources[source]),price=priceFor({provider:m.provider,model:m.model,endpoint:modelPriceEndpoint(m),at:Date.now()} as any,prices);
     const manual=m.billing?.inputUsdPerMillion!==undefined&&m.billing.outputUsdPerMillion!==undefined?`手工价 $${m.billing.inputUsdPerMillion}/$${m.billing.outputUsdPerMillion} 优先；官方候选：`:"";
     const state=price?`$${price.inputRate.toFixed(6)}/$${price.outputRate.toFixed(6)} 每百万输入/输出；${price.basis==="catalog-estimate"?"目录估价":"保守估算"}；到期 ${new Date(price.expiresAt!).toISOString()}`:status?.models&&!status.models.includes(m.model)?"官方目录没有可用的此精确模型单价（缺项或计费方式未支持），未猜测价格":"没有有效自动价格";
     return `${m.model} · ${manual}${state}\n来源 ${priceSources[source]}；${status?.code??status?.state??"尚未同步"}${status?`；下次允许查询 ${new Date(status.retryAt).toISOString()}`:""}${price?.version?`；版本 ${price.version}`:""}${price?.fx?`；原币 CNY，参考换算 ${price.fx.date} ${price.fx.source}`:""}`;
@@ -128,7 +128,7 @@ async function performSync(models:PriceModel[],root:string,options:{force?:boole
   for(const [id,configured] of groups){
     const source=priceSources[id],previous=j.priceStatus().find(s=>s.source===source),time=now();
     if(previous?.state==="error"&&previous.retryAt>time)continue;
-    const missing=configured.some(m=>previous?.models?.includes(m.model)&&!j.prices().some(p=>p.model===m.model&&p.endpoint===priceEndpoint(m.provider,m.baseUrl)));
+    const missing=configured.some(m=>previous?.models?.includes(m.model)&&!j.prices().some(p=>p.model===m.model&&p.endpoint===modelPriceEndpoint(m)));
     if(!options.force&&!missing&&previous?.state==="fresh"&&previous.retryAt>time)continue;
     const release=lease(root,source);if(!release)continue;
     try{
@@ -144,7 +144,7 @@ async function performSync(models:PriceModel[],root:string,options:{force?:boole
       }
       let changes=0;
       for(const model of configured){
-        const endpoint=priceEndpoint(model.provider,model.baseUrl),old=j.prices().find(p=>p.model===model.model&&p.provider===model.provider&&p.endpoint===endpoint),entry=parsed?.find(p=>p.model===model.model);
+        const endpoint=modelPriceEndpoint(model),old=j.prices().find(p=>p.model===model.model&&p.provider===model.provider&&p.endpoint===endpoint),entry=parsed?.find(p=>p.model===model.model);
         if(parsed&&!entry)continue;if(!entry&&!old)continue;
         const components=entry?.components??old!.components!,currency=entry?.currency??old!.currency!,conversion=currency==="CNY"?fx:undefined;
         const inputRate=entry?entry.inputRate*(conversion?.usdPerUnit??1):currency==="CNY"?old!.inputRate/old!.fx!.usdPerUnit*conversion!.usdPerUnit:old!.inputRate;

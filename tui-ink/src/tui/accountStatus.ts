@@ -32,6 +32,7 @@ export function formatUsage(values: UsageSnapshot[], history = false): string {
   }).join("\n\n");
 }
 function endpoint(model: ProviderConfig) {
+  if(model.transport==='bedrock'||model.transport==='vertex')return `${model.transport} · ${model.cloud?.region??'区域缺失'} · ${model.cloud?.project??model.cloud?.profile??'默认凭据链'}；凭据由官方库读取，权限待验证`;
   if (model.transport && model.transport !== "http") return "官方订阅客户端；登录状态需独立验证";
   try { const url = new URL(model.baseUrl ?? (model.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com")); return `${url.protocol}//${url.host}`; }
   catch { return "端点无效"; }
@@ -41,7 +42,7 @@ export function formatModelConfig(cfg: Config): string {
     let valid = true; try { validateBillingConfig(m); } catch { valid = false; }
     const sub = m.billing?.mode === "subscription", local = /^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(m.baseUrl??"");
     const pricing = sub ? "套餐消耗单独记账；本地不估算订阅账单" : m.billing?.inputUsdPerMillion!==undefined && m.billing.outputUsdPerMillion!==undefined ? `估价 $${m.billing.inputUsdPerMillion}/$${m.billing.outputUsdPerMillion} 每百万输入/输出 Token` : "模型未设价格（手工）；自动官方价见 /prices，或使用会话估价；不能视为免费";
-    return `${name} → ${m.provider}/${m.model} · ${sub?"订阅":"API"} · ${m.transport??"http"}\n  ${endpoint(m)}；${valid?"配置结构有效":"配置无效"}${sub?"":`；凭据${m.apiKey?"已配置":local?"本地端点无需凭据":"缺失"}`}\n  ${pricing}；maxTokens=${m.maxTokens??"角色默认"}`;
+    return `${name} → ${m.provider}/${m.model} · ${sub?"订阅":"API"} · ${m.transport??"http"}\n  ${endpoint(m)}；${valid?"配置结构有效":"配置无效"}${sub?"":`；凭据${m.apiKey?"已配置":m.transport==="bedrock"||m.transport==="vertex"?"使用云身份（未实时验证）":local?"本地端点无需凭据":"缺失"}`}\n  ${pricing}；maxTokens=${m.maxTokens??"角色默认"}`;
   });
   const profiles: ModelProfile[] = ["pm","leader","implement","research","review","verify","secretary"];
   const routes = profiles.map(profile=>{

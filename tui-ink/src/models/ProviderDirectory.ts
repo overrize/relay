@@ -3,6 +3,7 @@ export interface LoginProvider {
  id:string;sourceId:string;label:string;protocol:'openai'|'anthropic';endpoint:string;
  subscription:boolean;authProvider?:'codex'|'claude'|'copilot';gatewayOnly?:boolean;plan?:boolean;exactBaseUrl?:boolean;
  streamUsage?:boolean;
+ nativeAuth?:'openrouter'|'bedrock'|'vertex';
 }
 const legacy:LoginProvider[]=[
  {id:'codex',sourceId:'openai',label:'OpenAI / Codex',protocol:'openai',endpoint:'https://api.openai.com/v1',subscription:true,authProvider:'codex'},
@@ -21,6 +22,7 @@ export const loginProviders:LoginProvider[]=[...legacy,...snapshot.providers.fil
  ...(compatibility[p.id]?{protocol:'openai' as const,endpoint:compatibility[p.id]}:{}),
  ...(p.id==='mistral'?{streamUsage:false}:{}),
  ...(p.id==='chatgpt-subscription'?{authProvider:'codex' as const}:{}),
+ ...(['amazon-bedrock','google-vertex','openrouter'].includes(p.id)?{nativeAuth:({'amazon-bedrock':'bedrock','google-vertex':'vertex',openrouter:'openrouter'} as const)[p.id as 'amazon-bedrock'|'google-vertex'|'openrouter'],gatewayOnly:false,subscription:true,protocol:'openai' as const}:{}),
  // OpenAI-compatible services may use /v2 or /api without an additional /v1.
  exactBaseUrl:!!compatibility[p.id]||p.protocol==='openai'&&!p.gatewayOnly,
 })).sort((a,b)=>a.label.localeCompare(b.label))];

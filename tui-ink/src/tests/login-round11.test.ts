@@ -27,7 +27,7 @@ test("cancelling the wizard does not persist a key or start any model",()=>{
   const flow=custom();flow.dispose();assert.equal(fs.existsSync(configPath()),false);assert.throws(()=>flow.finish(),/incomplete|不完整/);
 });
 test("provider modes prevent a Copilot API key being presented as subscription",()=>{
-  const flow=new LoginFlow();assert.deepEqual(flow.view().options,["账号登录（订阅）","API Key"]);flow.choose(1);assert.ok(flow.view().options.every(s=>!s.includes("Copilot")));const subscription=new LoginFlow();subscription.choose(0);subscription.choose(2);assert.equal(subscription.choose(0),"check");subscription.authFailed();assert.equal(subscription.stage,"subscription");assert.equal(fs.existsSync(configPath()),false);
+  const flow=new LoginFlow();assert.deepEqual(flow.view().options,["账号登录 / OAuth / 云身份（按供应商计费）","API Key"]);flow.choose(1);assert.ok(flow.view().options.every(s=>!s.includes("Copilot")));const subscription=new LoginFlow();subscription.choose(0);subscription.choose(2);assert.equal(subscription.choose(0),"check");subscription.authFailed();assert.equal(subscription.stage,"subscription");assert.equal(fs.existsSync(configPath()),false);
 });
 test("subscription authentication is required before model configuration",()=>{
   const flow=new LoginFlow();flow.choose(0);flow.choose(0);assert.equal(flow.choose(1),"login");flow.authenticated();flow.catalog={models:[{id:"fixture-sub",label:"Fixture subscription"}],source:"account"};flow.choose(0);flow.alias="sub-model";flow.choose(1);flow.finish();const c=loadConfig();assert.equal(c.models["sub-model"]!.transport,"codex-cli");assert.equal(c.models["sub-model"]!.apiKey,"");assert.deepEqual(c.routing!.profiles!.pm,["sub-model"]);

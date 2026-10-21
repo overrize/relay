@@ -24,7 +24,7 @@ import * as fs from "node:fs";
 export const DISABLE_MOUSE_TRACKING = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
 /** Full restore: mouse off + bracketed paste off (2004) + cursor visible (25h). */
-export const TERM_RESET = `${DISABLE_MOUSE_TRACKING}\x1b[?2004l\x1b[?25h`;
+export const TERM_RESET = `${DISABLE_MOUSE_TRACKING}\x1b[?2004l\x1b[0 q\x1b[?25h`;
 
 /** Injectable sink so tests can assert what would be written to fd 1. */
 export type SyncWriter = (seq: string) => void;

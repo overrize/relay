@@ -101,7 +101,7 @@ import { runDemo, runTestSuite } from "./DevHarness.js";
 import { connectFeishu, configureFeishuBridge, isFeishuConnected, feishuSessionCount, getFeishuTokenManager, feishuMsgQueue, feishuReplyTarget, feishuForks, feishuBridge } from "./FeishuBridge.js";
 import { buildCommands, type CmdDef } from "../tui/commands.js";
 import { startLeaderAgent, startWorker, configureAgentHandlers } from "./AgentHandlers.js";
-import { getCursorAnchorSequence } from "./CursorAnchor.js";
+import { cursorAnchoredFrame } from "./CursorAnchor.js";
 import { formatMetricsReport, getHealthMetricsStore, recordHealthMetric, logDiag, installDiagnosticSink } from "./ObservabilityRuntime.js";
 import { SpawnHeader } from "../tui/Transcript.js";
 import { config as dotenvConfig } from "dotenv";
@@ -1308,7 +1308,7 @@ process.on("SIGINT", () => {
     // synchronized-output begin/end markers.
     if (s.includes("\x1b[1A") || s.includes("\x1b[2J")) {
       _inside = true;
-      const r = _orig(`\x1b[?2026h${s}${getCursorAnchorSequence()}\x1b[?2026l`, ...rest);
+      const r = _orig(`\x1b[?2026h${cursorAnchoredFrame(s)}\x1b[?2026l`, ...rest);
       _inside = false;
       return r;
     }
