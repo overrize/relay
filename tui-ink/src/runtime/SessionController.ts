@@ -13,9 +13,16 @@ import {budgetReport} from '../session/Budget.js';
 import {workItems} from '../session/Tasks.js';
 import {interruptSession} from '../session/Control.js';
 import {waitForIndexing} from '../session/SearchIndex.js';
+import {backgroundAuditReport} from '../session/BackgroundAudit.js';
+import type {AuditFilter} from '../session/Audit.js';
+import {transcriptPage} from '../session/Transcript.js';
 
 export class SessionController {
  private started=false;private stopping?:Promise<void>;private server?:Server;private root=process.cwd();private communicationAttach=false;
+ private reads=new Set<Promise<unknown>>();
+ private read<T>(job:Promise<T>):Promise<T>{this.reads.add(job);void job.finally(()=>this.reads.delete(job)).catch(()=>{});return job;}
+ audit(filter:AuditFilter={}){this.ready();return this.read(backgroundAuditReport(this.root,filter));}
+ transcript(before?:number){this.ready();return this.read(transcriptPage(this.root,before));}
  private model(){const cfg=loadConfig();try{return agents.get('pm')?.cfg.providerCfg.model??resolveModelRoute(cfg,'leader','pm').candidates[0]!.config.model;}catch{return getAgentProviderConfig(cfg,'leader').model;}}
  start(options:{http?:boolean}={}){
   if(this.started)return;registerRuntimeOwner(this.root);this.started=true;
@@ -74,6 +81,6 @@ export class SessionController {
   return structuredClone({revision:current?.revision??0,goal:current?.goal??'',inputs:current?.inputs??[],activeTools,agents:[...state.agents.values()].map(a=>({...a,activity:activeTools.some(t=>t.agent===a.id)?'tool-running':killedAgents.has(a.id)?'stopped':a.state==='run'?'model-running':state.pendingInputAgents.has(a.id)?'queued':a.state})),messages:[...(state.messagesByAgent.get('pm')??[])].slice(-150),history:j.history('pm').slice(-20),tasks:workItems(),budget:budgetReport(),recoverable:!!j.binding('pm')&&(!agents.has('pm')||this.communicationAttach),model:this.model()});
  }
  subscribe(listener:(snapshot:ReturnType<SessionController['snapshot']>)=>void){this.ready();const deliver=()=>{if(!this.stopping)try{listener(this.snapshot());}catch{process.stderr.write('[session-ui] subscriber failed\n');}};const off=subscribe(deliver);deliver();return off;}
- async shutdown(){if(this.stopping)return this.stopping;this.stopping=(async()=>{this.server?.closeAllConnections();if(this.server)await new Promise<void>(r=>this.server!.close(()=>r()));await shutdownRuntime();await waitForIndexing();})();return this.stopping;}
+ async shutdown(){if(this.stopping)return this.stopping;this.stopping=(async()=>{this.server?.closeAllConnections();if(this.server)await new Promise<void>(r=>this.server!.close(()=>r()));await shutdownRuntime();await Promise.allSettled([...this.reads]);await waitForIndexing();})();return this.stopping;}
 }
 export const sessionController=new SessionController();

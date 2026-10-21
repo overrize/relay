@@ -31,6 +31,7 @@ try{
  if(phase==='crash'){
   ui.submit('OLD_NATIVE_GOAL');await until(()=>Object.values(sessionJournal().current('pm')?.tools??{}).some(t=>t.agent==='native-worker'&&t.name==='Bash'&&t.status==='pending'),'worker Bash running');
   const revision=c.snapshot().revision;ui.editor.setText('中文草稿🙂');
+  for(const panel of ['tasks','budget','audit']){ui.openPanel(panel);terminal.input('\x1b');assert.equal(ui.editor.getText(),'中文草稿🙂');assert.equal(c.snapshot().revision,revision);}
   for(const kind of ['login','model','history']){ui.openWorkflow(kind);terminal.input('\x1b');assert.equal(ui.editor.getText(),'中文草稿🙂');assert.equal(c.snapshot().revision,revision);}
   const editor=path.join(root,'editor24.mjs');fs.writeFileSync(editor,"import fs from 'node:fs';await new Promise(r=>setTimeout(r,300));fs.appendFileSync(process.argv[2],'\\nLIVE_EDITOR24');");process.env.VISUAL=`"${process.execPath}" "${editor}"`;
   const editing=ui.externalEditor();ui.submit('当前进度如何？');await editing;await until(()=>c.snapshot().messages.some(m=>m.text.includes('LIVE_PROGRESS')),'PM followup');const whileRunning=c.snapshot().activeTools.some(t=>t.agent==='native-worker'&&t.name==='Bash');assert.ok(whileRunning,'PM reply must arrive while Worker runs');assert.equal(c.snapshot().revision,revision);assert.equal(ui.editor.getText(),'中文草稿🙂\nLIVE_EDITOR24');

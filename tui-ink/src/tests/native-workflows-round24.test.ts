@@ -32,6 +32,7 @@ test('model workflow searches names and explicitly chooses session versus saved 
  const selected:any[]=[];const open=()=>{const w=new NativeWorkflow(()=>{},()=>{});w.models([{name:'a',model:'alpha',billing:'api'},{name:'b',model:'beta',billing:'subscription'}],(...args)=>{selected.push(args);return 'ok';});return w;};
  const w=open();w.handleInput('\r');w.handleInput('beta');w.handleInput('\r');assert.match(frame(w),/保存默认/);w.handleInput('\r');assert.deepEqual(selected[0],['b','session','leader']);w.dispose();
  const other=open();other.handleInput('\x1b[B');other.handleInput('\r');other.handleInput('\r');other.handleInput('\x1b[B');other.handleInput('\r');assert.deepEqual(selected[1],['a','default','worker']);other.dispose();
+ const shortcuts=open();shortcuts.handleInput('\r');shortcuts.handleInput('\x06');assert.match(frame(shortcuts),/★/);shortcuts.handleInput('\t');assert.match(frame(shortcuts),/Worker/);shortcuts.handleInput('\r');shortcuts.handleInput('\x13');assert.deepEqual(selected[2],['a','default','worker']);shortcuts.dispose();
 });
 
 test('native history searches a fresh process record and restores multiline text without sending',()=>{

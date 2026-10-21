@@ -19,6 +19,13 @@ export const KEY_ACTIONS={
  'app.tools.expand':def(['ctrl+o'],'\x0f',compose,'展开工具输出'),
  'app.thinking.toggle':def(['ctrl+t'],'\x14',compose,'展开推理内容'),
  'app.thinking.cycle':def(['shift+tab'],'\x1b[Z',compose,'推理强度'),
+ 'app.viewport.up':def(['pageup'],'\x1b[5~',compose,'历史向上翻页'),
+ 'app.viewport.down':def(['pagedown'],'\x1b[6~',compose,'历史向下翻页'),
+ 'app.viewport.end':def(['alt+end'],'\x1b[1;3F',compose,'回到最新输出'),
+ 'app.panel.previous':def(['alt+up'],'\x1b[1;3A',compose,'面板上一条'),
+ 'app.panel.next':def(['alt+down'],'\x1b[1;3B',compose,'面板下一条'),
+ 'app.panel.more':def(['alt+n'],'\x1bn',compose,'加载更早记录'),
+ 'app.panel.refresh':def(['f5'],'\x1b[15~',compose,'刷新当前面板'),
  'tui.input.submit':def(['enter'],'\r',compose,'发送消息'),
  'tui.input.newline':def(['alt+enter','ctrl+j','shift+enter'],'\n',compose,'换行'),
  'tui.editor.left':def(['left'],'\x1b[D',compose,'光标左移'),
@@ -47,6 +54,7 @@ export type KeyAction=keyof typeof KEY_ACTIONS;
 const aliases:Record<string,string>={esc:'escape',return:'enter',control:'ctrl',option:'alt'};
 export function normalizeKey(raw:string){const key=raw.toLowerCase().split('+').map(s=>aliases[s.trim()]??s.trim()).join('+');return ({'ctrl+i':'tab','ctrl+m':'enter','ctrl+h':'backspace'} as Record<string,string>)[key]??key;}
 export function keySequences(key:string):string[]{
+ const viewport:Record<string,string[]>={pageup:['\x1b[5~'],pagedown:['\x1b[6~'],'alt+end':['\x1b[1;3F'],'alt+up':['\x1b[1;3A'],'alt+down':['\x1b[1;3B']};if(viewport[key])return viewport[key]!;
  const plain:Record<string,string[]>={escape:['\x1b'],enter:['\r'],tab:['\t'],backspace:['\x08','\x7f'],delete:['\x1b[3~'],up:['\x1b[A','\x1bOA'],down:['\x1b[B','\x1bOB'],left:['\x1b[D','\x1bOD'],right:['\x1b[C','\x1bOC'],home:['\x1b[H','\x1bOH','\x1b[1~'],end:['\x1b[F','\x1bOF','\x1b[4~'],'shift+tab':['\x1b[Z'],'alt+enter':['\x1b\r'],'shift+enter':['\x1b[13;2u','\x1b[27;2;13~']};
  if(plain[key])return plain[key]!;
  if(/^ctrl\+[a-z]$/.test(key))return [String.fromCharCode(key.charCodeAt(5)-96)];

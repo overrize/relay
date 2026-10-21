@@ -3,13 +3,17 @@ import {LoginFlow} from '../loginFlow.js';
 import {officialSubscriptionLogin} from '../../subscriptions/login.js';
 import {openRouterOAuth} from '../../subscriptions/openrouterOAuth.js';
 import {searchPrompts} from '../PromptHistory.js';
+import type {KeyScope} from '../Keybindings.js';
+import {toggleFavorite,uiPreferences} from '../interaction.js';
 
 /** A single focus owner. The chat Editor is never replaced or reset by a modal. */
 export class NativeWorkflow implements Component {
+ scope:KeyScope='login';
  private input=new Input({prompt:'> '});private title='';private detail='';private options:{label:string;value:string}[]=[];private selected=0;private searchable=false;private secret=false;private busy=false;private disposed=false;
  private choose:(value:string)=>void=()=>{};private submitValue:(value:string)=>void=()=>{};private onSearch?:(value:string)=>void;
  private abort?:AbortController;private flow?:LoginFlow;private generation=0;
- constructor(private renderRequest:()=>void,private done:(message?:string)=>void){}
+ private changeModelRole?:()=>void;private favoriteModel?:()=>void;
+ constructor(private renderRequest:()=>void,private done:(message?:string)=>void,private keyHints:()=>string=()=> '↑↓ 选择 · Enter 确认 · Esc 取消'){}
  get focused(){return this.input.focused;}set focused(value:boolean){this.input.focused=value;}
  invalidate(){this.input.invalidate();}
  private show(title:string,options:{label:string;value:string}[],choose:(value:string)=>void,settings:{search?:boolean;detail?:string;secret?:boolean;submit?:(value:string)=>void;onSearch?:(value:string)=>void}={}){
@@ -20,6 +24,9 @@ export class NativeWorkflow implements Component {
  handleInput(data:string){
   if(matchesKey(data,'esc')||matchesKey(data,'ctrl+c')){this.dispose();this.done();return;}
   if(this.busy)return;
+  if(this.scope==='model'&&matchesKey(data,'tab')){this.changeModelRole?.();this.renderRequest();return;}
+  if(this.scope==='model'&&matchesKey(data,'ctrl+f')){try{this.favoriteModel?.();}catch{this.detail='收藏保存失败；请检查配置目录。';}this.renderRequest();return;}
+  if(this.scope==='model'&&matchesKey(data,'ctrl+s')){if(this.title==='模型使用范围')this.choose('default');else this.detail='先选择角色和模型，再保存默认。';this.renderRequest();return;}
   try{
    const items=this.filtered();
    if(matchesKey(data,'up')||matchesKey(data,'down')){if(items.length)this.selected=(this.selected+(matchesKey(data,'up')?-1:1)+items.length)%items.length;}
@@ -37,18 +44,24 @@ export class NativeWorkflow implements Component {
   }
   const items=this.filtered();this.selected=Math.min(this.selected,Math.max(0,items.length-1));const start=Math.max(0,this.selected-3);
   for(let i=start;i<Math.min(items.length,start+7);i++)lines.push(...new Text(`${i===this.selected?'→':' '} ${stripTerminalSequences(items[i]!.label)}`,1,0).render(width));
-  lines.push(...new Text(`↑↓ 选择 · Enter 确认 · Esc 取消${this.searchable?` · ${items.length?this.selected+1:0}/${items.length}`:''}`,1,0).render(width));return lines;
+  lines.push(...new Text(`${this.keyHints()}${this.searchable?` · ${items.length?this.selected+1:0}/${items.length}`:''}`,1,0).render(width));return lines;
  }
  history(restore:(text:string)=>void){
+  this.scope='history';
   const load=(q:string)=>{const rows=searchPrompts(q,50);this.options=rows.map(r=>({label:`${r.created.slice(0,16)} · ${r.cwd} · ${r.text.replace(/\s+/g,' ').slice(0,180)}`,value:r.text}));};
   this.show('跨会话历史 · 选中后仅填回草稿',[],value=>{restore(value);this.done();},{search:true,onSearch:load});load('');this.renderRequest();
  }
  models(choices:{name:string;model:string;billing:string}[],select:(name:string,scope:'session'|'default',role:'leader'|'worker')=>string){
-  this.show('选择角色',[{label:'PM',value:'leader'},{label:'Worker（后续新任务）',value:'worker'}],role=>{
-   this.show('选择已配置模型',choices.map(c=>({label:`${c.model} · ${c.name} · ${c.billing}`,value:c.name})),name=>{
+  this.scope='model';
+  const chooseRole=(role:string)=>{
+   this.changeModelRole=()=>chooseRole(role==='leader'?'worker':'leader');
+   this.favoriteModel=()=>{if(!this.title.startsWith('选择已配置模型'))return;const row=this.filtered()[this.selected];if(!row)return;const favorites=toggleFavorite(row.value);this.options=this.options.map(o=>({...o,label:`${favorites.includes(o.value)?'★ ':''}${o.label.replace(/^★ /,'')}`}));};
+   const favorites=uiPreferences().favorites;
+   this.show(`选择已配置模型 · ${role==='leader'?'PM':'Worker'}`,choices.map(c=>({label:`${favorites.includes(c.name)?'★ ':''}${c.model} · ${c.name} · ${c.billing}`,value:c.name})),name=>{
     this.show('模型使用范围',[{label:'仅本次使用（重启恢复默认）',value:'session'},{label:'保存默认（重启后继续使用）',value:'default'}],scope=>this.done(select(name,scope as 'session'|'default',role as 'leader'|'worker')));
    },{search:true,detail:choices.length?'':'暂无可用模型；Esc 后 /login 配置。'});
-  });
+  };
+  this.changeModelRole=()=>{this.selected=(this.selected+1)%2;};this.show('选择角色',[{label:'PM',value:'leader'},{label:'Worker（后续新任务）',value:'worker'}],chooseRole);
  }
  login(flow=new LoginFlow()) {this.flow=flow;this.loginView();}
  private loginView(){
