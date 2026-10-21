@@ -30,6 +30,13 @@ function stopAffected(conversation: string, ids: string[]) {
   settling.set(key, barrier);
   void barrier.then(() => { if (settling.get(key) === barrier) settling.delete(key); }, () => {});
 }
+export function interruptSession(agent:string){
+  const j=sessionJournal(),b=j.binding(agent);if(!b)return;
+  const current=j.current(b.conversation)!;
+  const ids=j.tasks(b.conversation).filter(t=>t.revision===current.revision).map(t=>t.id);
+  j.append('requirement.changed',b.conversation,agent,current.revision+1,{text:current.goal,previousRevision:current.revision,preserveProgress:true,reason:'user-interrupted'});
+  stopAffected(b.conversation,[agent,...ids]);
+}
 export async function waitForSessionControl(agent: string) {
   const binding = sessionJournal().binding(agent);
   if (binding) await Promise.all([recovery.get(liveKey(binding.conversation)), settling.get(liveKey(binding.conversation))]);
@@ -46,13 +53,13 @@ export function inputKind(text: string): "change" | "query" | "continue" | "cons
   return "change";
 }
 
-export function acceptSessionInput(agent: string, original: string, inputId: string = randomUUID()) {
+export function acceptSessionInput(agent: string, original: string, inputId: string = randomUUID(),kindOverride?:'change'|'query'|'continue'|'constraint') {
   const journal = sessionJournal(), binding = journal.binding(agent);
   if (!binding) throw new Error(`No session binding for ${agent}`);
   let state = journal.current(binding.conversation)!;
   const prior = state.inputs.find((i) => i.id === inputId);
   if (prior) { journal.dispatched(inputId); return prior; }
-  const kind = inputKind(original.trim());
+  const kind = kindOverride ?? inputKind(original.trim());
   const text = original.replace(/^\/(?:revise|goal|constraint)\s+/i, "").trim();
   const affected = journal.tasks(binding.conversation).filter((a) => a.revision === state.revision && (a.status === "running" || a.status === "interrupted"));
   if (kind === "change" || !state.goal) {

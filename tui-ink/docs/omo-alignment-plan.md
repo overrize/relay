@@ -49,13 +49,15 @@
 
 运行：在 `tui-ink` 下 `npm run build`，再 `npm run ui:preview`。正式入口仍是根目录 `relay.cmd`。
 
-### 2. 先抽会话控制器，再接真实 PM
+### 2. 先抽会话控制器，再接真实 PM（已完成核心接入）
 
 - 抽离初始化/关闭生命周期、规范化操作和事件订阅，保持正式旧 UI 调用同一控制器，避免另建一套执行后端。
 - 把 React ref 从 command context 移出；命令返回结构化结果或 UI 意图。建立 `send / revise / interrupt / snapshot / subscribe / shutdown` 边界。
 - 新 UI 订阅真实状态，显示 pending/active 文本及任务停止原因；不中断 PM 时可以输入和发送追问。
 - 普通提问、目标变更、恢复分别验证。目标修订后旧请求与旧工具必须被阻断；退出 UI 的行为必须显式区分“断开界面”和“停止任务”。
 - 门槛：同一个真实 PM 在执行中响应追问；连续多次变更不漏取消；后台事件与弹层不吞字；不绕过预算/日志/隔离/验收。
+
+本阶段实施与验证见 [共享 SessionController](native-session-controller.md)。Native 通过 `--ui=native` 启用；默认界面、完整配置和独立进程附着尚未切换。
 
 ### 3. 完整迁移交互工作流
 

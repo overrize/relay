@@ -583,7 +583,7 @@ function reduce(p: Projection, e: Entry) {
     if (!s.goal && !e.data.parent) s.goal = e.data.goal ?? "";
   }
   if (e.kind === "requirement.changed") {
-    s.revision = e.revision; s.goal = e.data.text; s.todos = []; s.decisions = [];
+    s.revision = e.revision; s.goal = e.data.text; if(!e.data.preserveProgress){s.todos = []; s.decisions = [];}
     for (const a of Object.values(p.agents)) if (a.conversation === e.conversation) {
       if (a.parent && (a.status === "running" || a.status === "interrupted")) { a.status = "superseded"; a.outcome = { seq: e.seq, reason: "requirement-superseded", summary: a.outcome?.summary ?? "", evidence: a.outcome?.evidence ?? [], remaining: (a.todos ?? []).filter((t) => t.state !== "done").map((t) => t.text), artifacts: a.outcome?.artifacts ?? [], lastError: a.lastError }; }
       else if (!a.parent) { a.revision = e.revision; a.status = "running"; a.goal = s.goal; }

@@ -14,7 +14,7 @@ import * as crypto from "node:crypto";
 import { HttpConvAgent } from "../adapters/httpAgent.js";
 import type { ProcessManager } from "../pm/ProcessManager.js";
 import type { TuiEvent } from "../protocol.js";
-import type { LeaderOpts } from "./AgentRuntime.js";
+import type { LeaderOpts } from "./SessionTypes.js";
 import {
   applyEvent, ensureAgent, getState, selectAgent, userMessage,
   updateAgentInfo, markPendingInput, resumeAgent, abortAgent, setPendingRating,
@@ -768,6 +768,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
       initMsg = opts.goal ?? "等待用户指令";
     }
   }
+  if(opts.deferInitial)return;
   if (opts.resumedMemoryId) a.resumeSession();
   else if (isRoot) a.receiveUserInput(initMsg, opts.inputId);
   else a.sendCommand({ type: "user.message", text: initMsg });

@@ -95,6 +95,7 @@ export class HttpConvAgent extends EventEmitter {
   private _activeInputId?: string;
   private _sessionOutput?: number;
   private _communicationOnly = false;
+  private _queryOnly = false;
   private _subscriptionBudgetStopped = false;
   private _compiled?: ReturnType<typeof compileSessionContext>;
   private readonly _workspaceRoot = process.cwd();
@@ -187,7 +188,7 @@ export class HttpConvAgent extends EventEmitter {
     if (event === "event" && args.length === 1) {
       const type = (args[0] as TuiEvent).type;
       if (this._communicationOnly && !["message", "agent.state", "token.usage", "agent.error"].includes(type)) {
-        if (type === "tool.call" || type === "spawn") super.emit("event", { v: 1, type: "message", agent: this.cfg.id, to: "user", text: "执行预算已耗尽，当前仅保留沟通。/budget 查看；/budget add 显式增加额度。", session_revision: this._activeRevision });
+        if (type === "tool.call" || type === "spawn") super.emit("event", { v: 1, type: "message", agent: this.cfg.id, to: "user", text: this._queryOnly?'本条输入仅用于沟通，不执行工具；/revise 明确变更目标，/continue 继续当前任务。':"执行预算已耗尽，当前仅保留沟通。/budget 查看；/budget add 显式增加额度。", session_revision: this._activeRevision });
         return false;
       }
       if (this.cfg.sessionManaged) {
@@ -289,10 +290,10 @@ export class HttpConvAgent extends EventEmitter {
     return budgetHistory(messages, maxTokens);
   }
 
-  receiveUserInput(text: string, inputId?: string): void {
+  receiveUserInput(text: string, inputId?: string,kind?:'change'|'query'|'continue'|'constraint'): void {
     if (!text.trim()) return;
     if (!this.cfg.sessionManaged) { this._enqueue(text); return; }
-    const input = acceptSessionInput(this.cfg.id, text, inputId);
+    const input = acceptSessionInput(this.cfg.id, text, inputId,kind);
     if (input.status === "done" || input.status === "superseded") return;
     if (this._activeInputId === input.id || this._queue.some((item) => item.inputId === input.id)) return;
     this._enqueue(input.text, input.id, input.revision);
@@ -479,7 +480,8 @@ export class HttpConvAgent extends EventEmitter {
             bound = this.cfg.providerCfg.transport === "codex-cli" ? codexInputBound(this._compiled.system ?? "",this._trimmedHistory()) : Buffer.byteLength(JSON.stringify(this._compiled), "utf8") + 2048;
           }
           permit = reserveSessionRequest(this.cfg.id, bound, this.cfg.providerCfg.maxTokens ?? resolveMaxTokens(this.cfg.role, this.cfg.depth), !!input && input.kind === "query", this.cfg.providerCfg);
-          this._sessionOutput = permit?.maxOutput; this._communicationOnly = compact || (permit?.communicationOnly ?? false);
+          this._sessionOutput = permit?.maxOutput; this._communicationOnly = (!!input&&input.kind==='query') || compact || (permit?.communicationOnly ?? false);
+          this._queryOnly=!!input&&input.kind==='query'&&!compact&&!permit?.communicationOnly;
         }
         const pc = this.cfg.providerCfg;
         if (this.cfg.sessionManaged) { const j = sessionJournal(), b = j.binding(this.cfg.id)!; j.append("model.selected",b.conversation,this.cfg.id,b.revision,{event:"model.selected",profile:this.cfg.routingProfile,model:pc.model,provider:pc.provider,transport:pc.transport??"http",billing:pc.billing?.mode??"api",candidate:this.cfg.modelCandidates?.[this._routeIndex]?.name}); }

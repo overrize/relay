@@ -13,7 +13,7 @@ import * as crypto from "node:crypto";
 import { HttpConvAgent } from "../adapters/httpAgent.js";
 import type { ProcessManager } from "../pm/ProcessManager.js";
 import type { TuiEvent } from "../protocol.js";
-import type { LeaderOpts } from "./AgentRuntime.js";
+import type { LeaderOpts } from "./SessionTypes.js";
 import {
   applyEvent, ensureAgent, getState, selectAgent, userMessage,
   updateAgentInfo, markPendingInput, resumeAgent, abortAgent, setPendingRating,

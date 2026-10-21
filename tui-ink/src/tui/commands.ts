@@ -23,14 +23,13 @@ import { budgetReport, addSessionBudget } from "../session/Budget.js";
 
 import path from "node:path";
 import fs from "node:fs";
-import type { MutableRefObject } from "react";
 
 import type { TuiEvent, LogLevel } from "../protocol.js";
 import type { HttpConvAgent } from "../adapters/httpAgent.js";
 import type { ProcessManager } from "../pm/ProcessManager.js";
 import type { TaskScheduler } from "../runtime/TaskScheduler.js";
 import type { SecretaryProxy } from "../memory/SecretaryProxy.js";
-import type { LeaderOpts } from "../runtime/AgentRuntime.js";
+import type { LeaderOpts } from "../runtime/SessionTypes.js";
 import { EFFORT_LEVELS, type Effort, PALETTES } from "../ui.js";
 import type { PaletteName } from "../config.js";
 import { applyEvent, getState, selectAgent, setMinLevel, setTokenBudget, clearPendingRating, pruneAgents } from "../store.js";
@@ -59,7 +58,10 @@ export interface CommandCtx {
   killedAgents: Set<string>;
   startLeaderAgent: (opts: LeaderOpts) => void;
   startWorker: (ev: Extract<TuiEvent, { type: "spawn" }>, opts?: { resumedMemoryId?: string; firstMessage?: string }) => void;
-  pmStarted: MutableRefObject<boolean>;
+  resumeSession?:()=>void;
+  reviseSession?:(goal:string)=>void;
+  continueSession?:()=>void;
+  interruptSession?:()=>void;
   confirmEffort: (e: Effort) => void;
   requestExit: () => void;
   setEffortSelecting: (v: boolean) => void;
@@ -100,7 +102,7 @@ function fmtKIndex(n: number): string {
 export function buildCommands(ctx: CommandCtx): CmdDef[] {
   const {
     agents, secretaries, pm, scheduledTasks, killedAgents,
-    startLeaderAgent, startWorker, pmStarted,
+    startLeaderAgent, startWorker, resumeSession,
     confirmEffort, requestExit, setEffortSelecting, setModelSelecting,
     setPaletteName, setZenMode, setStatusMode,
     showModelConfig, switchModelCommand, registerModelCommand,
@@ -111,13 +113,15 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
   const feishuSessions = { size: feishuSessionCount() };
   const __dirname = path.dirname(new URL(import.meta.url).pathname);
   const COMMANDS: CmdDef[] = [
+    {name:'revise',desc:'/revise <目标> — 变更当前目标并取消旧任务',handler:args=>{if(!args.length){emitCommandMessage('用法：/revise 新目标');return;}ctx.reviseSession?.(args.join(' '));}},
+    {name:'continue',desc:'/continue — 明确继续当前目标',handler:()=>ctx.continueSession?.()},
     {name:"agents",desc:`/agents — Agent 列表（${keyHint('app.agents.toggle')}）`,handler:()=>ctx.setViewMode?.("agents")},
     {name:"chat",desc:"/chat — 返回会话",handler:()=>ctx.setViewMode?.("chat")},
     {name:"logs",desc:"/logs — 调试日志",handler:()=>ctx.setViewMode?.("logs")},
     {name:"plan",desc:"/plan — 展开或收起计划",handler:()=>ctx.togglePlan?.()},
     {name:"strategy",desc:"/strategy — 分工策略，独立于模型推理强度",handler:()=>setEffortSelecting(true)},
     {name:"login",desc:"/login — 选择供应商、订阅或 API Key，再配置模型和用途",handler:(args)=>{if(args.length){emitCommandMessage("请使用 /login 打开安全接入向导；不要把 API Key 写入命令参数。");return;}ctx.startLogin?.();}},
-    { name: "pause",   desc: "kill the selected agent",     handler: () => { const sel = getState().selectedAgent; agents.get(sel)?.kill(); if (sessionJournal().binding(sel)?.parent) { killedAgents.add(sel); recordTaskCancellation(sel, "TUI pause"); } } },
+    { name: "pause",   desc: "stop the selected agent",     handler: () => { const sel = getState().selectedAgent;if(sel==='pm'&&ctx.interruptSession){ctx.interruptSession();return;} agents.get(sel)?.kill(); if (sessionJournal().binding(sel)?.parent) { killedAgents.add(sel); recordTaskCancellation(sel, "TUI pause"); } } },
     { name: "effort",  desc: "/effort [min|mid|high|max] — 旧分工策略命令；请使用 /strategy", handler: (args) => {
       const lvl = args[0] as Effort | undefined;
       if (lvl && (EFFORT_LEVELS as readonly string[]).includes(lvl)) {
@@ -391,6 +395,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
     } },
     { name: "resume",  desc: "/resume [agentId|hash] — resume from memory", handler: (args) => {
       const input = args[0] ?? "pm";
+      if(input==="pm"&&resumeSession){resumeSession();return;}
       const mem = loadMemory(input) ?? loadMemoryByHash(input);
       if (!mem) {
         applyEvent({ v: 1, type: "message", agent: "pm", to: "user",
@@ -433,9 +438,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
           `**立刻输出 todo.set**，把上次已完成的项标为 done，把需要继续的项标为 todo/run，然后直接继续执行。不要等待确认，不要只说"收到"。`,
         ].join("\n");
         logDiag(`[resume] starting ${id} — firstMessage: "${resumeHint.slice(0, 200)}"\n`);
-        pmStarted.current = false;
         startLeaderAgent({ id, firstMessage: resumeHint, resumedMemoryId: id, promptFile: isRootAgent ? "pm" : "leader" });
-        pmStarted.current = true;
       } else if (mem.agent_type === "LEADER") {
         const parentId = mem.parent_chain[mem.parent_chain.length - 1] ?? "pm";
         const spawnEv: Extract<TuiEvent, { type: "spawn" }> = {

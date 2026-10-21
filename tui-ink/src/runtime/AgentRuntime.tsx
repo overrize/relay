@@ -1,7 +1,6 @@
-#!/usr/bin/env node
+import {useStore} from "../tui/useStore.js";
 import {ShortcutInput} from "../tui/ShortcutInput.js";
 import {submitInput} from '../tui/submitInput.js';
-import {registerRuntimeOwner} from '../session/RuntimeOwner.js';
 import {HistorySearch} from "../tui/HistorySearch.js";
 import {rememberPrompt,searchPrompts} from "../tui/PromptHistory.js";
 import {selectSessionModel} from "../config.js";
@@ -56,7 +55,7 @@ import {
   DagView, VDivider, PaletteContext, PALETTES,
 } from "../ui.js";
 import {
-  applyEvent, ensureAgent, getState, selectAgent, useStore, userMessage,
+  applyEvent, ensureAgent, getState, selectAgent,  userMessage,
   approve, reject, abortAgent, setLayout, scrollBy, scrollAgentBy, setMinLevel, setEffort,
   resumeAgent, updateAgentInfo, clearDoneAgents, markPendingInput, pruneAgents, setTokenBudget,
   selectAgentVisible,
@@ -110,177 +109,10 @@ import { config as dotenvConfig } from "dotenv";
 // Load .env so FEISHU_APP_ID / FEISHU_APP_SECRET are available even without shell export
 dotenvConfig();
 
-// ── 路径 ───────────────────────────────────────────────────────────────────
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const argv = process.argv.slice(2);
-const flag = (k: string) => argv.find((a) => a.startsWith(`--${k}`));
-const DEMO = !!flag("demo");
-const requestedMode = flag("mode")?.split("=")[1];
-if (requestedMode) process.env.SPAWN_ORCHESTRATION = requestedMode;
-const MODEL = flag("model")?.split("=")[1] ?? "claude-sonnet-4-5";
-const PROMPTS_DIR = path.resolve(__dirname, "..", "..",
-  flag("prompts")?.split("=")[1] ?? "../prompts");
-
-
-// ── 拼系统 prompt ──────────────────────────────────────────────────────────
-function buildSystemPrompt(
-  role: "Leader" | "Secretary" | "Worker",
-  agentId: string,
-  goal?: string,
-  resumedMemoryId?: string,
-  promptFile?: string, // override default: "pm", "leader", "worker", etc.
-): string {
-  const base = readIfExists(path.join(PROMPTS_DIR, "_base.md"));
-  const requestedPrompt = promptFile ?? role.toLowerCase();
-  const actualPrompt = requestedPrompt === "pm" && pm.getMode() !== "hierarchical" ? "pm-adaptive" : requestedPrompt;
-  const rolePrompt = readIfExists(path.join(PROMPTS_DIR, `${actualPrompt}.md`));
-  let tpl = `${base}\n\n---\n\n${rolePrompt}`;
-
-  // S3: inject RESUMED CONTEXT when resuming from memory (6c → MemoryRuntime)
-  // Live, fork and resumed requests use the same session context compiler.
-
-  const cfg = loadConfig();
-  const leaderCfg = getAgentProviderConfig(cfg, "leader");
-  const workerCfg = getAgentProviderConfig(cfg, "worker");
-  const secretaryCfg = getAgentProviderConfig(cfg, "secretary");
-  return tpl
-    .replace(/\{\{ORCHESTRATION_MODE\}\}/g, pm.getMode())
-    .replace(/\{\{AGENT_ID\}\}/g, agentId)
-    .replace(/\{\{ROLE\}\}/g, role)
-    .replace(/\{\{GOAL\}\}/g, goal ?? "(无，等用户指令)")
-    .replace(/\{\{ALLOWED_TOOLS\}\}/g, buildToolSchemaBlock(role as AgentRole))
-    .replace(/\{\{PARENT_ID\}\}/g, "—")
-    .replace(/\{\{CWD\}\}/g, process.cwd())
-    .replace(/\{\{AGENT_LIST\}\}/g, Array.from(agents.keys()).join(", ") || "(仅你自己)")
-    .replace(/\{\{WORKER_MODEL\}\}/g, workerCfg.model)
-    .replace(/\{\{LEADER_MODEL\}\}/g, leaderCfg.model)
-    .replace(/\{\{SECRETARY_MODEL\}\}/g, secretaryCfg.model);
-}
-function readIfExists(p: string): string {
-  try { return fs.readFileSync(p, "utf8"); } catch { return `(missing: ${p})`; }
-}
-
-// ── 全局单例 ───────────────────────────────────────────────────────────────
-const runtimeContext = createRuntimeContext();
-const { agents, secretaries, pm, scheduledTasks, killedAgents, feishuBusy, pmPendingArtifacts, leaderApprovalQueue } = runtimeContext;
-// 6e: inject runtime deps into FeishuBridge (startLeaderAgent is hoisted, safe to reference).
-configureFeishuBridge({ agents, feishuBusy, killedAgents, pm, pmPendingArtifacts, startLeaderAgent });
-// 6e: inject runtime deps into AgentHandlers (buildSystemPrompt/killAgent are hoisted).
-configureAgentHandlers({ agents, killedAgents, pm, feishuBusy, secretaries, pmPendingArtifacts, leaderApprovalQueue, buildSystemPrompt, killAgent, MODEL, DEMO });
-// Start HTTP REST API server (configurable via .env or default port 3001)
-const serverPort = parseInt(process.env.SERVER_PORT ?? "3001", 10);
-const serverEnabled = process.env.SERVER_ENABLED !== "false";
-startHttpServer({ port: serverPort, enabled: serverEnabled, onMessage: (text, inputId) => {
-  const root = agents.get("pm");
-  if (root) root.receiveUserInput(text, inputId);
-  else {
-    ensureAgent({ id: "pm", name: "pm", role: "Leader", state: "idle" });
-    startLeaderAgent({ id: "pm", firstMessage: text, inputId, promptFile: "pm" });
-  }
-} });
-// Feishu-only module state moved to FeishuBridge.ts (6e).
-
-// Agents that were explicitly killed by the user (ESC) or by a parent agent.kill event.
-// Used to suppress child→parent notifications after a kill so the parent isn't restarted.
-
-// Artifact files reported by TL children (message.to=parent or unit.handup) that PM
-// must inject as full document content before its next onTurnEnd flush.
-// Keyed by PM agent ID; values are absolute file paths to read.
-
-// Destructive Bash commands from workers are routed to leader for approval instead
-// of asking the user directly. Keyed by tool.call id.
-// PM 事件转发到 TUI
-pm.on("event", (ev: TuiEvent) => applyEvent(ev));
-pm.on("kill", (agentId: string) => {
-  agents.get(agentId)?.kill?.();
-  applyEvent({ v: 1, type: "agent.error", agent: agentId, code: "runtime_exceeded", detail: "PM killed: exceeded 60min hard limit" });
-});
-
-// dispatch.timeout_ms 软超时：PM 发纠正让 Worker 主动 handup，不直接 kill
-pm.on("timeout", (agentId: string) => {
-  const worker = agents.get(agentId);
-  if (worker instanceof HttpConvAgent) {
-    worker.sendCommand({
-      type: "user.message",
-      text: `[系统-超时] 你的 dispatch.timeout_ms 已到期。立刻输出 unit.handup（说明已完成的工作和未完成原因），然后 agent.done(success:false, reason:"timeout")。不要继续当前任务。`,
-    });
-  }
-});
-
-// 通信矩阵检查 moved to OrchestratorRuntime (6d); called with { getState, applyEvent, pm }.
-
-
-// ── 找离 childId 最近的 Leader 祖先，用于 Bash 审批路由 ──────────────────────
-// findApproverLeader moved to ToolRuntime (6b); called with { agents, getState }.
-
-// ── 通用 Leader 启动函数（PM depth=0 和 Tech Lead depth≥1 共用）────────────
-export interface LeaderOpts {
-  id: string;
-  parentId?: string;
-  goal?: string;
-  model?: string;
-  depth?: number;
-  parentChain?: string[];
-  dispatch?: Extract<TuiEvent, { type: "spawn" }>["dispatch"];
-  resumedMemoryId?: string;
-  promptFile?: string;      // "pm" for root, "leader" for tech leads
-  firstMessage?: string;    // override initial LLM message (used when PM first starts)
-  replyHook?: (text: string, format?: "text" | "document", meta?: { _fallback?: boolean; agentId?: string }) => void; // called when message.to=user (Feishu bridge)
-  turnEndHook?: () => void;            // called when Feishu PM turn ends — flushes aggregator
-  conversationMode?: boolean;          // if true: stop after each user reply, no auto-nudge
-  // Phase B: forked task options
-  sharedSystemPrompt?: string;         // exact system prompt from base PM (enables cache reuse)
-  initialMessages?: Array<{ role: "user" | "assistant"; content: string }>; // history snapshot
-  inputId?: string;
-  isForkedTask?: boolean;              // concurrent task with its own persisted secretary
-}
-
-function killAgent(id: string, _reason = "interrupted"): void {
-  for (const child of getState().agents.values()) {
-    if (child.parent === id && child.state !== "done" && child.state !== "err" && !killedAgents.has(child.id)) killAgent(child.id, _reason);
-  }
-  killedAgents.add(id);
-  agents.get(id)?.kill?.(); // clears queue, pops unresponded user msg, aborts HTTP
-  abortAgent(id);           // clears pending approvals in store
-  pm.cancelForeground(id);
-  for (const [toolId, pending] of leaderApprovalQueue) {
-    if (pending.workerChildId === id) leaderApprovalQueue.delete(toolId);
-  }
-  if (getState().agents.get(id)?.parent) {
-    applyEvent({ v: 1, type: "agent.error", agent: id, code: "cancelled", detail: _reason });
-    recordTaskCancellation(id, _reason);
-  }
-  if (getState().agents.get(id)?.parent) globalBus.unregisterAgent(id);
-  // Release feishu serial lock so the next message for this PM isn't queued forever.
-  feishuBusy.delete(id);
-  // Phase B: remove from fork tracking so capacity count stays correct.
-  for (const pmIds of feishuForks.values()) {
-    if (pmIds.has(id)) { pmIds.delete(id); break; }
-  }
-  // Do NOT set state:err — httpAgent emits state:idle after AbortError,
-  // which returns the agent to ready state so the user can resend immediately.
-}
-
-async function shutdownRuntime(): Promise<void> {
-  cancelExternalEditor();
-  stopTaskRecovery();
-  for (const [id, agent] of agents) { killedAgents.add(id); agent.kill(); }
-  for (const secretary of secretaries.values()) secretary.destroy();
-  pm.destroy();
-  await cancelAllAgentTools();
-  await waitTaskResolution();
-  stopTaskRecovery();
-  await waitForIndexing();
-  releaseRuntimeOwners();
-}
-
-// replaceAgentForResume moved to OrchestratorRuntime (6d); called with { agents, secretaries, killedAgents }.
-
-// ── 飞书桥接 ──────────────────────────────────────────────────────────────
-// connectFeishu + all feishu* state moved to FeishuBridge.ts (6e).
-
-// startLeaderAgent + startWorker moved to AgentHandlers.ts (6e).
-// runDemo + runTestSuite + HEADLESS_SUITES moved to DevHarness.ts (6e)
+export type {LeaderOpts} from './SessionTypes.js';
+import {runtimeContext,agents,secretaries,pm,scheduledTasks,killedAgents,feishuBusy,pmPendingArtifacts,leaderApprovalQueue,flag,DEMO,MODEL,PROMPTS_DIR,buildSystemPrompt,killAgent} from './SessionRuntime.js';
+import {sessionController} from './SessionController.js';
+sessionController.start({http:true});
 
 // ── App ─────────────────────────────────────────────────────────────────────
 
@@ -524,7 +356,7 @@ function App() {
   useEffect(()=>{if(startupKeysError)emitCommandMessage(`快捷键配置未加载：${startupKeysError}；使用默认快捷键。`);},[]);
   const COMMANDS = buildCommands({
     agents, secretaries, pm, scheduledTasks, killedAgents,
-    startLeaderAgent, startWorker, pmStarted,
+    startLeaderAgent, startWorker, resumeSession:()=>sessionController.resume(),reviseSession:goal=>sessionController.revise(goal),continueSession:()=>sessionController.continue(),interruptSession:()=>sessionController.interrupt(),
     confirmEffort: (e) => confirmEffort(e),
     requestExit: () => requestExit(),
     setEffortSelecting, setModelSelecting, setPaletteName, setZenMode, setStatusMode,
@@ -600,41 +432,11 @@ function App() {
     // Route to the PM — the conversation entry point — instead of dropping it.
     if (target !== "pm" && !agents.get(target)) { target = "pm"; selectAgent("pm"); }
 
-    if (target === "pm" && !pmStarted.current) {
-      // Reject before optimistic UI acceptance or changing PM-started state.
-      registerRuntimeOwner();
-      const existing = agents.get("pm");
-      if (existing) existing.receiveUserInput(body);
-      else startLeaderAgent({ id: "pm", firstMessage: body, promptFile: "pm" });
-      if(!agents.has('pm'))return false;
-      userMessage("pm", body);
-      pmStarted.current = true;
-      return;
-    }
+    if(target==='pm'&&/^\/(?:revise|goal)\s+/.test(body))sessionController.revise(body.replace(/^\/\w+\s+/,''));
+    else if(target==='pm'&&body==='/resume')sessionController.resume();
+    else sessionController.send(body,{target});
+    pmStarted.current=agents.has('pm');
 
-    // New PM message: clear done agents and any pending rating from the previous task.
-    if (target === "pm") { clearDoneAgents(); clearPendingRating(); }
-    const a = agents.get(target);
-    if (!a) {
-      // Should be unreachable after the reroute above; never drop silently.
-      applyEvent({ v: 1, type: "message", agent: "pm", to: "user",
-        text: `⚠ 无法送达 "${target}"（该 agent 无活动实例）。已选中 pm，请重发。` });
-      selectAgent("pm");
-      return false;
-    }
-
-    // Mark pending so the UI shows activity even if the agent is busy and
-    // queues the message. Cleared automatically when agent.state:run fires.
-    markPendingInput(target);
-
-    // If user re-engages a killed agent, clear its killed status so dead-parent
-    // guards don't block any child agents it spawns next.
-    killedAgents.delete(target);
-
-    // HttpConvAgent has its own internal _queue and drains one message per turn,
-    // so we always call sendCommand immediately — no React-level blocking needed.
-    a.receiveUserInput(body);
-    userMessage(target, body);
   },notice=>emitCommandMessage(notice+' 输入草稿已保留，可继续编辑。'));
 
   useEffect(() => {
@@ -667,7 +469,7 @@ function App() {
       if (!sessionJournal().isCurrent(resumeId)) throw new Error("Cannot resume an obsolete task; resume its PM instead");
       pmStarted.current = resumeId === "pm";
       ensureAgent({ id: resumeId, name: resumeId, role: "Leader", state: "idle" });
-      startLeaderAgent({ id: resumeId, resumedMemoryId: resumeId, promptFile: "pm" });
+      sessionController.resume();
     }
     const pmMem = loadMemory("pm");
     if (pmMem && pmMem.tombstone?.final_status === null && !pmStarted.current) {
@@ -741,7 +543,7 @@ function App() {
     const selId = getState().selectedAgent;
     const selState = getState().agents.get(selId)?.state;
     if (selState === "run" || selState === "idle") {
-      killAgent(selId);
+      if(selId==="pm")sessionController.interrupt();else killAgent(selId);
       applyEvent({ v: 1, type: "message", agent: selId, to: "user",
         text: `⏹ interrupted — edit your message above and resend` });
       // Load the last user message back into the input box, just like Claude Code:
@@ -758,8 +560,9 @@ function App() {
     if (now - lastExitRequestAt.current < 120) return;
     lastExitRequestAt.current = now;
     if (exitConfirm||immediate) {
+      cancelExternalEditor();
       if (exitConfirmTimer.current) clearInterval(exitConfirmTimer.current);
-      void shutdownRuntime().finally(() => {
+      void sessionController.shutdown().finally(() => {
         exit();
         writeTermSync(TERM_RESET);
         process.exit(0);
@@ -1270,7 +1073,7 @@ function restoreTerminalForExit(): void {
   writeTermSync(buildExitRestoreSequence(process.stdout.rows ?? 24));
 }
 process.on("exit", restoreTerminalForExit);
-process.on("SIGTERM", () => { writeTermSync(TERM_RESET); void shutdownRuntime().finally(() => process.exit(143)); });
+process.on("SIGTERM", () => { cancelExternalEditor();writeTermSync(TERM_RESET); void sessionController.shutdown().finally(() => process.exit(143)); });
 
 let requestExitFromSignal: (() => void) | null = null;
 let cancelLoginFromSignal:(()=>void)|null=null;

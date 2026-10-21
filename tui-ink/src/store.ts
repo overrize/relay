@@ -3,7 +3,6 @@ import { observeMemoryEvent } from "./runtime/MemoryEvents.js";
 // Store — 单一可变状态。Ink 组件用 useStore() 订阅。
 // 手动 subscribe + useState,避免 useSyncExternalStore 与 Ink React 的兼容问题。
 
-import { useEffect, useState } from "react";
 import type {
   AgentInfo, Message, TodoItem, TuiEvent, Session, LogLevel,
 } from "./protocol.js";
@@ -94,11 +93,6 @@ export function subscribe(fn: () => void) {
 /** 在非 React 上下文(事件回调、命令分派)读取当前状态。 */
 export function getState(): State { return state; }
 
-export function useStore<T>(sel: (s: State) => T): T {
-  const [val, setVal] = useState<T>(() => sel(state));
-  useEffect(() => subscribe(() => setVal(sel(state))), []);
-  return val;
-}
 
 let mid = 0;
 const newMid = () => `m${++mid}`;

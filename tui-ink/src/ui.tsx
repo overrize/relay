@@ -1,3 +1,4 @@
+import {useStore} from "./tui/useStore.js";
 import {uiPreferences,toggleFavorite,PRODUCT_NAME} from "./tui/interaction.js";
 // V1 三栏 inbox 的 Ink 移植。
 // agents | conversation (+todo sidebar) | input + status bar
@@ -13,7 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { execSync } from "node:child_process";
-import { useStore, approve, reject, switchSession, getSessionTokens, setScrollOffset } from "./store.js";
+import {  approve, reject, switchSession, getSessionTokens, setScrollOffset } from "./store.js";
 import { setCursorAnchor, getCursorAnchorSequence } from "./runtime/CursorAnchor.js";
 import type {
   AgentInfo, Message, TodoItem, AgentRunState,

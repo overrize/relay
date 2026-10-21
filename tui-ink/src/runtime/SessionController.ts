@@ -1,0 +1,71 @@
+import {randomUUID} from 'node:crypto';
+import {agents,secretaries,killedAgents,killAgent,shutdownRuntime} from './SessionRuntime.js';
+import {startLeaderAgent} from './AgentHandlers.js';
+import {replaceAgentForResume} from './OrchestratorRuntime.js';
+import {getState,subscribe,ensureAgent,userMessage,applyEvent,markPendingInput} from '../store.js';
+import {sessionJournal} from '../session/Journal.js';
+import {registerRuntimeOwner} from '../session/RuntimeOwner.js';
+import {startHttpServer} from '../server/httpServer.js';
+import type {Server} from 'node:http';
+import {loadConfig,getAgentProviderConfig} from '../config.js';
+import {resolveModelRoute} from '../models/routing.js';
+import {budgetReport} from '../session/Budget.js';
+import {workItems} from '../session/Tasks.js';
+import {interruptSession} from '../session/Control.js';
+import {waitForIndexing} from '../session/SearchIndex.js';
+
+export class SessionController {
+ private started=false;private stopping?:Promise<void>;private server?:Server;private root=process.cwd();private communicationAttach=false;
+ private model(){const cfg=loadConfig();try{return agents.get('pm')?.cfg.providerCfg.model??resolveModelRoute(cfg,'leader','pm').candidates[0]!.config.model;}catch{return getAgentProviderConfig(cfg,'leader').model;}}
+ start(options:{http?:boolean}={}){
+  if(this.started)return;registerRuntimeOwner(this.root);this.started=true;
+  ensureAgent({id:'pm',name:'pm',role:'Leader',state:'idle',model:this.model()});
+  if(options.http){
+   this.server=startHttpServer({enabled:process.env.SERVER_ENABLED!=='false',port:Number(process.env.SERVER_PORT??3001),onMessage:(text,id)=>{this.send(text,{inputId:id,echo:false});}})??undefined;
+   this.server?.on('error',()=>applyEvent({v:1,type:'message',agent:'pm',to:'user',text:'HTTP 服务未启动，请检查端口占用；本地会话可继续，/detach 暂不可用。'}));
+  }
+ }
+ private ready(){if(!this.started||this.stopping)throw new Error('SESSION_NOT_RUNNING');if(process.cwd()!==this.root)throw new Error('SESSION_WORKSPACE_CHANGED');}
+ send(text:string,options:{target?:string;inputId?:string;echo?:boolean;kind?:'query'|'change'|'continue'|'constraint'}={}){
+  this.ready();if(!text.trim())throw new Error('EMPTY_INPUT');const id=options.inputId??randomUUID(),target=options.target??'pm';
+  if(target==='pm'&&!agents.has('pm')){
+   killedAgents.delete('pm');
+   const existed=sessionJournal().binding('pm');
+   if(existed){startLeaderAgent({id:'pm',resumedMemoryId:'pm',promptFile:'pm',deferInitial:true});this.communicationAttach=true;}
+   else startLeaderAgent({id:'pm',firstMessage:text,inputId:id,promptFile:'pm'});
+   if(!agents.has('pm'))throw new Error('SESSION_START_REJECTED');
+   if(!existed){if(options.echo!==false)userMessage(target,text);return id;}
+  }
+  const agent=agents.get(target);if(!agent)throw new Error('SESSION_AGENT_NOT_AVAILABLE');
+  killedAgents.delete(target);
+  const journal=sessionJournal(),prior=journal.current(target)?.inputs.some(i=>i.id===id);
+  const directive=/^\/(revise|goal|constraint)\s/i.exec(text),kind=options.kind??(directive?(directive[1]!.toLowerCase()==='constraint'?'constraint':'change'):/^(继续|接着做|continue|resume)[。！!\s]*$/i.test(text.trim())?'continue':'query');
+  agent.receiveUserInput(text,id,kind);markPendingInput(target);if(kind!=='query')this.communicationAttach=false;
+  if(options.echo!==false&&!prior)userMessage(target,text);return id;
+ }
+ revise(goal:string,inputId?:string){if(!goal.trim())throw new Error('EMPTY_GOAL');return this.send(goal,{inputId,kind:'change'});}
+ continue(){this.ready();if(this.communicationAttach||(!agents.has('pm')&&sessionJournal().binding('pm')))return this.resume();return this.send('继续',{kind:'continue'});}
+ detach(){this.ready();if(!this.server?.listening)throw new Error('DETACH_REQUIRES_HTTP');this.server.ref();return {pid:process.pid,address:this.server.address()};}
+ resume(){
+  this.ready();const j=sessionJournal();if(!j.binding('pm'))throw new Error('SESSION_NOT_FOUND');
+  if(agents.has('pm')){
+   if(!killedAgents.has('pm')&&!this.communicationAttach)throw new Error('会话已连接；用 /continue 继续，或 /interrupt 后再 /resume。');
+   replaceAgentForResume('pm',{agents,secretaries,killedAgents});
+  }
+  startLeaderAgent({id:'pm',resumedMemoryId:'pm',promptFile:'pm'});
+  this.communicationAttach=false;
+  if(!agents.has('pm'))throw new Error('SESSION_RESUME_REJECTED');
+ }
+ interrupt(){
+  this.ready();interruptSession('pm');
+  killAgent('pm','user interrupted');applyEvent({v:1,type:'message',agent:'pm',to:'user',text:'执行已停止；/resume 恢复前会核对当前状态，/revise 设置新目标。'});
+ }
+ snapshot(){
+  this.ready();const j=sessionJournal(),current=j.current('pm'),state=getState();
+  const activeTools=Object.entries(current?.tools??{}).filter(([,t])=>t.status==='pending'&&t.revision===current?.revision).map(([id,t])=>({id,agent:t.agent,name:t.name}));
+  return structuredClone({revision:current?.revision??0,goal:current?.goal??'',inputs:current?.inputs??[],activeTools,agents:[...state.agents.values()].map(a=>({...a,activity:activeTools.some(t=>t.agent===a.id)?'tool-running':killedAgents.has(a.id)?'stopped':a.state==='run'?'model-running':state.pendingInputAgents.has(a.id)?'queued':a.state})),messages:[...(state.messagesByAgent.get('pm')??[])].slice(-150),history:j.history('pm').slice(-20),tasks:workItems(),budget:budgetReport(),recoverable:!!j.binding('pm')&&(!agents.has('pm')||this.communicationAttach),model:this.model()});
+ }
+ subscribe(listener:(snapshot:ReturnType<SessionController['snapshot']>)=>void){this.ready();const deliver=()=>{if(!this.stopping)try{listener(this.snapshot());}catch{process.stderr.write('[session-ui] subscriber failed\n');}};const off=subscribe(deliver);deliver();return off;}
+ async shutdown(){if(this.stopping)return this.stopping;this.stopping=(async()=>{this.server?.closeAllConnections();if(this.server)await new Promise<void>(r=>this.server!.close(()=>r()));await shutdownRuntime();await waitForIndexing();})();return this.stopping;}
+}
+export const sessionController=new SessionController();
