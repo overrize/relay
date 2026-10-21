@@ -1,6 +1,7 @@
 import React,{useEffect,useRef,useState} from "react";
 import {Box,Text,useInput} from "ink";
 import TextInput from "ink-text-input";
+import {terminalPaste} from './TerminalPaste.js';
 import {LoginFlow} from "./loginFlow.js";
 import {officialSubscriptionLogin} from "../subscriptions/login.js";
 
@@ -8,6 +9,7 @@ export function LoginWizard({onDone,onCancel}:{onDone:(message:string)=>void;onC
   const [flow]=useState(()=>new LoginFlow()),[,render]=useState(0),[value,setValue]=useState(""),[selected,setSelected]=useState(0),[error,setError]=useState(""),[instructions,setInstructions]=useState(""),[search,setSearch]=useState(""),[loading,setLoading]=useState(false);
   const alive=useRef(true),abort=useRef<AbortController>();const view=flow.view();
   const searching=view.stage==="models"||view.stage==="provider";
+  useEffect(()=>{const paste=(text:string)=>{const clean=text.replace(/[\x00-\x1f\x7f]/g,'');if(searching){setSearch(v=>v+clean);setSelected(0);}else if(['key','endpoint','model','alias'].includes(view.stage))setValue(v=>v+clean);};terminalPaste.on('paste',paste);return()=>{terminalPaste.off('paste',paste);};},[view.stage,searching]);
   const indices=view.options.map((_,i)=>i).filter(i=>!searching||(view.stage==="models"&&i>=flow.catalog.models.length)||view.options[i]!.toLowerCase().includes(search.toLowerCase()));
   const selectedIndex=Math.min(selected,Math.max(0,indices.length-1)),start=Math.max(0,Math.min(selectedIndex-3,indices.length-7));
   const cancel=()=>{alive.current=false;abort.current?.abort();flow.dispose();setValue("");onCancel();};

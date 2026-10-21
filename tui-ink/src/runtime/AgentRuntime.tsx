@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 import {ShortcutInput} from "../tui/ShortcutInput.js";
+import {HistorySearch} from "../tui/HistorySearch.js";
+import {rememberPrompt,searchPrompts} from "../tui/PromptHistory.js";
+import {selectSessionModel} from "../config.js";
+import {editorLines} from '../tui/MultilineEditor.js';
+import {displayWidth} from '../ui.js';
 import {configuredModels,cycleModel,uiPreferences,nextReasoning} from "../tui/interaction.js";
 import {splitCommand} from "../tui/splitCommand.js";
 import {syncModelPrices} from "../session/PriceSync.js";
@@ -310,6 +315,8 @@ function App() {
   const lastExitRequestAt               = useRef(0);
   const lastInputFocusLog               = useRef("");
   const cmdHistory      = useRef<string[]>([]);
+  const [historySelecting,setHistorySelecting]=useState(false);
+  useEffect(()=>{try{cmdHistory.current=searchPrompts('',100).reverse().map(r=>r.text);}catch{/* Search shows a readable error if the history database is unavailable. */}},[]);
   const historyIdx      = useRef(-1);
   const browsingHistory = useRef(false);
   const completeTick    = useRef(0);
@@ -323,14 +330,14 @@ function App() {
   // Ctrl+T / Ctrl+L are intercepted at the stdin layer (so the input field
   // never sees the char); register the React state toggles here.
   useEffect(() => {
-    cancelLoginFromSignal=loginSelecting?()=>setLoginSelecting(false):modelSelecting?()=>setModelSelecting(false):effortSelecting?()=>setEffortSelecting(false):null;
+    cancelLoginFromSignal=historySelecting?()=>setHistorySelecting(false):loginSelecting?()=>setLoginSelecting(false):modelSelecting?()=>setModelSelecting(false):effortSelecting?()=>setEffortSelecting(false):null;
     return()=>{cancelLoginFromSignal=null;};
-  },[loginSelecting,modelSelecting,effortSelecting]);
+  },[loginSelecting,modelSelecting,effortSelecting,historySelecting]);
   useEffect(() => {
-    ctrlTHandler = () => {if(!loginSelecting&&!modelSelecting&&!effortSelecting)setShowThinking(v=>!v);};
-    ctrlLHandler = () => {if(!loginSelecting){setEffortSelecting(false);setModelSelecting(true);}};
+    ctrlTHandler = () => {if(!loginSelecting&&!modelSelecting&&!effortSelecting&&!historySelecting)setShowThinking(v=>!v);};
+    ctrlLHandler = () => {if(!loginSelecting&&!historySelecting){setEffortSelecting(false);setModelSelecting(true);}};
     return () => { ctrlTHandler = null; ctrlLHandler = null; };
-  }, [loginSelecting,modelSelecting,effortSelecting]);
+  }, [loginSelecting,modelSelecting,effortSelecting,historySelecting]);
 
   // ── 消息队列 (agent busy 时暂存输入) ─────────────────────────────────────
   const msgQueue = useRef(new Map<string, string[]>());
@@ -420,17 +427,20 @@ function App() {
     emitCommandMessage(`${role} 模型已切换: ${modelName} -> ${modelCfg.model} ✓`);
   };
 
-  const confirmModelChoice = (role: AgentConfigRole, model: string) => {
+  const confirmModelChoice = (role: AgentConfigRole, model: string, scope: "session" | "default" = "session") => {
     const cfg = loadConfig();
     const modelCfg = cfg.models[model];
-    if (!modelCfg || !saveAgentModel(role, model)) {
+    if (!modelCfg || !(scope === "default" ? saveAgentModel(role, model) : selectSessionModel(role, model))) {
       emitCommandMessage(`未知模型 "${model}"。先用 /connect 注册。`);
       setModelSelecting(false);
       return;
     }
+    const target = role === "leader" ? agents.get("pm") : role === selectedConfigRole() ? agents.get(getState().selectedAgent) : undefined;
+    if(target){const id=target.cfg.id;target.once('modelChanged',(model:string)=>updateAgentInfo(id,{model}));}
+    target?.selectModel({name:model,config:getAgentProviderConfig(loadConfig(),role)});
     if (role === "leader") refreshModelLabels();
     setModelSelecting(false);
-    emitCommandMessage(`${role} 默认用途 → ${modelCfg.model}；新启动/恢复生效，进行中任务保持原模型。`);
+    emitCommandMessage(`${role} → ${modelCfg.model}（${scope === "default" ? "已保存默认" : "仅本次使用，重启恢复默认"}）；当前角色后续请求和新任务生效，进行中的请求保持原模型。`);
   };
 
   const showWebConfig = () => {
@@ -530,6 +540,9 @@ function App() {
   const slashPaneRows = slashDisplay.length > 0
     ? 2 + slashVisible.length + (slashDisplay.length > SLASH_MAX_VISIBLE ? 1 : 0)
     : 0;
+  const editorLineCount=editorLines(input,Math.max(1,(process.stdout.columns??80)-9),displayWidth).length;
+  const editorMaxRows=Math.max(2,Math.min(8,Math.floor((process.stdout.rows??24)/3)));
+  const editorExtraRows=Math.min(editorMaxRows,editorLineCount)-1+(editorLineCount>editorMaxRows?1:0);
 
 
   const dispatchUser = (raw: string) => {
@@ -548,7 +561,7 @@ function App() {
     }
 
     let target = getState().selectedAgent;
-    const m = text.match(/^@(\S+)\s+(.+)$/);
+    const m = text.match(/^@(\S+)\s+(.+)$/s);
     let body = text;
     if (m) { target = m[1]!; body = m[2]!; selectAgent(target); }
 
@@ -645,118 +658,12 @@ function App() {
     }
   }, []);
 
-  // 鼠标滚轮 + 粘贴处理:
-  //   \x1b[?1000h\x1b[?1006h — SGR 鼠标上报
-  //   \x1b[?2004h            — bracketed paste mode
-  //
-  // Monkey-patch process.stdin.emit so escape sequences are consumed BEFORE
-  // Ink's input handler sees them (Ink would otherwise print them as garbage).
-  //
-  // Paste problem: in raw mode each \r/\n fires as Enter → only the last line
-  // survives. Bracketed paste wraps content in \x1b[200~...\x1b[201~; we
-  // collapse newlines to spaces. Long pastes can arrive in multiple chunks, so
-  // we accumulate with a stateful buffer rather than hoping for a single chunk.
-  //
-  // X10 mouse fallback: if the terminal downgrades from SGR (\x1b[<...M) to
-  // X10 format (\x1b[M + 3 raw bytes), strip those too.
+  // Paste and mouse framing are decoded once in ShortcutInput, before Ink.
   useEffect(() => {
     if (!isRawModeSupported) return;
     process.stdout.write("\x1b[?1000h\x1b[?1006h\x1b[?2004h");
-    const MOUSE_SGR_RE = /\x1b\[<(\d+);(\d+);\d+[Mm]/g; // groups: btn, col
-    // X10: \x1b[M + exactly 3 bytes (button, col, row — all offset by 32)
-    const MOUSE_X10_RE = /\x1b\[M[\x00-\xff]{3}/g;
-
-    // Stateful paste accumulator — handles paste split across data chunks
-    let inPaste = false;
-    let pasteBuf = "";
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const origEmit = (process.stdin as any).emit as (...a: unknown[]) => boolean;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (process.stdin as any).emit = function (event: string, ...args: unknown[]) {
-      if (event === "data") {
-        const chunk = args[0] as Buffer | string;
-        const raw = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-        const utf8 = raw.toString("utf8");
-        const bin  = raw.toString("binary"); // for ANSI escape matching
-
-        // ── Bracketed paste ───────────────────────────────────────────────
-        if (inPaste || utf8.includes("\x1b[200~")) {
-          if (!inPaste) {
-            // First chunk: skip past the opening marker
-            pasteBuf = utf8.slice(utf8.indexOf("\x1b[200~") + 6);
-            inPaste = true;
-          } else {
-            pasteBuf += utf8;
-          }
-          const endIdx = pasteBuf.indexOf("\x1b[201~");
-          if (endIdx !== -1) {
-            // End marker arrived — flush
-            const pasted = pasteBuf.slice(0, endIdx).replace(/[\r\n]+/g, " ").trimEnd();
-            inPaste = false;
-            pasteBuf = "";
-            if (!pasted) return false;
-            return origEmit.call(process.stdin, event, Buffer.from(pasted, "utf8"));
-          }
-          // End marker not yet seen — swallow this chunk and wait for more
-          return false;
-        }
-
-        // ── SGR mouse ─────────────────────────────────────────────────────
-        MOUSE_SGR_RE.lastIndex = 0;
-        let hasMouse = false;
-        let m: RegExpExecArray | null;
-        // AgentsPane occupies the leftmost ~22 columns (FIXED_COLS comment in ui.tsx)
-        const AGENT_PANE_COLS = 23;
-        while ((m = MOUSE_SGR_RE.exec(bin)) !== null) {
-          hasMouse = true;
-          const btn = m[1];
-          const col = parseInt(m[2] ?? "999", 10);
-          const isAgentPane = col <= AGENT_PANE_COLS;
-          if (btn === "64") {
-            // wheel up → scroll toward older/higher items
-            if (isAgentPane) {
-              const total = getState().agents.size;
-              const maxVis = Math.max(3, Math.floor(Math.max(6, (process.stdout.rows ?? 24) - 5) / 3));
-              scrollAgentBy(-1, total, maxVis);
-            } else {
-              scrollBy(3);
-            }
-          }
-          if (btn === "65") {
-            // wheel down → scroll toward newer/lower items
-            if (isAgentPane) {
-              const total = getState().agents.size;
-              const maxVis = Math.max(3, Math.floor(Math.max(6, (process.stdout.rows ?? 24) - 5) / 3));
-              scrollAgentBy(1, total, maxVis);
-            } else {
-              scrollBy(-3);
-            }
-          }
-        }
-        if (hasMouse) {
-          const filtered = bin.replace(/\x1b\[<\d+;\d+;\d+[Mm]/g, "");
-          if (!filtered) return false;
-          return origEmit.call(process.stdin, event, Buffer.from(filtered, "binary"));
-        }
-
-        // ── X10 mouse fallback ────────────────────────────────────────────
-        if (MOUSE_X10_RE.test(bin)) {
-          const filtered = bin.replace(MOUSE_X10_RE, "");
-          if (!filtered) return false;
-          return origEmit.call(process.stdin, event, Buffer.from(filtered, "binary"));
-        }
-      }
-      return origEmit.call(process.stdin, event, ...args);
-    };
-    return () => {
-      writeTermSync("\x1b[?1000l\x1b[?1006l\x1b[?2004l");
-      inPaste = false; pasteBuf = "";
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (process.stdin as any).emit = origEmit;
-    };
+    return () => writeTermSync("\x1b[?1000l\x1b[?1006l\x1b[?2004l");
   }, [isRawModeSupported]);
-
   const EFFORT_DESC_SHORT: Record<Effort, string> = {
     min:  "PM 优先自理，仅复杂多文件任务才 spawn TL",
     mid:  "默认平衡，对话/单文件自理，其余 spawn TL",
@@ -865,6 +772,8 @@ function App() {
   // 全局快捷键
   useEffect(()=>{
     controlKeyHandler=code=>{
+      if(code===0x12){if(!loginSelecting&&!modelSelecting&&!effortSelecting&&!selectedPending.length)setHistorySelecting(true);return;}
+      if(historySelecting)return;
       if(loginSelecting||modelSelecting||effortSelecting||selectedPending.length)return;
       if(code===0x04){if(!input)requestExit(true);return;}
       if(code===0x07){setViewMode(v=>v==="agents"?"chat":"agents");return;}
@@ -875,7 +784,7 @@ function App() {
   });
 
   useInput((char, key) => {
-    if(loginSelecting||modelSelecting||effortSelecting)return; // The active selector exclusively owns text, Tab and Esc.
+    if(loginSelecting||modelSelecting||effortSelecting||historySelecting)return; // The active selector exclusively owns text, Tab and Esc.
     if (key.ctrl && char === "c") { requestExit(); return; }
     if(key.ctrl&&char==="d"&&!input){requestExit(true);return;}
     if(!modelSelecting&&!effortSelecting&&selectedPending.length===0){
@@ -1028,7 +937,7 @@ function App() {
     }
 
     // 命令历史 — ↑ 回溯, ↓ 前进
-    if (key.upArrow && (input === "" || browsingHistory.current)) {
+    if (key.upArrow && (input === "" || browsingHistory.current && !input.includes('\n'))) {
       if (cmdHistory.current.length === 0) return;
       browsingHistory.current = true;
       const idx = Math.min(historyIdx.current + 1, cmdHistory.current.length - 1);
@@ -1036,7 +945,7 @@ function App() {
       setInput(cmdHistory.current[cmdHistory.current.length - 1 - idx]!);
       return;
     }
-    if (key.downArrow && browsingHistory.current) {
+    if (key.downArrow && browsingHistory.current && !input.includes('\n')) {
       if (historyIdx.current > 0) {
         historyIdx.current--;
         setInput(cmdHistory.current[cmdHistory.current.length - 1 - historyIdx.current]!);
@@ -1097,8 +1006,8 @@ function App() {
             </Box>
           ) : (
             <>
-              <Box paddingLeft={1}><Text dimColor>{getState().selectedAgent} · Ctrl+G agents · Ctrl+L model · Shift+Tab reasoning · Esc interrupt</Text></Box>
-              <ConvPane scrollOffset={scrollOffset} completionRows={slashPaneRows} showTools={showTools} showThinking={showThinking} />
+              <Box paddingLeft={1}><Text dimColor>{getState().selectedAgent} · Ctrl+L 模型 · Ctrl+R 历史 · Alt+Enter 换行 · Esc 中断</Text></Box>
+              <ConvPane scrollOffset={scrollOffset} completionRows={slashPaneRows+editorExtraRows} showTools={showTools} showThinking={showThinking} />
             </>
           )}
         </Box>
@@ -1122,7 +1031,9 @@ function App() {
             </Box>
           );
         })()}
-        {loginSelecting
+        {historySelecting
+          ? <HistorySearch onSelect={text=>{setInput(text);setDismissedSlash(null);setHistorySelecting(false);completeTick.current++;setViewMode("chat");}} onCancel={()=>setHistorySelecting(false)} />
+          : loginSelecting
           ? <LoginWizard onDone={message=>{setLoginSelecting(false);refreshModelLabels();emitCommandMessage(message);}} onCancel={()=>setLoginSelecting(false)} />
           : modelSelecting
           ? (() => {
@@ -1177,7 +1088,8 @@ function App() {
                 key={completeTick.current}
                 focused={selectedPending.length === 0}
                 value={input}
-                onChange={value=>{setDismissedSlash(null);setInput(value);}}
+                menuActive={slashDisplay.length>0}
+                onChange={value=>{setDismissedSlash(null);browsingHistory.current=false;historyIdx.current=-1;setInput(value);}}
                 onESC={()=>{if(slashDisplay.length){setDismissedSlash(input);return;}handleESCInterrupt();}}
                 onSubmit={(v) => {
                   // 斜杠命令：回车时若面板有匹配，解析成选中(或首个)命令，
@@ -1196,6 +1108,7 @@ function App() {
                   }
                   if (toSend.trim()) {
                     cmdHistory.current.push(toSend.trim());
+                    try{rememberPrompt(toSend);}catch{emitCommandMessage("本次输入未写入搜索历史：历史库不可写，当前消息仍会正常发送。");}
                     historyIdx.current = -1;
                     browsingHistory.current = false;
                   }
@@ -1299,6 +1212,11 @@ const filteredStdin = new ShortcutInput(code=>{
   else if(code===0x14)ctrlTHandler?.();
   else if(code===0x0c)ctrlLHandler?.();
   else controlKeyHandler?.(code);
+},(button,column)=>{
+  if(button!==64&&button!==65)return;
+  const direction=button===64?-1:1;
+  if(column<=23){const total=getState().agents.size,maxVis=Math.max(3,Math.floor(Math.max(6,(process.stdout.rows??24)-5)/3));scrollAgentBy(direction,total,maxVis);}
+  else scrollBy(-3*direction);
 });
 process.stdin.pipe(filteredStdin, { end: false });
 

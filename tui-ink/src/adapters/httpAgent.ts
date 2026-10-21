@@ -99,6 +99,21 @@ export class HttpConvAgent extends EventEmitter {
   private _compiled?: ReturnType<typeof compileSessionContext>;
   private readonly _workspaceRoot = process.cwd();
   private _routeIndex = 0;
+  private _nextModel?: ModelCandidate;
+  /** Switch only between requests, before price reservation and provider selection. */
+  selectModel(candidate: ModelCandidate) {
+    validateBillingConfig(candidate.config);
+    this._nextModel = candidate;
+    if (!this._busy) this._applySelectedModel();
+  }
+  private _applySelectedModel() {
+    if (!this._nextModel) return;
+    this.cfg.providerCfg = this._nextModel.config;
+    this.cfg.modelCandidates = [this._nextModel];
+    this._routeIndex = 0;
+    this._nextModel = undefined;
+    this.emit('modelChanged',this.cfg.providerCfg.model);
+  }
   private _loopIdx = 0;                               // 单调递增循环计数
 
   constructor(public cfg: {
@@ -441,6 +456,7 @@ export class HttpConvAgent extends EventEmitter {
       if (this._abort?.signal.aborted || (this.cfg.sessionManaged && !sessionJournal().isCurrent(this.cfg.id, this._activeRevision))) { abortedDuringRetry = true; break; }
       let permit: ReturnType<typeof reserveSessionRequest>;
       try {
+        this._applySelectedModel();
         validateBillingConfig(this.cfg.providerCfg);
         if(this.cfg.sessionManaged&&process.env.SPAWN_PRICE_AUTO_SYNC!=="0"&&priceSourceFor(this.cfg.providerCfg)&&this.cfg.providerCfg.billing?.inputUsdPerMillion===undefined&&this.cfg.providerCfg.billing?.outputUsdPerMillion===undefined){
           await syncModelPrices([this.cfg.providerCfg],this._workspaceRoot,{signal:this._abort?.signal});

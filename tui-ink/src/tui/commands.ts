@@ -6,7 +6,7 @@ import {backgroundAuditReport as auditReport} from "../session/BackgroundAudit.j
 import {syncModelPrices,formatPriceStatus} from "../session/PriceSync.js";
 import {recordPrice} from "../session/Pricing.js";
 import { resolveModelRoute, type ModelProfile } from "../models/routing.js";
-import { saveModelRouting } from "../config.js";
+import { saveModelRouting, loadSavedConfig } from "../config.js";
 import { loadConfig as loadBillingConfig, saveModelConfig, validateBillingConfig } from "../config.js";
 import { sessionJournal } from "../session/Journal.js";
 import { listBackups } from "../session/Backup.js";
@@ -187,7 +187,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
     } },
     { name: "route", desc: "/route [pm|leader|implement|research|review|verify|secretary <模型名...>|api-fallback on|off] — 定位与候选模型链", handler: (args) => {
       try {
-        const cfg = loadBillingConfig(), profiles = ["pm","leader","implement","research","review","verify","secretary"];
+        const cfg = loadSavedConfig(), profiles = ["pm","leader","implement","research","review","verify","secretary"];
         if (!args.length) { emitCommandMessage(JSON.stringify(cfg.routing ?? {profiles:{},allowApiFallback:false},null,2)); return; }
         if(args[0] === "api-fallback") { if(args.length!==2 || !["on","off"].includes(args[1]!)) throw new Error("用法 /route api-fallback on|off"); saveModelRouting({...cfg.routing,allowApiFallback:args[1]==="on"}); }
         else {

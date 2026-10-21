@@ -6,7 +6,8 @@ import {uiPreferences,toggleFavorite,PRODUCT_NAME} from "./tui/interaction.js";
 import React, { createContext, useContext, useEffect, useRef, useState } from "react";
 import { Box, Text, measureElement, useInput, useStdin } from "ink";
 import type { DOMElement } from "ink";
-import TextInput from "ink-text-input";
+import {MultilineEditor,editorLines} from "./tui/MultilineEditor.js";
+import {terminalPaste} from './tui/TerminalPaste.js';
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -332,7 +333,7 @@ function charWidth(cp: number): number {
   return cp >= 0x20 ? 1 : 0;           // control chars → 0
 }
 
-function displayWidth(s: string): number {
+export function displayWidth(s: string): number {
   let w = 0;
   for (let i = 0; i < s.length; ) {
     const cp = s.codePointAt(i) ?? 0;
@@ -941,18 +942,20 @@ export function ModelBar({
   currentModelByRole: Record<AgentConfigRole, string>;
   modelChoices?: readonly string[];
   modelDescriptions?: Record<string, string>;
-  onConfirm: (role: AgentConfigRole, model: string) => void;
+  onConfirm: (role: AgentConfigRole, model: string, scope?: "session" | "default") => void;
   onCancel: () => void;
 }) {
   const [roleIndex,setRoleIndex]=useState(Math.max(0,MODEL_ROLES.indexOf(currentRole))),[search,setSearch]=useState(""),[selected,setSelected]=useState(Math.max(0,((modelChoices??MODEL_CHOICES) as readonly string[]).indexOf(currentModelByRole[currentRole]))),[favorites,setFavorites]=useState<string[]>(uiPreferences().favorites);
   const role=MODEL_ROLES[roleIndex]!,choices=[...(modelChoices??MODEL_CHOICES)].filter(name=>(name+" "+(modelDescriptions?.[name]??"")).toLowerCase().includes(search.toLowerCase())),index=Math.min(selected,Math.max(0,choices.length-1)),start=Math.max(0,index-3);
+  useEffect(()=>{const paste=(text:string)=>{setSearch(v=>v+text.replace(/[\x00-\x1f\x7f]/g,''));setSelected(0);};terminalPaste.on('paste',paste);return()=>{terminalPaste.off('paste',paste);};},[]);
   useInput((char,key)=>{
     if(key.escape||key.ctrl&&char==="c"){onCancel();return;}
     if(key.tab){const next=(roleIndex+1)%MODEL_ROLES.length;setRoleIndex(next);setSelected(Math.max(0,choices.indexOf(currentModelByRole[MODEL_ROLES[next]!]))) ;return;}
     if(key.upArrow){setSelected(n=>choices.length?(n+choices.length-1)%choices.length:0);return;}
     if(key.downArrow){setSelected(n=>choices.length?(n+1)%choices.length:0);return;}
     if(key.ctrl&&char==="f"&&choices[index]){setFavorites(toggleFavorite(choices[index]!));return;}
-    if(key.return){if(choices[index])onConfirm(role,choices[index]!);return;}
+    if(key.ctrl&&char==="s"){if(choices[index])onConfirm(role,choices[index]!,"default");return;}
+    if(key.return){if(choices[index])onConfirm(role,choices[index]!,"session");return;}
     if(key.backspace||key.delete){setSearch(v=>Array.from(v).slice(0,-1).join(""));setSelected(0);return;}
     if(char&&!key.ctrl&&!key.meta&&!key.tab&&!key.upArrow&&!key.downArrow&&!key.leftArrow&&!key.rightArrow){setSearch(v=>v+char.replace(/[\x00-\x1f\x7f]/g,""));setSelected(0);}
   });
@@ -962,7 +965,7 @@ export function ModelBar({
     <Box><Text>&gt; </Text><Text>{search||"搜索模型或供应商…"}▏</Text></Box>
     {choices.slice(start,start+7).map((name,i)=><Text key={name} color={i+start===index?"magenta":undefined}>{i+start===index?"→ ":"  "}{favorites.includes(name)?"★ ":""}{modelDescriptions?.[name]??name}{name===currentModelByRole[role]?" · current":""}</Text>)}
     {!choices.length?<Text dimColor>没有匹配的已接入模型；/login 添加</Text>:null}
-    <Text dimColor>({choices.length?index+1:0}/{choices.length}) ↑↓ navigate · Enter select · Ctrl+F favorite · Esc cancel</Text>
+    <Text dimColor>({choices.length?index+1:0}/{choices.length}) ↑↓ 选择 · Enter 仅本次使用 · Ctrl+S 保存默认 · Ctrl+F 收藏 · Esc 取消</Text>
   </Box>;
 }
 
@@ -1093,7 +1096,7 @@ export function DagView({ maxHeight = 12 }: { maxHeight?: number }) {
 
 // ── 输入栏 ──────────────────────────────────────────────────────────────────
 export function InputBar({
-  value, onChange, onSubmit, hint, focused = true, onESC,
+  value, onChange, onSubmit, hint, focused = true, onESC, menuActive=false,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -1101,22 +1104,25 @@ export function InputBar({
   hint?: string;
   focused?: boolean;
   onESC?: () => void;
+  menuActive?: boolean;
 }) {
   const p = usePalette();
   const { isRawModeSupported } = useStdin();
   const useNativeCursor = process.env.SPAWN_INPUT_CURSOR_ANCHOR !== "0";
-  useEffect(() => {
+  useEffect(()=>{if(!focused)setCursorAnchor({focused:false});},[focused]);
+  const anchor=(cursor:number) => {
     const rows = process.stdout.rows ?? 24;
     const cols = process.stdout.columns ?? 80;
     const rowOffset = Number.parseInt(process.env.SPAWN_INPUT_CURSOR_ROW_OFFSET ?? "2", 10);
     const colOffset = Number.parseInt(process.env.SPAWN_INPUT_CURSOR_COL_OFFSET ?? "5", 10);
+    const width=Math.max(1,cols-9),lines=editorLines(value,width,displayWidth),active=lines.reduce((last,line,i)=>line.start<=cursor?i:last,0),max=Math.max(2,Math.min(8,Math.floor(rows/3))),start=Math.max(0,active-max+1),visible=lines.slice(start,start+max),extra=lines.length>max?1:0;
     setCursorAnchor({
       focused: focused && useNativeCursor,
-      row: Math.max(1, rows - (Number.isFinite(rowOffset) ? rowOffset : 2)),
-      col: Math.max(1, Math.min(cols, colOffset + displayWidth(value))),
+      row: Math.max(1, rows - (Number.isFinite(rowOffset) ? rowOffset : 2) - 1 - (visible.length-1-(active-start))-extra),
+      col: Math.max(1, Math.min(cols, colOffset + displayWidth(value.slice(lines[active]!.start,cursor)))),
     });
-    return () => setCursorAnchor({ focused: false });
-  }, [focused, value, useNativeCursor]);
+  };
+  useEffect(()=>()=>setCursorAnchor({focused:false}),[]);
   useInput((_char, key) => {
     if (key.escape && focused && onESC) {
       onESC();
@@ -1129,10 +1135,12 @@ export function InputBar({
            paddingX={1} flexShrink={0}>
         <Text color={p.warn}>⚠ </Text>
         <Box flexGrow={1} overflow="hidden">
-          <TextInput
+          <MultilineEditor
             value={value}
             onChange={onChange}
             onSubmit={onSubmit}
+            menuActive={menuActive}
+            width={Math.max(1,(process.stdout.columns??80)-9)} measure={displayWidth} onCursor={anchor}
             placeholder={hint ?? "type a message · @agent to switch · /command"}
           />
         </Box>
@@ -1152,10 +1160,12 @@ export function InputBar({
         // overflow="hidden" clips TextInput rendering at box boundary;
         // prevents long pastes from spilling across terminal width
         <Box flexGrow={1} overflow="hidden">
-          <TextInput
+          <MultilineEditor
             value={value}
             onChange={onChange}
             onSubmit={onSubmit}
+            menuActive={menuActive}
+            width={Math.max(1,(process.stdout.columns??80)-9)} measure={displayWidth} onCursor={anchor}
             placeholder={hint ?? "type a message · @agent to switch · /command"}
           />
         </Box>

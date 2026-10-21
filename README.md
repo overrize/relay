@@ -2,6 +2,8 @@
 
 启动：`E:\spawn-work\relay.cmd`。旧 `spawn.cmd` 继续兼容；会话与配置仍沿用 `.spawn`，无需迁移密钥和账本。
 
+打开独立 Windows Terminal：`pwsh -NoProfile -ExecutionPolicy Bypass -File E:\spawn-work\open-relay.ps1`。Alt+Enter / Ctrl+J 换行，Enter 发送；Ctrl+R 跨会话搜索输入历史；Ctrl+L 模型列表中 Enter 仅本次使用，Ctrl+S 保存默认。详见 [TUI 交互说明](tui-ink/docs/relay-interaction.md)。
+
 ## 运行模式与第一轮可靠性修复
 
 默认 `adaptive`：PM 可以直接完成简单工作，或直接派发 Worker；只有需要协调时才增加 Leader。
