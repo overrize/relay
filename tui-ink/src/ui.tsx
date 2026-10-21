@@ -8,6 +8,7 @@ import { Box, Text, measureElement, useInput, useStdin } from "ink";
 import type { DOMElement } from "ink";
 import {MultilineEditor,editorLines} from "./tui/MultilineEditor.js";
 import {terminalPaste} from './tui/TerminalPaste.js';
+import {keyHint} from './tui/Keybindings.js';
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -965,7 +966,7 @@ export function ModelBar({
     <Box><Text>&gt; </Text><Text>{search||"搜索模型或供应商…"}▏</Text></Box>
     {choices.slice(start,start+7).map((name,i)=><Text key={name} color={i+start===index?"magenta":undefined}>{i+start===index?"→ ":"  "}{favorites.includes(name)?"★ ":""}{modelDescriptions?.[name]??name}{name===currentModelByRole[role]?" · current":""}</Text>)}
     {!choices.length?<Text dimColor>没有匹配的已接入模型；/login 添加</Text>:null}
-    <Text dimColor>({choices.length?index+1:0}/{choices.length}) ↑↓ 选择 · Enter 仅本次使用 · Ctrl+S 保存默认 · Ctrl+F 收藏 · Esc 取消</Text>
+    <Text dimColor>({choices.length?index+1:0}/{choices.length}) {keyHint('tui.select.up')} / {keyHint('tui.select.down')} · {keyHint('tui.select.confirm')} 仅本次使用 · {keyHint('app.model.save')} 保存默认 · {keyHint('app.model.favorite')} 收藏 · {keyHint('tui.select.cancel')} 取消</Text>
   </Box>;
 }
 

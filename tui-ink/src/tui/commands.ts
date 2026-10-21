@@ -7,6 +7,7 @@ import {syncModelPrices,formatPriceStatus} from "../session/PriceSync.js";
 import {recordPrice} from "../session/Pricing.js";
 import { resolveModelRoute, type ModelProfile } from "../models/routing.js";
 import { saveModelRouting, loadSavedConfig } from "../config.js";
+import {keyHint} from './Keybindings.js';
 import { loadConfig as loadBillingConfig, saveModelConfig, validateBillingConfig } from "../config.js";
 import { sessionJournal } from "../session/Journal.js";
 import { listBackups } from "../session/Backup.js";
@@ -76,6 +77,8 @@ export interface CommandCtx {
   startLogin?: () => void;
   setViewMode?:(mode:"agents"|"chat"|"logs")=>void;
   togglePlan?:()=>void;
+  openEditor?:(keys?:boolean)=>void;
+  showKeys?:(reload:boolean)=>void;
 }
 
 function parseScheduleDelay(raw: string, now = Date.now()): number | null {
@@ -108,7 +111,7 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
   const feishuSessions = { size: feishuSessionCount() };
   const __dirname = path.dirname(new URL(import.meta.url).pathname);
   const COMMANDS: CmdDef[] = [
-    {name:"agents",desc:"/agents — Agent 列表（Ctrl+G）",handler:()=>ctx.setViewMode?.("agents")},
+    {name:"agents",desc:`/agents — Agent 列表（${keyHint('app.agents.toggle')}）`,handler:()=>ctx.setViewMode?.("agents")},
     {name:"chat",desc:"/chat — 返回会话",handler:()=>ctx.setViewMode?.("chat")},
     {name:"logs",desc:"/logs — 调试日志",handler:()=>ctx.setViewMode?.("logs")},
     {name:"plan",desc:"/plan — 展开或收起计划",handler:()=>ctx.togglePlan?.()},
@@ -548,6 +551,8 @@ export function buildCommands(ctx: CommandCtx): CmdDef[] {
       const text = alerts.map((a) => `[${a.severity}] ${a.code} @ ${a.agent}: ${a.detail}`).join("\n");
       applyEvent({ v: 1, type: "message", agent: "pm", to: "user", text: `📊 告警 (${alerts.length} 条):\n${text}\n\n/alerts ack <code> 确认` });
     } },
+    {name:'edit',desc:'/edit — 在外部编辑器编辑草稿，不发送',handler:args=>{if(args.length){emitCommandMessage('请使用 /edit 或配置的外部编辑器快捷键。');return;}ctx.openEditor?.();}},
+    {name:'keys',desc:'/keys [reload|edit] — 查看、重载或编辑快捷键',handler:args=>{if(args.length>1||args[0]&&!['reload','edit'].includes(args[0])){emitCommandMessage('用法 /keys [reload|edit]');return;}if(args[0]==='edit')ctx.openEditor?.(true);else ctx.showKeys?.(args[0]==='reload');}},
     { name: "quit",    desc: "exit the TUI",                handler: () => requestExit() },
     { name: "contextbudget", desc: "/contextbudget [Nk|N|off] — set/clear token budget", handler: (args) => {
       const raw = args[0];

@@ -7,6 +7,7 @@
 import React, { useContext, useEffect, useState } from "react";
 import { Box, Text } from "ink";
 import { PaletteContext } from "../ui.js";
+import {keyHint} from './Keybindings.js';
 
 /** A little mascot whose eyes blink every few seconds. */
 function Mascot({ color }: { color: string }): React.ReactElement {
@@ -43,7 +44,7 @@ export function SpawnHeader({ model }: { model: string }): React.ReactElement {
           <Text><Text color={p.accent} bold>◆ Relay · 接力</Text><Text dimColor>  multi-agent · full-duplex</Text></Text>
           <Text dimColor>model:     <Text color={p.text}>{model}</Text>   <Text color={p.accent}>/model</Text> to change</Text>
           <Text dimColor>directory: {cwd}</Text>
-          <Text dimColor>commands:  <Text color={p.accent}>Enter</Text> open · <Text color={p.accent}>Ctrl+G</Text> agents · <Text color={p.accent}>/command</Text> · <Text color={p.accent}>Shift+Tab</Text> thinking · <Text color={p.accent}>Ctrl+L</Text> models</Text>
+          <Text dimColor>commands:  <Text color={p.accent}>{keyHint('app.agents.toggle')}</Text> agents · <Text color={p.accent}>/keys</Text> shortcuts · <Text color={p.accent}>{keyHint('app.editor.external')}</Text> editor · <Text color={p.accent}>{keyHint('app.model.select')}</Text> models</Text>
         </Box>
       </Box>
       <Text dimColor>{rule}</Text>

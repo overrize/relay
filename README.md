@@ -4,6 +4,8 @@
 
 打开独立 Windows Terminal：`pwsh -NoProfile -ExecutionPolicy Bypass -File E:\spawn-work\open-relay.ps1`。Alt+Enter / Ctrl+J 换行，Enter 发送；Ctrl+R 跨会话搜索输入历史；Ctrl+L 模型列表中 Enter 仅本次使用，Ctrl+S 保存默认。详见 [TUI 交互说明](tui-ink/docs/relay-interaction.md)。
 
+`/keys` 查看自定义快捷键，`/keys edit` 编辑并校验；Ctrl+G / `/edit` 调用 `editor.json`、`VISUAL` 或 `EDITOR` 指定的外部编辑器，Ctrl+B 切换 Agent 列表。供应商目录覆盖参考 OmO 的 49 个项目；未实现的原生认证明确标注，需要显式选择 API 或兼容网关，不将其冒充订阅接入。
+
 ## 运行模式与第一轮可靠性修复
 
 默认 `adaptive`：PM 可以直接完成简单工作，或直接派发 Worker；只有需要协调时才增加 Leader。

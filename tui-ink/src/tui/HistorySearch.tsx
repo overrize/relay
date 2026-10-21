@@ -3,6 +3,7 @@ import {Box,Text,useInput} from 'ink';
 import TextInput from 'ink-text-input';
 import {searchPrompts} from './PromptHistory.js';
 import {terminalPaste} from './TerminalPaste.js';
+import {keyHint} from './Keybindings.js';
 
 export function HistorySearch({onSelect,onCancel}:{onSelect:(text:string)=>void;onCancel:()=>void}) {
   const [query,setQuery]=useState(''),[selected,setSelected]=useState(0);
@@ -17,10 +18,10 @@ export function HistorySearch({onSelect,onCancel}:{onSelect:(text:string)=>void;
     if(key.return&&records[index])onSelect(records[index]!.text);
   });
   return <Box flexDirection="column" borderStyle="single" borderColor="blue" borderLeft={false} borderRight={false} paddingX={1}>
-    <Text bold color="magenta">跨会话历史搜索 · Ctrl+R</Text>
+    <Text bold color="magenta">跨会话历史搜索 · {keyHint('app.history.search')}</Text>
     <Box><Text>&gt; </Text><TextInput value={query} onChange={v=>{setQuery(v);setSelected(0);}} onSubmit={()=>{}} placeholder="搜索曾输入的内容…"/></Box>
     {records.slice(start,start+6).map((r,i)=><Text key={r.id} color={i+start===index?'magenta':undefined} wrap="truncate-end">{i+start===index?'→ ':'  '}{r.text.replace(/\s+/g,' ')} · {r.created.slice(0,16)} · {r.cwd}</Text>)}
     {error?<Text color="yellow">{error}</Text>:!records.length?<Text dimColor>没有匹配的历史记录</Text>:null}
-    <Text dimColor>↑↓ 选择 · Enter 放回编辑器（不发送） · Esc 保留草稿 · 最近 {records.length} 条</Text>
+    <Text dimColor>{keyHint('tui.select.up')} / {keyHint('tui.select.down')} 选择 · {keyHint('tui.select.confirm')} 放回编辑器（不发送） · {keyHint('tui.select.cancel')} 保留草稿 · 最近 {records.length} 条</Text>
   </Box>;
 }

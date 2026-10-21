@@ -2,6 +2,8 @@ import React,{useEffect,useRef,useState} from "react";
 import {Box,Text,useInput} from "ink";
 import TextInput from "ink-text-input";
 import {terminalPaste} from './TerminalPaste.js';
+import {keyHint} from './Keybindings.js';
+import {providerDirectorySource} from '../models/ProviderDirectory.js';
 import {LoginFlow} from "./loginFlow.js";
 import {officialSubscriptionLogin} from "../subscriptions/login.js";
 
@@ -24,19 +26,20 @@ export function LoginWizard({onDone,onCancel}:{onDone:(message:string)=>void;onC
       if(action==="models")reload();
       if(action==="login"||action==="check"){
         abort.current=new AbortController();setInstructions("");
-        void officialSubscriptionLogin(flow.provider.id,action==="login",text=>{if(alive.current)setInstructions(text);},abort.current.signal).then(()=>{if(alive.current){setInstructions("");flow.authenticated();changed();}}).catch(()=>{if(alive.current){setInstructions("");flow.authFailed();changed();setError("官方订阅登录未确认成功；检查客户端安装、账号权限，或重试。未保存模型配置。");}});
+        void officialSubscriptionLogin(flow.provider.authProvider??flow.provider.id,action==="login",text=>{if(alive.current)setInstructions(text);},abort.current.signal).then(()=>{if(alive.current){setInstructions("");flow.authenticated();changed();}}).catch(()=>{if(alive.current){setInstructions("");flow.authFailed();changed();setError("官方订阅登录未确认成功；检查客户端安装、账号权限，或重试。未保存模型配置。");}});
       }
     }catch{setError("未保存配置；检查选项、配置目录权限后重试。");}
   };
   useInput((_char,key)=>{if(key.escape||(key.ctrl&&_char==="c")){cancel();return;}if(!view.options.length||!indices.length)return;if(key.upArrow){setSelected(n=>(n+indices.length-1)%indices.length);return;}if(key.downArrow){setSelected(n=>(n+1)%indices.length);return;}if(key.return)choose(indices[selectedIndex]!);});
   return <Box flexDirection="column" borderStyle="single" borderColor="blue" borderLeft={false} borderRight={false} paddingX={1} paddingY={1} flexShrink={0}>
     <Text bold color="magenta">{view.title}</Text>
+    {view.stage==='provider'?<Text dimColor>目录覆盖 {providerDirectorySource.count} 个 OmO 内置供应商 · {providerDirectorySource.version} · 预置名称不代表账号权限</Text>:null}
     {!['mode','provider'].includes(view.stage)?<Text dimColor>{view.summary.join(" | ")}</Text>:null}
     {searching?<Box><Text>&gt; </Text><TextInput value={search} onChange={text=>{setSearch(text);setSelected(0);}} onSubmit={()=>{}} placeholder={view.stage==="models"?"搜索模型名称…":"搜索供应商…"}/></Box>:null}
     {indices.slice(start,start+7).map(i=><Text key={`${i}-${view.options[i]}`} color={indices[selectedIndex]===i?"magenta":undefined}>{indices[selectedIndex]===i?"→ ":"  "}{view.options[i]}</Text>)}
     {searching?<Text dimColor>({indices.length?selectedIndex+1:0}/{indices.length}){view.stage==="models"&&loading?" · 正在读取账号目录，预置列表仍可选":""}</Text>:null}
     {view.stage==="busy"?<Text>{instructions||"正在检查官方客户端…（后台 PM 继续运行）"}</Text>:!view.options.length?<TextInput key={view.stage} value={value} onChange={setValue} mask={view.secret?"*":undefined} placeholder={view.secret?"输入 API Key":view.defaultValue||view.title} onSubmit={input=>{try{flow.submit(input);changed();}catch(e){setError(e instanceof Error?e.message:"参数无效");}}}/>:null}
     {error?<Text color="red">{error}</Text>:null}
-    <Text dimColor>↑↓ 选择　Enter 确认　Esc / Ctrl+C 取消</Text>
+    <Text dimColor>{keyHint('tui.select.up')} / {keyHint('tui.select.down')} 选择　{keyHint('tui.select.confirm')} 确认　{keyHint('tui.select.cancel')} / {keyHint('app.clear')} 取消</Text>
   </Box>;
 }

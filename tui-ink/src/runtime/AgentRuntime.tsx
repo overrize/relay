@@ -5,6 +5,9 @@ import {rememberPrompt,searchPrompts} from "../tui/PromptHistory.js";
 import {selectSessionModel} from "../config.js";
 import {editorLines} from '../tui/MultilineEditor.js';
 import {displayWidth} from '../ui.js';
+import {keybindings,Keybindings,keybindingsPath,keyHint,type KeyScope} from '../tui/Keybindings.js';
+import {editExternally,terminalOwnership,cancelExternalEditor} from '../tui/ExternalEditor.js';
+import {writeSnapshot} from '../memory/atomic.js';
 import {configuredModels,cycleModel,uiPreferences,nextReasoning} from "../tui/interaction.js";
 import {splitCommand} from "../tui/splitCommand.js";
 import {syncModelPrices} from "../session/PriceSync.js";
@@ -257,6 +260,7 @@ function killAgent(id: string, _reason = "interrupted"): void {
 }
 
 async function shutdownRuntime(): Promise<void> {
+  cancelExternalEditor();
   stopTaskRecovery();
   for (const [id, agent] of agents) { killedAgents.add(id); agent.kill(); }
   for (const secretary of secretaries.values()) secretary.destroy();
@@ -288,6 +292,8 @@ function App() {
   const { exit } = useApp();
   const { stdin, isRawModeSupported } = useStdin();
   const [input, setInput] = useState("");
+  const [externalBusy,setExternalBusy]=useState(false);
+  const [startupKeysError]=useState(()=>{try{keybindings.reload();return '';}catch(error){keybindings.configure({});return error instanceof Error?error.message:'无效配置';}});
 
   const agentList = useStore((s) =>
     Array.from(s.agents.entries()).filter(([, a]) => !a.hidden).map(([id]) => id));
@@ -493,6 +499,27 @@ function App() {
   };
 
   const pmStarted = useRef(false);
+  async function openEditor(keys=false){
+    if(externalBusy||terminalOwnership.external)return;
+    const original=input.trim()==='/edit'?'':input;
+    setExternalBusy(true);
+    try{
+      const content=keys?(fs.existsSync(keybindingsPath())?fs.readFileSync(keybindingsPath(),'utf8'):'{}\n'):original;
+      const result=await editExternally(content,{
+        validate:keys?text=>new Keybindings().configure(JSON.parse(text)):undefined,
+        suspend:()=>{terminalOwnership.external=true;process.stdin.unpipe(filteredStdin);process.stdin.pause();if(process.stdin.isTTY)process.stdin.setRawMode(false);writeTermSync(TERM_RESET+'\x1b[2J\x1b[H');},
+        resume:()=>{if(process.stdin.isTTY)process.stdin.setRawMode(true);process.stdin.pipe(filteredStdin,{end:false});process.stdin.resume();writeTermSync('\x1b[2J\x1b[H\x1b[?1000h\x1b[?1006h\x1b[?2004h');terminalOwnership.external=false;},
+      });
+      if(result.status==='complete'){
+        if(keys){fs.mkdirSync(path.dirname(keybindingsPath()),{recursive:true});writeSnapshot(keybindingsPath(),result.content!);keybindings.reload();}
+        else{setInput(result.content!);completeTick.current++;}
+        emitCommandMessage(keys?'快捷键配置已校验、保存并重载。':'外部编辑完成，草稿已恢复；尚未发送。');
+      }else{if(!keys)setInput(original);emitCommandMessage(`${result.reason}；恢复文件：${result.recoveryPath}`);}
+    }catch{if(!keys)setInput(original);emitCommandMessage('外部编辑器配置或启动失败；原草稿保留。使用 editor.json 的 command 参数数组，或设置 VISUAL / EDITOR。');}
+    finally{terminalOwnership.external=false;setExternalBusy(false);}
+  }
+  const showKeys=(reload:boolean)=>{try{if(reload)keybindings.reload();emitCommandMessage(`${keybindingsPath()}\n${keybindings.report()}${reload?'\n已重载。':''}`);}catch(error){emitCommandMessage(`${error instanceof Error?error.message:'快捷键配置无效'}；保留上次有效快捷键。`);}};
+  useEffect(()=>{if(startupKeysError)emitCommandMessage(`快捷键配置未加载：${startupKeysError}；使用默认快捷键。`);},[]);
   const COMMANDS = buildCommands({
     agents, secretaries, pm, scheduledTasks, killedAgents,
     startLeaderAgent, startWorker, pmStarted,
@@ -504,6 +531,7 @@ function App() {
     emitCommandMessage,
     setViewMode,togglePlan:()=>setPlanOpen(v=>!v),
     startLogin:()=>{setModelSelecting(false);setEffortSelecting(false);setLoginSelecting(true);},
+    openEditor:keys=>{void openEditor(keys);},showKeys,
   });
 
   const runCommand = (cmd: string) => {
@@ -771,12 +799,15 @@ function App() {
 
   // 全局快捷键
   useEffect(()=>{
+    keyboardScope=modelSelecting?'model':loginSelecting||effortSelecting?'login':historySelecting?'history':viewMode==='agents'?'agents':'compose';
     controlKeyHandler=code=>{
+      if(terminalOwnership.external||externalBusy)return;
       if(code===0x12){if(!loginSelecting&&!modelSelecting&&!effortSelecting&&!selectedPending.length)setHistorySelecting(true);return;}
       if(historySelecting)return;
       if(loginSelecting||modelSelecting||effortSelecting||selectedPending.length)return;
       if(code===0x04){if(!input)requestExit(true);return;}
-      if(code===0x07){setViewMode(v=>v==="agents"?"chat":"agents");return;}
+      if(code===0x07){void openEditor();return;}
+      if(code===0x02){setViewMode(v=>v==="agents"?"chat":"agents");return;}
       if(code===0x0f){setShowTools(v=>!v);return;}
       if(code===0x10||code===0x80){const cfg=loadConfig(),role=selectedConfigRole(),chosen=cycleModel(cfg.models,cfg.agents[role].model,code===0x80?-1:1,uiPreferences().favorites);if(chosen)confirmModelChoice(role,chosen);else emitCommandMessage("暂无已接入模型，请 /login。");}
     };
@@ -784,7 +815,7 @@ function App() {
   });
 
   useInput((char, key) => {
-    if(loginSelecting||modelSelecting||effortSelecting||historySelecting)return; // The active selector exclusively owns text, Tab and Esc.
+    if(loginSelecting||modelSelecting||effortSelecting||historySelecting||externalBusy)return; // The active selector exclusively owns text, Tab and Esc.
     if (key.ctrl && char === "c") { requestExit(); return; }
     if(key.ctrl&&char==="d"&&!input){requestExit(true);return;}
     if(!modelSelecting&&!effortSelecting&&selectedPending.length===0){
@@ -1006,7 +1037,7 @@ function App() {
             </Box>
           ) : (
             <>
-              <Box paddingLeft={1}><Text dimColor>{getState().selectedAgent} · Ctrl+L 模型 · Ctrl+R 历史 · Alt+Enter 换行 · Esc 中断</Text></Box>
+              <Box paddingLeft={1}><Text dimColor>{getState().selectedAgent} · {keyHint('app.model.select')} 模型 · {keyHint('app.history.search')} 历史 · {keyHint('app.editor.external')} 编辑器 · /keys</Text></Box>
               <ConvPane scrollOffset={scrollOffset} completionRows={slashPaneRows+editorExtraRows} showTools={showTools} showThinking={showThinking} />
             </>
           )}
@@ -1080,13 +1111,13 @@ function App() {
                     {slashDisplay.length > SLASH_MAX_VISIBLE && (
                       <Text dimColor>  {"·".repeat(3)} {slashDisplay.length - SLASH_MAX_VISIBLE} more</Text>
                     )}
-                    <Text dimColor>↑↓ 选择 · Enter 执行 · Tab 补全 · Esc 关闭</Text>
+                    <Text dimColor>{keyHint('tui.editor.up')} / {keyHint('tui.editor.down')} 选择 · {keyHint('tui.input.submit')} 执行 · {keyHint('tui.editor.complete')} 补全 · {keyHint('app.interrupt')} 关闭</Text>
                   </Box>
                 </>
               )}
               <InputBar
                 key={completeTick.current}
-                focused={selectedPending.length === 0}
+                focused={selectedPending.length === 0&&!externalBusy}
                 value={input}
                 menuActive={slashDisplay.length>0}
                 onChange={value=>{setDismissedSlash(null);browsingHistory.current=false;historyIdx.current=-1;setInput(value);}}
@@ -1217,12 +1248,12 @@ const filteredStdin = new ShortcutInput(code=>{
   const direction=button===64?-1:1;
   if(column<=23){const total=getState().agents.size,maxVis=Math.max(3,Math.floor(Math.max(6,(process.stdout.rows??24)-5)/3));scrollAgentBy(direction,total,maxVis);}
   else scrollBy(-3*direction);
-});
+},(bytes,final)=>keybindings.resolve(bytes,keyboardScope,final));
 process.stdin.pipe(filteredStdin, { end: false });
 
 Object.defineProperties(filteredStdin, {
   isTTY: { get: () => process.stdin.isTTY },
-  setRawMode: { value: (mode: boolean) => { try { process.stdin.setRawMode(mode); } catch { /* non-TTY fallback */ } } },
+  setRawMode: { value: (mode: boolean) => { if(terminalOwnership.external)return;try { process.stdin.setRawMode(mode); } catch { /* non-TTY fallback */ } } },
   ref: { value: () => process.stdin.ref() },
   unref: { value: () => process.stdin.unref() },
 });
@@ -1241,9 +1272,11 @@ let cancelLoginFromSignal:(()=>void)|null=null;
 // Control-shortcut handlers, registered by App; fired from filteredStdin so the
 // input field never receives the char (fixes Ctrl+T typing a literal 't').
 let controlKeyHandler:((code:number)=>void)|null=null;
+let keyboardScope:KeyScope='compose';
 let ctrlTHandler: (() => void) | null = null;
 let ctrlLHandler: (() => void) | null = null;
 process.on("SIGINT", () => {
+  if(terminalOwnership.external)return; // The foreground editor owns Ctrl+C; do not kill PM.
   if(cancelLoginFromSignal){cancelLoginFromSignal();return;}
   writeTermSync(TERM_RESET);
   if (requestExitFromSignal) {
@@ -1267,6 +1300,7 @@ process.on("SIGINT", () => {
   let _inside = false;
   // @ts-ignore — intentional write shim
   process.stdout.write = function (chunk: any, ...rest: any[]): boolean {
+    if(terminalOwnership.external){const callback=rest.find(v=>typeof v==='function');if(callback)queueMicrotask(()=>callback());return true;}
     if (_inside) return _orig(chunk, ...rest);
     const s: string = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     // Ink frame writes always contain eraseLines (\x1b[1A\x1b[2K) or

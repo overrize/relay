@@ -30,6 +30,11 @@ export interface ProviderConfig {
   model: string;
   apiKey: string;
   baseUrl?: string;
+  /** Treat baseUrl's path as the exact API prefix (e.g. /v2 or /api). */
+  exactBaseUrl?: boolean;
+  catalogProvider?: string;
+  /** Omit stream_options for compatible services that do not accept it. */
+  streamUsage?: boolean;
   maxTokens?: number;
   reasoningEffort?: "low" | "medium" | "high" | "max";
   /** Explicit override; otherwise inferred by resolveCapabilities(). */

@@ -7,7 +7,7 @@ export function cycleModel(models:Record<string,ProviderConfig>,current:string,d
 const levels=['low','medium','high','max'] as const;
 export async function nextReasoning(model:ProviderConfig,fetcher=fetch){
  if(model.provider!=='openai'||model.transport&&model.transport!=='http')return undefined;
- const url=new URL(model.baseUrl??'https://api.openai.com');if(url.username||url.password||url.search||url.hash)throw Error('invalid-endpoint');url.pathname=url.pathname.replace(/\/$/,'')+(url.pathname.replace(/\/$/,'').endsWith('/v1')?'/models':'/v1/models');
+ const url=new URL(model.baseUrl??'https://api.openai.com');if(url.username||url.password||url.search||url.hash)throw Error('invalid-endpoint');url.pathname=url.pathname.replace(/\/$/,'')+(model.exactBaseUrl||url.pathname.replace(/\/$/,'').endsWith('/v1')?'/models':'/v1/models');
  const r=await fetcher(url,{headers:{Authorization:`Bearer ${model.apiKey}`},redirect:'error',signal:AbortSignal.timeout(10000)});if(!r.ok)throw Error('model-capabilities-unavailable');
  const {jsonBounded}=await import('../models/catalog.js');const body=await jsonBounded(r),metadata=body?.data?.find((m:any)=>m.id===model.model),supported=metadata?.effort?.supported_levels?.filter((v:unknown)=>levels.includes(v as any));if(!Array.isArray(supported)||!supported.length)return undefined;
  const current=model.reasoningEffort??metadata.effort.default_level,index=supported.indexOf(current);return supported[(index+1)%supported.length] as typeof levels[number];

@@ -69,10 +69,10 @@ if (USE_LOG_CONTEXT) {
  *   "https://dashscope.aliyuncs.com/compatible-mode/v1" → /compatible-mode/v1/chat/completions
  *   "http://localhost:8080/api/v1"                    → /api/v1/chat/completions
  */
-export function buildChatPath(baseUrl: string): string {
+export function buildChatPath(baseUrl: string, exactBaseUrl=false): string {
   const { pathname } = new URL(baseUrl);
   const base = pathname.replace(/\/?$/, ""); // strip trailing slash
-  return base.endsWith("/v1")
+  return exactBaseUrl || base.endsWith("/v1")
     ? base + "/chat/completions"
     : base + "/v1/chat/completions";
 }
@@ -619,10 +619,10 @@ export class HttpConvAgent extends EventEmitter {
     return this._compiled?.messages ?? budgetHistory(this.messages, 20_000);
   }
 
-  private async _callAnthropic(): Promise<{ text: string; promptTokens: number; completionTokens: number; ttftMs: number; totalMs: number }> {
+  private async _callAnthropic(): Promise<{ text: string; promptTokens?: number; completionTokens?: number; ttftMs: number; totalMs: number }> {
     const pc = this.cfg.providerCfg;
-    let promptTokens = 0;
-    let completionTokens = 0;
+    let promptTokens: number|undefined;
+    let completionTokens: number|undefined;
     let ttftMs = 0;
 
     // ── Prompt caching 支持 ────────────────────────────────────────────
@@ -656,16 +656,20 @@ export class HttpConvAgent extends EventEmitter {
     });
 
     const t0 = Date.now();
+    const endpoint=new URL(pc.baseUrl||'https://api.anthropic.com');
+    const prefix=endpoint.pathname.replace(/\/$/,'');
     const stream = await this._doStream(
-      "api.anthropic.com",
+      endpoint.hostname,
       "POST",
-      "/v1/messages",
+      (pc.exactBaseUrl||prefix.endsWith('/v1')?prefix:prefix+'/v1')+'/messages',
       {
         "x-api-key": pc.apiKey,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
       },
       body,
+      endpoint.port?Number(endpoint.port):undefined,
+      endpoint.protocol,
     );
 
     const text = await this._readStream(stream, (chunk) => {
@@ -674,11 +678,11 @@ export class HttpConvAgent extends EventEmitter {
         const parsed = JSON.parse(chunk);
         // Capture input tokens from message_start
         if (parsed?.type === "message_start" && parsed.message?.usage) {
-          promptTokens = (parsed.message.usage.input_tokens ?? 0) + (parsed.message.usage.cache_creation_input_tokens ?? 0) + (parsed.message.usage.cache_read_input_tokens ?? 0);
+          if(Number.isSafeInteger(parsed.message.usage.input_tokens))promptTokens = parsed.message.usage.input_tokens + (parsed.message.usage.cache_creation_input_tokens ?? 0) + (parsed.message.usage.cache_read_input_tokens ?? 0);
         }
         // Capture output tokens from message_delta
         if (parsed?.type === "message_delta" && parsed.usage) {
-          completionTokens = parsed.usage.output_tokens ?? 0;
+          if(Number.isSafeInteger(parsed.usage.output_tokens))completionTokens = parsed.usage.output_tokens;
         }
         if (parsed?.type === "content_block_delta" && parsed.delta?.text) {
           const delta = parsed.delta.text;
@@ -692,10 +696,10 @@ export class HttpConvAgent extends EventEmitter {
     return { text, promptTokens, completionTokens, ttftMs, totalMs };
   }
 
-  private async _callOpenAI(): Promise<{ text: string; promptTokens: number; completionTokens: number; ttftMs: number; totalMs: number }> {
+  private async _callOpenAI(): Promise<{ text: string; promptTokens?: number; completionTokens?: number; ttftMs: number; totalMs: number }> {
     const pc = this.cfg.providerCfg;
-    let promptTokens = 0;
-    let completionTokens = 0;
+    let promptTokens: number|undefined;
+    let completionTokens: number|undefined;
     let ttftMs = 0;
     const baseUrl = pc.baseUrl || "https://api.openai.com";
     const url = new URL(baseUrl);
@@ -712,7 +716,7 @@ export class HttpConvAgent extends EventEmitter {
         ...this._trimmedHistory().map((m) => ({ role: m.role, content: m.content })),
       ],
       stream: true,
-      stream_options: { include_usage: true },
+      ...(pc.streamUsage===false?{}:{stream_options: { include_usage: true }}),
     };
     if (pc.reasoningEffort) requestBody.reasoning_effort = pc.reasoningEffort;
     const body = JSON.stringify(requestBody);
@@ -721,13 +725,14 @@ export class HttpConvAgent extends EventEmitter {
     const stream = await this._doStream(
       url.hostname,
       "POST",
-      buildChatPath(baseUrl),
+      buildChatPath(baseUrl,pc.exactBaseUrl),
       {
         "Authorization": `Bearer ${pc.apiKey}`,
         "content-type": "application/json",
       },
       body,
       port,
+      url.protocol,
     );
 
     const text = await this._readStream(stream, (chunk) => {
@@ -740,8 +745,8 @@ export class HttpConvAgent extends EventEmitter {
         const parsed = JSON.parse(chunk);
         // Capture usage from the final chunk (stream_options.include_usage)
         if (parsed?.usage) {
-          promptTokens = parsed.usage.prompt_tokens ?? 0;
-          completionTokens = parsed.usage.completion_tokens ?? 0;
+          if(Number.isSafeInteger(parsed.usage.prompt_tokens))promptTokens = parsed.usage.prompt_tokens;
+          if(Number.isSafeInteger(parsed.usage.completion_tokens))completionTokens = parsed.usage.completion_tokens;
         }
         const delta = parsed?.choices?.[0]?.delta;
         if (!delta) return null;
@@ -773,9 +778,10 @@ export class HttpConvAgent extends EventEmitter {
     headers: Record<string, string>,
     body: string,
     port?: number,
+    protocol?: string,
   ): Promise<NodeJS.ReadableStream> {
     return new Promise((resolve, reject) => {
-      const isHttps = !hostname.startsWith("localhost") && !hostname.startsWith("127.");
+      const isHttps = protocol ? protocol === 'https:' : !hostname.startsWith("localhost") && !hostname.startsWith("127.");
       const mod = isHttps ? https : http;
 
       const REQUEST_TIMEOUT_MS = 8 * 60 * 1000; // 8 min — well under PM's 60min kill
