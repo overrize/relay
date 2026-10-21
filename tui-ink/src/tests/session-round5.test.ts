@@ -190,7 +190,8 @@ test("message-only Worker is bounded and leaves a durable failed handoff instead
   try {
     ensureAgent({ id: "pm", name: "PM", role: "Leader", state: "idle" });
     startLeaderAgent({ id: "pm", firstMessage: "start", conversationMode: true, replyHook: (t) => replies.push(t) });
-    await until(() => sessionJournal().binding("w")?.status === "failed");
+    // Shared Windows CI runners can delay the three model turns beyond 8s; keep the call-count bound below unchanged.
+    await until(() => sessionJournal().binding("w")?.status === "failed", process.env.CI ? 30000 : 8000);
     await until(() => replies.includes("PM_ACK"));
     const outcome = new SessionJournal(root).binding("w")!.outcome!;
     assert.match(outcome.reason, /missing-terminal-report/); assert.equal(outcome.reportedSuccess, false);
