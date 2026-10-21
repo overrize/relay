@@ -41,4 +41,8 @@ senpi 模型注册表装配模型目录及用户覆盖。`provider-composer.js` 
 
 ## 本轮验证
 
+斜杠菜单默认选中第一项，用明确的 `→` 指示选中行，避免无颜色终端无法辨认反色。↑↓ 循环选择，Enter 执行，Tab 补全；Esc 先关闭菜单并保留输入，不打断 PM。输入空格进入参数后收起菜单，继续编辑后可以重新打开匹配列表。
+
+Windows PTY 实测从 `/` 用方向键进入 `/login`，选择 API Key、搜索 DeepSeek 并进入密钥输入后取消；用真实配置打开 Ctrl+L，确认 PM 当前为 kimi-k3，Tab 切换 Worker 后 current 标记为 deepseek-flash。未改写用户配置，也未重新进行订阅认证。
+
 `npm run typecheck`、`npm test`、`npm run test:headless`、`npm run build`。新增实际渲染测试覆盖模型搜索、方向键、Enter/Esc、Ctrl+F，验证收藏不保存凭据，以及模型用途切换同步有效路由。独立 PTY 手工发送 Ctrl+L、Esc、q、Ctrl+C、Ctrl+D，核对界面和退出；运行在 E 盘隔离演示配置中，不改动用户凭据。

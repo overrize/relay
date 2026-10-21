@@ -313,7 +313,8 @@ function App() {
   const historyIdx      = useRef(-1);
   const browsingHistory = useRef(false);
   const completeTick    = useRef(0);
-  const [slashSelectedIdx, setSlashSelectedIdx] = useState(-1);
+  const [slashSelectedIdx, setSlashSelectedIdx] = useState(0);
+  const [dismissedSlash, setDismissedSlash] = useState<string | null>(null);
   // M3-7c interaction: view mode (Agents tree ↔ chat) + Plan drawer toggle.
   const [viewMode, setViewMode] = useState<"agents" | "chat" | "logs">("chat");
   const [planOpen, setPlanOpen] = useState(false);
@@ -509,14 +510,14 @@ function App() {
     ? COMMANDS.filter((c) => c.name.startsWith(slashHead))
     : [];
   // slashDisplay drives the visible dropdown — shows everything on bare "/"
-  const slashDisplay = input === "/" ? COMMANDS : slashMatches;
+  const slashDisplay = dismissedSlash === input || /\s/.test(input) ? [] : input === "/" ? COMMANDS : slashMatches;
 
   // Reset selection when the displayed list changes (user typed another char)
   const prevSlashKey = useRef("");
   const slashKey = slashDisplay.map((c) => c.name).join(",");
   if (prevSlashKey.current !== slashKey) {
     prevSlashKey.current = slashKey;
-    if (slashSelectedIdx !== -1) setSlashSelectedIdx(-1);
+    if (slashSelectedIdx !== 0) setSlashSelectedIdx(0);
   }
 
   const SLASH_MAX_VISIBLE = 8;
@@ -527,7 +528,7 @@ function App() {
   const slashVisible = slashDisplay.slice(slashScrollStart, slashScrollStart + SLASH_MAX_VISIBLE);
   // 1 separator + visible items + 1 "N more" line if truncated
   const slashPaneRows = slashDisplay.length > 0
-    ? 1 + slashVisible.length + (slashDisplay.length > SLASH_MAX_VISIBLE ? 1 : 0)
+    ? 2 + slashVisible.length + (slashDisplay.length > SLASH_MAX_VISIBLE ? 1 : 0)
     : 0;
 
 
@@ -1160,7 +1161,7 @@ function App() {
                       const selected = absIdx === slashSelectedIdx;
                       return (
                         <Box key={c.name}>
-                          <Text color="cyan" inverse={selected}>{`/${c.name}`.padEnd(12)}</Text>
+                          <Text color="cyan" inverse={selected}>{`${selected ? "→" : " "} /${c.name}`.padEnd(14)}</Text>
                           <Text dimColor={!selected}> {c.desc}</Text>
                         </Box>
                       );
@@ -1168,6 +1169,7 @@ function App() {
                     {slashDisplay.length > SLASH_MAX_VISIBLE && (
                       <Text dimColor>  {"·".repeat(3)} {slashDisplay.length - SLASH_MAX_VISIBLE} more</Text>
                     )}
+                    <Text dimColor>↑↓ 选择 · Enter 执行 · Tab 补全 · Esc 关闭</Text>
                   </Box>
                 </>
               )}
@@ -1175,8 +1177,8 @@ function App() {
                 key={completeTick.current}
                 focused={selectedPending.length === 0}
                 value={input}
-                onChange={setInput}
-                onESC={handleESCInterrupt}
+                onChange={value=>{setDismissedSlash(null);setInput(value);}}
+                onESC={()=>{if(slashDisplay.length){setDismissedSlash(input);return;}handleESCInterrupt();}}
                 onSubmit={(v) => {
                   // 斜杠命令：回车时若面板有匹配，解析成选中(或首个)命令，
                   // 避免把 "/mo" 这种前缀当普通消息发出去（表现为"直接输入斜杠"）。
