@@ -1,5 +1,4 @@
 import {openRouterOAuth} from "../subscriptions/openrouterOAuth.js";
-import {checkCloud} from "../adapters/cloud.js";
 import React,{useEffect,useRef,useState} from "react";
 import {Box,Text,useInput} from "ink";
 import TextInput from "ink-text-input";
@@ -29,7 +28,7 @@ export function LoginWizard({onDone,onCancel}:{onDone:(message:string)=>void;onC
       if(action==="login"||action==="check"){
         abort.current=new AbortController();setInstructions("");
         const notify=(text:string)=>{if(alive.current)setInstructions(text);};
-        const task=flow.native?(flow.provider.nativeAuth==="openrouter"?openRouterOAuth(notify,abort.current.signal):checkCloud(flow.nativeConfig(),abort.current.signal)):officialSubscriptionLogin(flow.provider.authProvider??flow.provider.id,action==="login",text=>{if(alive.current)setInstructions(text);},abort.current.signal);
+        const task=flow.native?(flow.provider.nativeAuth==="openrouter"?openRouterOAuth(notify,abort.current.signal):import("../adapters/cloud.js").then(({checkCloud})=>checkCloud(flow.nativeConfig(),abort.current!.signal))):officialSubscriptionLogin(flow.provider.authProvider??flow.provider.id,action==="login",text=>{if(alive.current)setInstructions(text);},abort.current.signal);
         void task.then(key=>{if(alive.current&&!abort.current?.signal.aborted){setInstructions("");flow.authenticated(typeof key==="string"?key:undefined);changed();}}).catch(()=>{if(alive.current){setInstructions("");flow.authFailed();changed();setError("认证未成功；AWS 检查 profile / SSO，GCP 检查 ADC，OAuth 检查浏览器授权。未保存模型配置。");}});
       }
     }catch{setError("未保存配置；检查选项、配置目录权限后重试。");}

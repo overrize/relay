@@ -1,5 +1,4 @@
 import {syncModelPrices,priceSourceFor} from "../session/PriceSync.js";
-import {callCloud} from './cloud.js';
 import { assertCodexBudgetCapability, codexInputBound } from "./codexBudget.js";
 import { callCopilotSubscription } from "./copilotSubscription.js";
 import { cachedUsage, usageExhausted, type UsageProvider } from "../subscriptions/usage.js";
@@ -485,7 +484,7 @@ export class HttpConvAgent extends EventEmitter {
         const pc = this.cfg.providerCfg;
         if (this.cfg.sessionManaged) { const j = sessionJournal(), b = j.binding(this.cfg.id)!; j.append("model.selected",b.conversation,this.cfg.id,b.revision,{event:"model.selected",profile:this.cfg.routingProfile,model:pc.model,provider:pc.provider,transport:pc.transport??"http",billing:pc.billing?.mode??"api",candidate:this.cfg.modelCandidates?.[this._routeIndex]?.name}); }
         const result = pc.transport === 'bedrock'||pc.transport === 'vertex'
-          ? await callCloud(pc,this._compiled?.system??this.cfg.systemPrompt??'',this._trimmedHistory(),this._sessionOutput??pc.maxTokens??resolveMaxTokens(this.cfg.role,this.cfg.depth),this._abort?.signal)
+          ? await (await import("./cloud.js")).callCloud(pc,this._compiled?.system??this.cfg.systemPrompt??'',this._trimmedHistory(),this._sessionOutput??pc.maxTokens??resolveMaxTokens(this.cfg.role,this.cfg.depth),this._abort?.signal)
           : pc.transport === "copilot-sdk"
           ? await callCopilotSubscription(pc,this._compiled?.system ?? this.cfg.systemPrompt ?? "",this._trimmedHistory(),{agent:this.cfg.id,maxOutput:this._sessionOutput??pc.maxTokens??resolveMaxTokens(this.cfg.role,this.cfg.depth),signal:this._abort?.signal})
           : pc.transport === "codex-cli"

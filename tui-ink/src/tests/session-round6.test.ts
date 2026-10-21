@@ -32,7 +32,9 @@ function seed(extra: Record<string, unknown> = {}) {
   admitWorker(e); applyEvent(e); return { j, e, t: taskFor("worker")! };
 }
 function stopped(agent = "worker", success = false, reason = "retryable: interrupted", evidence: string[] = []) { applyEvent({ v: 1, type: "agent.done", agent, success, reason, evidence }); }
-async function until(f: () => boolean, timeout = 9000) { const end = Date.now() + timeout; while (!f()) { if (Date.now() > end) throw new Error("round6 runtime timeout"); await new Promise((r) => setTimeout(r, 10)); } }
+// CI Windows runners can take several seconds per durable retry; this is a
+// harness deadline, not an increase to production attempts or retry budgets.
+async function until(f: () => boolean, timeout = process.env.CI && process.platform === "win32" ? 45000 : 9000) { const end = Date.now() + timeout; while (!f()) { if (Date.now() > end) throw new Error("round6 runtime timeout"); await new Promise((r) => setTimeout(r, 10)); } }
 async function runtime(reply: (id: string, body: any, n: number) => any[] | { status: number }) {
   const requests: any[] = [], counts = new Map<string, number>();
   const server = http.createServer(async (req, res) => {
