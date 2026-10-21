@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import {ShortcutInput} from "../tui/ShortcutInput.js";
+import {submitInput} from '../tui/submitInput.js';
+import {registerRuntimeOwner} from '../session/RuntimeOwner.js';
 import {HistorySearch} from "../tui/HistorySearch.js";
 import {rememberPrompt,searchPrompts} from "../tui/PromptHistory.js";
 import {selectSessionModel} from "../config.js";
@@ -573,7 +575,7 @@ function App() {
   const editorExtraRows=Math.min(editorMaxRows,editorLineCount)-1+(editorLineCount>editorMaxRows?1:0);
 
 
-  const dispatchUser = (raw: string) => {
+  const dispatchUser = (raw: string):boolean => submitInput(()=>{
     const text = raw.trim();
     if (!text) return;
 
@@ -599,24 +601,26 @@ function App() {
     if (target !== "pm" && !agents.get(target)) { target = "pm"; selectAgent("pm"); }
 
     if (target === "pm" && !pmStarted.current) {
-      userMessage("pm", body);
-      pmStarted.current = true;
+      // Reject before optimistic UI acceptance or changing PM-started state.
+      registerRuntimeOwner();
       const existing = agents.get("pm");
       if (existing) existing.receiveUserInput(body);
       else startLeaderAgent({ id: "pm", firstMessage: body, promptFile: "pm" });
+      if(!agents.has('pm'))return false;
+      userMessage("pm", body);
+      pmStarted.current = true;
       return;
     }
 
     // New PM message: clear done agents and any pending rating from the previous task.
     if (target === "pm") { clearDoneAgents(); clearPendingRating(); }
-    userMessage(target, body);
     const a = agents.get(target);
     if (!a) {
       // Should be unreachable after the reroute above; never drop silently.
       applyEvent({ v: 1, type: "message", agent: "pm", to: "user",
         text: `⚠ 无法送达 "${target}"（该 agent 无活动实例）。已选中 pm，请重发。` });
       selectAgent("pm");
-      return;
+      return false;
     }
 
     // Mark pending so the UI shows activity even if the agent is busy and
@@ -630,7 +634,8 @@ function App() {
     // HttpConvAgent has its own internal _queue and drains one message per turn,
     // so we always call sendCommand immediately — no React-level blocking needed.
     a.receiveUserInput(body);
-  };
+    userMessage(target, body);
+  },notice=>emitCommandMessage(notice+' 输入草稿已保留，可继续编辑。'));
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -1137,13 +1142,13 @@ function App() {
                       toSend = `/${sel.name}${args}`;
                     }
                   }
+                  if(!dispatchUser(toSend))return;
                   if (toSend.trim()) {
                     cmdHistory.current.push(toSend.trim());
                     try{rememberPrompt(toSend);}catch{emitCommandMessage("本次输入未写入搜索历史：历史库不可写，当前消息仍会正常发送。");}
                     historyIdx.current = -1;
                     browsingHistory.current = false;
                   }
-                  dispatchUser(toSend);
                   setInput("");
                   setViewMode("chat"); // submitting a message → show the conversation
                 }}

@@ -54,6 +54,7 @@ export function startLeaderAgent(opts: LeaderOpts): void {
   const leaderProviderCfg = modelRoute.candidates[0]!.config;
   const model = leaderProviderCfg.model ?? MODEL;
   const isRoot = !opts.parentId;
+  if (isRoot) registerRuntimeOwner();
   const promptFile = opts.promptFile ?? (isRoot ? "pm" : "leader");
 
   // Compute depth and parent chain from store when not provided
@@ -84,7 +85,6 @@ export function startLeaderAgent(opts: LeaderOpts): void {
   const systemPrompt = opts.sharedSystemPrompt
     ?? buildSystemPrompt("Leader", opts.id, opts.goal, opts.resumedMemoryId, promptFile);
   const journal = sessionJournal();
-  if (isRoot) registerRuntimeOwner();
   const existed = journal.binding(opts.id);
   journal.bind(opts.id, "Leader", opts.parentId, opts.goal ?? "", opts.dispatch);
   if (isRoot) beginSessionRecovery(journal.binding(opts.id)!.conversation);
