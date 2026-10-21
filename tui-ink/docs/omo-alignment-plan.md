@@ -89,3 +89,5 @@
 分段元数据缓存、大归档流式校验与重建进度见 [实现与验证](history-streaming-metadata.md)。
 
 首次索引重建的分批持久断点、强杀续建与锁发布修复见 [本轮实现与验证](transcript-resumable-build.md)。
+
+单 gzip 内部解压/索引分块与双重强杀恢复见 [实现、边界和完整验收矩阵](transcript-gzip-blocks.md)。工作秘书的双端接入与飞书记录见 [设计调查](work-secretary-feishu.md)。

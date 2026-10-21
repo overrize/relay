@@ -29,7 +29,10 @@ async function tailAnchor(file:string,size:number,through:number){
 }
 export class AuditIndex{
   private messageCache=false;
-  private buildCount=0;private buildDigest="";
+  private buildCount=0;private buildDigest="";private buildTailDigest="";
+  private externalBytes=()=>0;
+  setExternalBytes(read:()=>number){this.externalBytes=read;}
+  bytes(){return Number((this.statement("PRAGMA page_count").get() as any).page_count)*Number((this.statement("PRAGMA page_size").get() as any).page_size);}
   private db:DatabaseSync;
   private maxBytes:number;
   private statements=new Map<string,StatementSync>();
@@ -57,7 +60,7 @@ export class AuditIndex{
         for(const row of this.statement('SELECT position,json,hash FROM transcript_build_sources ORDER BY position').iterate() as Iterable<{position:number;json:string;hash:string}>){
           const source=JSON.parse(row.json) as Manifest;
           if(row.position!==manifest.length||digest(source)!==row.hash||source.from!==next||!Number.isSafeInteger(source.to)||source.to<source.from||source.to>value.seq||!source.lastHash||!/^[a-f0-9]{64}$/.test(source.lastHash))return;
-          chain=digest([chain,row.hash]);manifest.push(source);next=source.to+1;
+          this.buildTailDigest=chain;chain=digest([chain,row.hash]);manifest.push(source);next=source.to+1;
         }
         if(manifest.length!==value.sourceCount||chain!==value.sourceDigest||next!==value.seq+1||manifest.at(-1)?.lastHash!==value.lastHash)return;
         value.manifest=manifest;
@@ -124,17 +127,20 @@ export class AuditIndex{
     const value={version:2,seq:boundary.seq,lastHash:boundary.lastHash,manifest,state};
     this.statement("INSERT OR REPLACE INTO meta VALUES(1,?,?)").run(JSON.stringify(value),digest(value));
   }
-  private clearBuild(){this.db.exec('DELETE FROM transcript_build_sources');this.buildCount=0;this.buildDigest='';}
-  /** Add only the newly verified source suffix. Rows and the checkpoint root
+  private clearBuild(){this.db.exec('DELETE FROM transcript_build_sources');this.buildCount=0;this.buildDigest='';this.buildTailDigest='';}
+  /** Append verified sources and replace only an extending archive tail.
+   * Rows and the checkpoint root
    * share the same SQLite transaction, so a crash cannot publish half a batch. */
   async saveBuild(boundary:Boundary,state:{kind:'transcript-build-v1';count:number;throughAt:number;targetSeq:number},anchors:Map<number,string>){
     if(!this.messageCache)throw Error('Build checkpoints require a transcript cache');
     if(boundary.sources.length<this.buildCount)throw Error('Build checkpoint moved backwards');
+    if(this.buildCount){const row=this.statement('SELECT json FROM transcript_build_sources WHERE position=?').get(this.buildCount-1) as {json:string};const old=JSON.parse(row.json) as Manifest,next=boundary.sources[this.buildCount-1]!;
+      if(next.to!==old.to){if(!old.archive||next.key!==old.key||next.from!==old.from||next.to<old.to||next.fingerprint!==old.fingerprint)throw Error('Build checkpoint tail changed');this.statement('DELETE FROM transcript_build_sources WHERE position=?').run(--this.buildCount);this.buildDigest=this.buildTailDigest;}}
     if(!this.buildCount)this.clearBuild();
     for(let position=this.buildCount;position<boundary.sources.length;position++){
       const source=boundary.sources[position]!,lastHash=anchors.get(source.to);if(!lastHash)throw Error('Build checkpoint requires a verified source anchor');
       const value:Manifest={...source,lastHash,contentHash:source.key==='active'?await prefixHash(source.file,source.size):''},hash=digest(value);
-      this.statement('INSERT INTO transcript_build_sources VALUES(?,?,?)').run(position,JSON.stringify(value),hash);this.buildDigest=digest([this.buildDigest,hash]);this.buildCount++;
+      this.statement('INSERT INTO transcript_build_sources VALUES(?,?,?)').run(position,JSON.stringify(value),hash);this.buildTailDigest=this.buildDigest;this.buildDigest=digest([this.buildDigest,hash]);this.buildCount++;
     }
     const value={version:3,seq:boundary.seq,lastHash:boundary.lastHash,sourceCount:this.buildCount,sourceDigest:this.buildDigest,state};
     this.statement('INSERT OR REPLACE INTO meta VALUES(1,?,?)').run(JSON.stringify(value),digest(value));
@@ -142,7 +148,7 @@ export class AuditIndex{
   checkpoint(){
     if(!this.messageCache)throw Error('Build checkpoints require a transcript cache');
     const pages=this.statement('PRAGMA page_count').get() as {page_count:number},size=this.statement('PRAGMA page_size').get() as {page_size:number};
-    const bytes=pages.page_count*size.page_size,retained=this.maxBytes>0&&bytes<=this.maxBytes;
+    const bytes=pages.page_count*size.page_size,retained=this.maxBytes>0&&bytes+this.externalBytes()<=this.maxBytes;
     // A quota miss must not erase the in-progress result. Keep this transaction
     // uncommitted; final commit retains the existing quota/eviction behavior.
     if(retained){this.db.exec('COMMIT');this.db.exec('BEGIN IMMEDIATE');}
@@ -150,7 +156,7 @@ export class AuditIndex{
   }
   commit(){
     const pages=this.statement("PRAGMA page_count").get() as {page_count:number},size=this.statement("PRAGMA page_size").get() as {page_size:number};
-    const bytes=pages.page_count*size.page_size,retained=bytes<=this.maxBytes;
+    const bytes=pages.page_count*size.page_size,retained=bytes+this.externalBytes()<=this.maxBytes;
     if(!retained)this.reset();
     this.db.exec("COMMIT");
     if(!retained){try{this.db.exec("VACUUM");}catch(e){if(!/locked|busy/i.test(String(e)))throw e;}}

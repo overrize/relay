@@ -91,6 +91,9 @@ export function recordSessionEvent(event: TuiEvent): boolean {
     journal.append("event.rejected", binding.conversation, agent, revision, { type: event.type, reason: "superseded_revision" });
     return false;
   }
+  if(event.type==='agent.done'&&(typeof event.success!=='boolean'||event.evidence!==undefined&&(!Array.isArray(event.evidence)||!event.evidence.every(item=>typeof item==='string')))){
+    journal.append('event.rejected',binding.conversation,agent,revision,{type:event.type,reason:'invalid_agent_done_payload'});return false;
+  }
   journal.append("runtime.event", binding.conversation, agent, revision, event);
   return true;
 }

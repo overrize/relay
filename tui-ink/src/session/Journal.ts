@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import type {HistoryMetadata} from "./HistoryMetadata.js";
 import {acquireJournalLock,prepareJournalLock} from "./JournalLock.js";
+import type {ArchiveChunkStore} from './ArchiveChunkStore.js';
 import {archiveEntries} from "./ArchiveStream.js";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -219,9 +220,12 @@ export class SessionJournal {
       const body = { version: 1 as const, seq: this.state.seq + 1, id: randomUUID(), ts: Date.now(), kind, conversation, agent, revision, data };
       const event: Entry = { ...body, hash: hash(body, this.state.lastHash) };
       const line = JSON.stringify(event) + "\n";
+      // Projection failures must happen before durable publication, otherwise a
+      // malformed runtime payload can advance seq while leaving offset behind.
+      const next=structuredClone(this.state);reduce(next,JSON.parse(line) as Entry);
       const fd = fs.openSync(this.file, "a", 0o600);
       try { fs.writeFileSync(fd, line, "utf8"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-      reduce(this.state, event); this.offset += Buffer.byteLength(line);
+      this.state=next; this.offset += Buffer.byteLength(line);
       this.activeStamp = this.stamp(this.file);
       if (event.seq % 32 === 0 || kind === "requirement.changed") {
         try { writeSnapshot(path.join(path.dirname(this.file), "current.json"), JSON.stringify(this.state)); }
@@ -268,7 +272,7 @@ export class SessionJournal {
   }
   /** Stable asynchronous history scan. An incremental caller must first verify
    * the retained prefix's source manifest and hash, as AuditIndex does. */
-  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string},onSource?:(through:number,lastHash:string)=>unknown,options:{capture?:ReturnType<SessionJournal['historySources']>;prefetch?:number;streamArchives?:boolean}={}) {
+  async visitHistory(use: (entry: Entry) => void | Promise<void>, after?:{seq:number;lastHash:string},onSource?:(through:number,lastHash:string)=>unknown,options:{capture?:ReturnType<SessionJournal['historySources']>;prefetch?:number;streamArchives?:boolean;archiveCache?:ArchiveChunkStore;onArchiveChunk?:(seq:number,hash:string)=>unknown}={}) {
     const snapshot = options.capture??this.locked(() => ({ ...this.sequence(), sources: this.sources(), budget:structuredClone(this.state.budget) }), false);
     const prefetch=options.prefetch??1;if(!Number.isSafeInteger(prefetch)||prefetch<1||prefetch>4)throw Error('History prefetch must be 1..4');
     let visited = after?.seq??0, previousHash: string | undefined = after?.lastHash??"";
@@ -277,7 +281,7 @@ export class SessionJournal {
       const requests=remaining.slice(start,start+prefetch),opened:{source:Source;fd:number}[]=[];
       this.locked(()=>{try{for(const request of requests){const source=this.sourceFor(request);if(!source)throw Error('Retained history source disappeared; refusing an incomplete recall');opened.push({source,fd:fs.openSync(source.file,'r')});}}catch(error){for(const o of opened)fs.closeSync(o.fd);throw error;}},false,gate);
       this.stats.historyBatches++;this.stats.maxPrefetch=Math.max(this.stats.maxPrefetch,opened.length);
-      const reads=opened.map(async({source,fd})=>{if(options.streamArchives&&source.archive&&(source.size>=65536||source.archive.events>=512)){this.stats.archiveStreams++;return archiveEntries(fd,source.size,source.archive);}const bytes=Buffer.alloc(source.size);let offset=0;while(offset<bytes.length){const count=await new Promise<number>((resolve,reject)=>fs.read(fd,bytes,offset,bytes.length-offset,offset,(error,n)=>error?reject(error):resolve(n)));if(!count)throw Error('History source was truncated during recall');offset+=count;}if(source.archive&&options.streamArchives&&bytes.length>=4&&bytes.readUInt32LE(bytes.length-4)>1024*1024){this.stats.archiveStreams++;return archiveEntries(fd,source.size,source.archive);}return source.archive?(await decodeArchive(bytes,source.archive)).entries:parseEvents(bytes);});
+      const reads=opened.map(async({source,fd})=>{if(options.streamArchives&&source.archive&&(source.size>=65536||source.archive.events>=512)){this.stats.archiveStreams++;return options.archiveCache?options.archiveCache.entries(fd,source.size,source.archive,after?.seq??0,options.onArchiveChunk):archiveEntries(fd,source.size,source.archive);}const bytes=Buffer.alloc(source.size);let offset=0;while(offset<bytes.length){const count=await new Promise<number>((resolve,reject)=>fs.read(fd,bytes,offset,bytes.length-offset,offset,(error,n)=>error?reject(error):resolve(n)));if(!count)throw Error('History source was truncated during recall');offset+=count;}if(source.archive&&options.streamArchives&&bytes.length>=4&&bytes.readUInt32LE(bytes.length-4)>1024*1024){this.stats.archiveStreams++;return options.archiveCache?options.archiveCache.entries(fd,source.size,source.archive,after?.seq??0,options.onArchiveChunk):archiveEntries(fd,source.size,source.archive);}return source.archive?(await decodeArchive(bytes,source.archive)).entries:parseEvents(bytes);});
       // Observe every rejection immediately; a later prefetch may fail before
       // the ordered consumer reaches it. Descriptors close only after all reads.
       for(const read of reads)void read.catch(()=>{});
@@ -662,8 +666,11 @@ function reduce(p: Projection, e: Entry) {
   }
   if (v.type === "unit.handup" && a) a.outcome = { seq: e.seq, reason: "handup", summary: String(v.summary ?? "").slice(0, 4000), evidence: a.outcome?.evidence ?? [], remaining: (v.failed_acceptance ?? []).slice(0, 20), artifacts: (v.artifacts ?? []).slice(0, 20), lastError: a.lastError };
   if (v.type === "agent.done" && a) {
-    a.status = v.success ? "done" : "failed";
-    a.outcome = { seq: e.seq, reason: String(v.reason ?? (v.success ? "reported-complete" : "stopped-without-reason")).slice(0, 2000), summary: a.outcome?.summary ?? "", evidence: (v.evidence ?? []).slice(0, 20).map((s: string) => String(s).slice(0, 1000)), remaining: a.outcome?.remaining.length ? a.outcome.remaining : (a.todos ?? []).filter((t) => t.state !== "done").map((t) => t.text), artifacts: a.outcome?.artifacts ?? [], lastError: a.lastError, reportedSuccess: !!v.success };
+    const valid=typeof v.success==='boolean'&&(v.evidence===undefined||Array.isArray(v.evidence)&&v.evidence.every((item:unknown)=>typeof item==='string'));
+    // Old logs may already contain malformed model events. Preserve their hash
+    // chain and replay them as failed reports, never as accepted completion.
+    const evidence=valid?(v.evidence??[]):[];a.status = valid&&v.success ? "done" : "failed";
+    a.outcome = { seq: e.seq, reason: String(!valid?"invalid-agent-done-payload":v.reason ?? (v.success ? "reported-complete" : "stopped-without-reason")).slice(0, 2000), summary: a.outcome?.summary ?? "", evidence: evidence.slice(0, 20).map((s: string) => String(s).slice(0, 1000)), remaining: a.outcome?.remaining.length ? a.outcome.remaining : (a.todos ?? []).filter((t) => t.state !== "done").map((t) => t.text), artifacts: a.outcome?.artifacts ?? [], lastError: a.lastError, reportedSuccess: valid&&!!v.success };
     for (const tool of Object.values(s.tools)) if (tool.agent === a.id && tool.status === "pending") tool.status = "uncertain";
   }
   if (v.type === "agent.error" && a) {

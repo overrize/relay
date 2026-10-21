@@ -22,8 +22,8 @@ if(!phase){
 }
 const root=process.argv[3];process.chdir(root);Object.assign(process.env,{SPAWN_CONFIG_DIR:path.join(root,'config'),SERVER_ENABLED:'false',SPAWN_PRICE_AUTO_SYNC:'0',FEISHU_APP_ID:'',FEISHU_APP_SECRET:'',SPAWN_SESSION_MAX_REQUESTS:'30',SPAWN_SESSION_MAX_TOOLS:'15'});process.argv.push('--prompts='+path.join(root,'prompts'));
 if(phase==='crash'){
- const {SessionJournal}=await import('../dist/session/Journal.js');const fixture=new SessionJournal(root,{automatic:false,segmentBytes:1024});
- for(let i=0;i<200;i++)fixture.append('message.recorded','index-fixture','pm',0,{role:'user',content:`ARCHIVE_EVIDENCE_${i}: read-only diagnostic history. `+'历史证据 '.repeat(70)});
+ const {SessionJournal}=await import('../dist/session/Journal.js');const fixture=new SessionJournal(root,{automatic:false,segmentBytes:64*1024*1024});
+ for(let i=0;i<900;i++)fixture.append('message.recorded','index-fixture','pm',0,{role:'user',content:`ARCHIVE_EVIDENCE_${i}: read-only diagnostic history. `+'历史证据 '.repeat(350)});
  const maintenance=await fixture.maintain({maxLogBytes:0,retentionMs:0,maxTotalBytes:128*1024*1024});assert.deepEqual(maintenance.errors,[]);process.env.SPAWN_TRANSCRIPT_BUILD_BATCH_SOURCES='8';
 }
 const {sessionController:c}=await import('../dist/runtime/SessionController.js');
@@ -36,14 +36,14 @@ try{
  if(phase==='crash'){
   ui.submit('OLD_NATIVE_GOAL');await until(()=>Object.values(sessionJournal().current('pm')?.tools??{}).some(t=>t.agent==='native-worker'&&t.name==='Bash'&&t.status==='pending'),'worker Bash running');
   const revision=c.snapshot().revision;ui.editor.setText('中文草稿🙂');
-  let checkpointObserved=false;const transcript=c.transcript.bind(c);c.transcript=(before,report)=>transcript(before,p=>{if(p.checkpoint)checkpointObserved=true;report?.(p);});
-  const reading=ui.loadOlder();const communicationDuringBuild=ui.submit('当前进度如何？');assert.equal(communicationDuringBuild,true);await reading;assert.ok(checkpointObserved,'History rebuild must save a durable batch while the real Worker runs');assert.equal(c.snapshot().revision,revision);assert.equal(ui.editor.getText(),'中文草稿🙂');
+  let checkpointObserved=false,archiveCheckpointObserved=false;const transcript=c.transcript.bind(c);c.transcript=(before,report)=>transcript(before,p=>{if(p.checkpoint)checkpointObserved=true;if(p.archiveSeq)archiveCheckpointObserved=true;report?.(p);});
+  const reading=ui.loadOlder();const communicationDuringBuild=ui.submit('当前进度如何？');assert.equal(communicationDuringBuild,true);await reading;assert.ok(checkpointObserved,'History rebuild must checkpoint inside the single archive while Worker runs');assert.ok(archiveCheckpointObserved,'Gzip conversion checkpoint must be observed');assert.equal(c.snapshot().revision,revision);assert.equal(ui.editor.getText(),'中文草稿🙂');
   for(const panel of ['tasks','budget','audit']){ui.openPanel(panel);terminal.input('\x1b');assert.equal(ui.editor.getText(),'中文草稿🙂');assert.equal(c.snapshot().revision,revision);}
   for(const kind of ['login','model','history']){ui.openWorkflow(kind);terminal.input('\x1b');assert.equal(ui.editor.getText(),'中文草稿🙂');assert.equal(c.snapshot().revision,revision);}
   const editor=path.join(root,'editor24.mjs');fs.writeFileSync(editor,"import fs from 'node:fs';await new Promise(r=>setTimeout(r,300));fs.appendFileSync(process.argv[2],'\\nLIVE_EDITOR24');");process.env.VISUAL=`"${process.execPath}" "${editor}"`;
   const editing=ui.externalEditor();await editing;await until(()=>c.snapshot().messages.some(m=>m.text.includes('LIVE_PROGRESS')),'PM followup');const whileRunning=c.snapshot().activeTools.some(t=>t.agent==='native-worker'&&t.name==='Bash');assert.ok(whileRunning,'PM reply must arrive while Worker runs');assert.equal(c.snapshot().revision,revision);assert.equal(ui.editor.getText(),'中文草稿🙂\nLIVE_EDITOR24');
   ui.submit('/revise NEW_NATIVE_GOAL');await until(()=>fs.existsSync('new.txt')&&c.snapshot().messages.some(m=>m.text.includes('LIVE_NEW_DONE')),'new goal write and reply');assert.equal(fs.existsSync('obsolete.txt'),false);assert.equal(fs.readFileSync('new.txt','utf8'),'NEW_NATIVE_GOAL');
-  fs.writeFileSync('before-crash.json',JSON.stringify({root,revision:c.snapshot().revision,goal:c.snapshot().goal,budget:c.snapshot().budget,followupWhileWorkerRunning:whileRunning,oldTaskCancelled:c.snapshot().tasks.some(t=>t.status==='superseded'),draftPreserved:true,indexCheckpointObserved:checkpointObserved,communicationDuringBuild}));process.kill(process.pid,'SIGKILL');
+  fs.writeFileSync('before-crash.json',JSON.stringify({root,revision:c.snapshot().revision,goal:c.snapshot().goal,budget:c.snapshot().budget,followupWhileWorkerRunning:whileRunning,oldTaskCancelled:c.snapshot().tasks.some(t=>t.status==='superseded'),draftPreserved:true,indexCheckpointObserved:checkpointObserved,archiveCheckpointObserved,communicationDuringBuild}));process.kill(process.pid,'SIGKILL');
  }else{
   const before=JSON.parse(fs.readFileSync('before-crash.json','utf8')),recovered=c.snapshot();assert.equal(recovered.goal,before.goal);assert.equal(recovered.budget.used.requests,before.budget.used.requests);ui.submit('/resume');await until(()=>c.snapshot().messages.some(m=>m.text.includes('LIVE_RECOVERED')),'restart recovery');assert.equal(fs.existsSync('obsolete.txt'),false);assert.equal(c.snapshot().goal,'NEW_NATIVE_GOAL');fs.writeFileSync('verification.json',JSON.stringify({...before,hardKillRestartRecovered:true,afterBudget:c.snapshot().budget,models:c.snapshot().model},null,2));
  }

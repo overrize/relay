@@ -1,7 +1,7 @@
 import path from 'node:path';
 import {Worker} from 'node:worker_threads';
 import type {TranscriptPage} from './TranscriptWorker.js';
-export interface TranscriptProgress {phase:string;visited:number;through:number;checkpoint?:number;resumedFrom?:number}
+export interface TranscriptProgress {phase:string;visited:number;through:number;checkpoint?:number;resumedFrom?:number;archiveOffset?:number;archiveTotal?:number;archiveSeq?:number;archiveResumedOffset?:number;archiveResumedSeq?:number;archiveInflatedBytes?:number}
 interface Reader {worker:Worker;pending:Map<number,{resolve:(p:TranscriptPage)=>void;reject:(e:Error)=>void;progress?:(p:TranscriptProgress)=>void}>;timer?:ReturnType<typeof setTimeout>;closed:boolean}
 const readers=new Map<string,Reader>();let requestId=0;
 async function closeReader(root:string,reader:Reader){if(reader.closed)return;reader.closed=true;if(readers.get(root)===reader)readers.delete(root);clearTimeout(reader.timer);for(const p of reader.pending.values())p.reject(Error('历史读取已关闭'));reader.pending.clear();await reader.worker.terminate();}
