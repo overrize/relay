@@ -2,12 +2,12 @@ import {randomUUID} from 'node:crypto';
 import {agents,secretaries,killedAgents,killAgent,shutdownRuntime} from './SessionRuntime.js';
 import {startLeaderAgent} from './AgentHandlers.js';
 import {replaceAgentForResume} from './OrchestratorRuntime.js';
-import {getState,subscribe,ensureAgent,userMessage,applyEvent,markPendingInput} from '../store.js';
+import {getState,subscribe,ensureAgent,userMessage,applyEvent,markPendingInput,updateAgentInfo} from '../store.js';
 import {sessionJournal} from '../session/Journal.js';
 import {registerRuntimeOwner} from '../session/RuntimeOwner.js';
 import {startHttpServer} from '../server/httpServer.js';
 import type {Server} from 'node:http';
-import {loadConfig,getAgentProviderConfig} from '../config.js';
+import {loadConfig,getAgentProviderConfig,selectSessionModel,saveAgentModel} from '../config.js';
 import {resolveModelRoute} from '../models/routing.js';
 import {budgetReport} from '../session/Budget.js';
 import {workItems} from '../session/Tasks.js';
@@ -26,6 +26,13 @@ export class SessionController {
   }
  }
  private ready(){if(!this.started||this.stopping)throw new Error('SESSION_NOT_RUNNING');if(process.cwd()!==this.root)throw new Error('SESSION_WORKSPACE_CHANGED');}
+ modelChoices(){this.ready();return Object.entries(loadConfig().models).filter(([,c])=>!!c.apiKey||(c.transport??'http')!=='http').map(([name,c])=>({name,model:c.model,billing:c.billing?.mode??'api'}));}
+ selectModel(name:string,scope:'session'|'default',role:'leader'|'worker'='leader'){
+  this.ready();if(!(scope==='default'?saveAgentModel(role,name):selectSessionModel(role,name)))throw new Error('MODEL_NOT_CONFIGURED');
+  const config=getAgentProviderConfig(loadConfig(),role);
+  if(role==='leader'){const agent=agents.get('pm');agent?.once('modelChanged',(model:string)=>updateAgentInfo('pm',{model}));agent?.selectModel({name,config});}
+  return `${role==='leader'?'PM':'Worker'} → ${config.model}（${scope==='default'?'已保存默认':'仅本次使用'}）；进行中的请求保持原模型，后续请求生效。`;
+ }
  send(text:string,options:{target?:string;inputId?:string;echo?:boolean;kind?:'query'|'change'|'continue'|'constraint'}={}){
   this.ready();if(!text.trim())throw new Error('EMPTY_INPUT');const id=options.inputId??randomUUID(),target=options.target??'pm';
   if(target==='pm'&&!agents.has('pm')){
