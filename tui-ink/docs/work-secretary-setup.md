@@ -32,7 +32,9 @@
 
 本功能不读取通讯录全集、聊天记录，不调用消息发送接口，也不需要消息回调 URL。应用的可用范围必须包括被授权员工；仅有接口权限而没有目标目录的数据权限会收到 403。
 
-每次发布前核对文件夹协作者，拒绝未声明的成员。员工报告可编辑，leader 只读；审计文档员工与 leader 只读；文档关闭公开链接、外部访问，协作者管理保留给 full_access。继承权限与专用机器人群的实际成员仍需管理员确认，不将权限列表检查误称为完整组织安全审计。
+新版协作者接口使用 `docs:permission.member:retrieve`、`docs:permission.member:create`、`docs:permission.member:update`，修改公共权限使用 `docs:permission.setting:write_only`。旧的宽泛权限名称不保证覆盖新版接口；已有权限无需反复申请。
+
+每次发布前核对文件夹协作者，拒绝未声明的成员。应用创建的目录可能将机器人返回为 `openid` 类型的所有者；此时通过当前应用的 `GET /bot/v3/info` 核验 `open_id`，不能按名称或任意 full_access 身份放行。员工报告可编辑，leader 只读；审计文档员工与 leader 只读；文档关闭公开链接、外部访问，协作者管理保留给 full_access。继承权限与专用机器人群的实际成员仍需管理员确认，不将权限列表检查误称为完整组织安全审计。
 
 认证使用[新的自建应用 OAuth 凭据接口](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/authentication-management/access-token/tenant_access_token)，缓存令牌并按服务端 expires_in 更新；不把密钥或服务端错误正文打印进日志。Docx/Drive 请求契约同时对照官方 `@larksuiteoapi/node-sdk@1.76.0` 类型定义验证。
 
@@ -145,7 +147,7 @@ node --use-env-proxy --env-file=E:\RelaySecretary\publisher.env scripts/verify-s
 
 `test:live:secretary` 会使用现有配置的 Worker 兼容 API 做一次真实秘书模型请求，但飞书请求发往本地 HTTP 契约服务器，明确不是企业租户联调。
 
-最后一条脚本才访问真实飞书。它使用独立 verification 员工命名空间，在已配置目录创建带测试标识的日报、周报和审计文档，不会替换正式报告。员工还需实际打开日报、修改并运行 sync，才能验证员工账号的完整编辑体验。凭据/租户/目录未提供时，不把契约测试称为真实飞书验证。
+最后一条脚本才访问真实飞书。它使用独立 verification 员工命名空间，在已配置目录创建带测试标识的日报、周报和审计文档，不会替换正式报告。员工实际打开日报并修改后，使用下面的续验脚本绑定原来的 verification.json 和测试账本，禁止新建文档；不要对正式配置直接运行 sync 来验证隔离测试命名空间。凭据/租户/目录未提供时，不把契约测试称为真实飞书验证。
 
 ## 本轮实测记录（2026-10-21）
 
@@ -166,3 +168,18 @@ node --use-env-proxy --env-file=E:\RelaySecretary\publisher.env dist/worklog/cli
 程序显示 company.name、tenantKey 和 confirmationCode。确认企业正确后，以相同参数添加 `--confirm <显示的 confirmationCode>`；保存前重新查询，企业或应用有变化则拒绝旧确认。两个配置的 tenant 同步保存，其余字段和采集开关保持原样。不需要手填或保存 access_token。
 
 若返回 99991672，先开通应用身份权限 `tenant:tenant:readonly` 并按后台要求发布／审批生效，再重跑；凭据有效不代表企业信息权限已开通。
+
+
+## 真实租户续验（2026-10-22）
+
+真实飞书已完成日报、周报、独立审计文档发布；在员工浏览器界面追加更正并保存到云端后，同步保留前后块差异，周报追加第 2 版并纳入更正。原始报告快照不变，重复同步不产生重复修订。应用机器人所有者身份经接口核验；员工对报告为 edit、审计为 view，公开链接和外部访问关闭。
+
+续验入口如下（verification.json 路径取首次脚本输出，标记是员工实际在日报填写的唯一测试文字）：
+
+```powershell
+node --use-env-proxy --env-file=E:\RelaySecretary\publisher.env scripts/verify-secretary-feishu-edits.mjs E:\RelaySecretary\publisher.json <原测试目录>\verification.json <员工更正唯一标记>
+```
+
+该脚本复用原测试员工、账本和 4 份云文档，在传输层拒绝创建新文档，验证更正入账、周报纳入、云审计证据摘要、历史快照不变、权限和重复同步，并保存 edit-verification.json。可中断后重跑；如果发布队列处于退避期，等待到期后重跑，不清空重试预算。
+
+边界：修订记录是两次同步之间的内容差异，编辑者记为 unknown-feishu-editor；不能追溯区间内每次按键或精确编辑者。此次使用单员工测试命名空间，主管列表为空；正式采集开关仍保持关闭，未将测试数据计入正式工作。

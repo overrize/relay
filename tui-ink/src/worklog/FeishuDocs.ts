@@ -15,6 +15,7 @@ export interface CloudSnapshot {
 const tokenId = (h: string) => h.slice(0, 8) + '-' + h.slice(8, 12) + '-4' + h.slice(13, 16) + '-a' + h.slice(17, 20) + '-' + h.slice(20, 32);
 export class FeishuDocs {
     private access = '';
+    private botOpenId?: string;
     private expires = 0;
     private verified = false;
     private lastWrite = 0;
@@ -68,11 +69,22 @@ export class FeishuDocs {
         if (wait)
             await new Promise(r => setTimeout(r, wait));
         this.lastWrite = Date.now();
-    } const v = await this.json('https://open.feishu.cn/open-apis/' + route, { method, headers: { Authorization: 'Bearer ' + this.access, 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }, method !== 'GET'); return v.data ?? {}; }
+    } const v = await this.json('https://open.feishu.cn/open-apis/' + route, { method, headers: { Authorization: 'Bearer ' + this.access, 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }, method !== 'GET'); return v.data ?? (route === 'bot/v3/info' ? v.bot ?? {} : {}); }
+    private async isApplicationMember(m: any) {
+        if (m.member_type === 'appid' && m.member_id === this.config.appId) return true;
+        if (m.member_type !== 'openid' || m.perm !== 'full_access') return false;
+        if (!this.botOpenId) {
+            const bot = await this.api('bot/v3/info');
+            if (typeof bot.open_id !== 'string' || !bot.open_id.startsWith('ou_'))
+                throw new FeishuError('FEISHU_BOT_IDENTITY_UNVERIFIED');
+            this.botOpenId = bot.open_id;
+        }
+        return m.member_id === this.botOpenId;
+    }
     async doctor() { await this.auth(); await this.api('tenant/v2/tenant/query'); return { tenant: this.config.tenant, authenticated: true }; }
     async folderMembers(folder: string, allowed: string[]) { const v = await this.api(`drive/v1/permissions/${encodeURIComponent(folder)}/members?type=folder&fields=*`); if (!Array.isArray(v.items))
         throw new FeishuError('FEISHU_FOLDER_MEMBERS_UNVERIFIED'); for (const m of v.items) {
-        if (m.member_type === 'appid' && m.member_id === this.config.appId || m.member_type === 'openchat' && m.member_id === this.config.serviceGroupId)
+        if (m.member_type === 'openid' && allowed.includes(m.member_id) || await this.isApplicationMember(m) || m.member_type === 'openchat' && m.member_id === this.config.serviceGroupId)
             continue;
         if (m.member_type !== 'openid' || !allowed.includes(m.member_id))
             throw new FeishuError('FEISHU_FOLDER_UNEXPECTED_MEMBER');
@@ -92,7 +104,7 @@ export class FeishuDocs {
         throw new FeishuError('FEISHU_CREATE_RESPONSE_INVALID', true); return id; }
     async permissions(document: string, employee: string, leaders: string[], audit = false) { await this.api(`drive/v2/permissions/${encodeURIComponent(document)}/public?type=docx`, 'PATCH', { external_access_entity: 'closed', link_share_entity: 'closed', share_entity: 'same_tenant', manage_collaborator_entity: 'collaborator_full_access', security_entity: 'only_full_access', copy_entity: 'only_full_access' }); const members = [{ member_type: 'openid', member_id: employee, perm: audit ? 'view' : 'edit' }, ...leaders.filter(x => x !== employee).map(x => ({ member_type: 'openid', member_id: x, perm: 'view' }))]; const current = await this.api(`drive/v1/permissions/${encodeURIComponent(document)}/members?type=docx&fields=*`); if (!Array.isArray(current.items))
         throw new FeishuError('FEISHU_DOCUMENT_MEMBERS_UNVERIFIED'); const known = new Map(current.items.map((m: any) => [m.member_type + ':' + m.member_id, m])); for (const m of current.items) {
-        if (m.member_type === 'appid' && m.member_id === this.config.appId || m.member_type === 'openchat' && m.member_id === this.config.serviceGroupId)
+        if (m.member_type === 'openid' && members.some(x => x.member_id === m.member_id) || await this.isApplicationMember(m) || m.member_type === 'openchat' && m.member_id === this.config.serviceGroupId)
             continue;
         if (m.member_type !== 'openid' || !members.some(x => x.member_id === m.member_id))
             throw new FeishuError('FEISHU_DOCUMENT_UNEXPECTED_MEMBER');
