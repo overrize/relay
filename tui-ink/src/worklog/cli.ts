@@ -9,12 +9,17 @@ import { WorkPublisher } from './Publisher.js';
 import { FeishuDocs } from './FeishuDocs.js';
 import { SecretaryService } from './Service.js';
 import { ingestionServer } from './Ingestion.js';
+import { setupTenant } from './Setup.js';
 const args = process.argv.slice(2), command = args[0] ?? 'help', option = (name: string) => { const i = args.indexOf('--' + name); return i < 0 ? undefined : args[i + 1]; }, has = (name: string) => args.includes('--' + name), print = (v: unknown) => process.stdout.write(JSON.stringify(v, null, 2) + '\n');
 const required = (name: string) => { const value = option(name); if (!value || value.startsWith('--'))
     throw Error('WORKLOG_ARGUMENT_REQUIRED'); return value; };
 async function main() {
+    if (command === 'setup') {
+        print(await setupTenant(required('publish'), option('client'), option('confirm')));
+        return;
+    }
     if (command === 'help') {
-        print({ commands: ['capture --config FILE --workspace DIR [--backfill]', 'deliver --config FILE', 'status --config FILE', 'pause --config FILE', 'resume --config FILE', 'generate --publish FILE --employee ID --kind daily|weekly --day YYYY-MM-DD', 'publish --publish FILE', 'sync --publish FILE', 'doctor --publish FILE', 'watch --publish FILE', 'provision --publish FILE --name NAME', 'retry --publish FILE --job ID --reason TEXT', 'jobs --publish FILE', 'reconcile --publish FILE --report ID --reason TEXT [--document TOKEN | --confirm-absent] [--audit]', 'verify --publish FILE'], notes: '配置和账本放在工作区之外；密钥只放环境变量。watch 独立于 Relay/OmO 主会话运行。' });
+        print({ commands: ['setup --publish FILE [--client FILE] [--confirm CONFIRMATION_CODE]', 'capture --config FILE --workspace DIR [--backfill]', 'deliver --config FILE', 'status --config FILE', 'pause --config FILE', 'resume --config FILE', 'generate --publish FILE --employee ID --kind daily|weekly --day YYYY-MM-DD', 'publish --publish FILE', 'sync --publish FILE', 'doctor --publish FILE', 'watch --publish FILE', 'provision --publish FILE --name NAME', 'retry --publish FILE --job ID --reason TEXT', 'jobs --publish FILE', 'reconcile --publish FILE --report ID --reason TEXT [--document TOKEN | --confirm-absent] [--audit]', 'verify --publish FILE'], notes: '配置和账本放在工作区之外；密钥只放环境变量。watch 独立于 Relay/OmO 主会话运行。' });
         return;
     }
     if (['capture', 'deliver', 'status', 'pause', 'resume'].includes(command)) {

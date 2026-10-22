@@ -43,6 +43,21 @@ export class FeishuDocs {
         return; const secret = process.env[this.config.secretEnv]; if (!secret)
         throw new FeishuError('FEISHU_APP_SECRET_MISSING'); const v = await this.json('https://accounts.feishu.cn/oauth/v3/token', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ grant_type: 'client_credentials', client_id: this.config.appId, client_secret: secret }) }); if (typeof v.access_token !== 'string' || !Number.isFinite(v.expires_in) || v.expires_in < 60)
         throw new FeishuError('FEISHU_TOKEN_RESPONSE_INVALID'); this.access = v.access_token; this.expires = Date.now() + (v.expires_in - 60) * 1000; this.verified = false; }
+    async discoverTenant() {
+        await this.auth();
+        let v: any;
+        try {
+            v = await this.json('https://open.feishu.cn/open-apis/tenant/v2/tenant/query', { headers: { Authorization: 'Bearer ' + this.access } });
+        } catch (error) {
+            if (error instanceof FeishuError && error.reason.endsWith('_CODE_99991672'))
+                throw new FeishuError('FEISHU_COMPANY_READ_PERMISSION_REQUIRED');
+            throw error;
+        }
+        const tenant = v.data?.tenant;
+        if (typeof tenant?.tenant_key !== 'string' || !tenant.tenant_key || typeof tenant.name !== 'string')
+            throw new FeishuError('FEISHU_TENANT_RESPONSE_INVALID');
+        return { tenantKey: tenant.tenant_key as string, name: tenant.name as string };
+    }
     async api(route: string, method = 'GET', body?: unknown) { await this.auth(); if (!this.verified) {
         const v = await this.json('https://open.feishu.cn/open-apis/tenant/v2/tenant/query', { headers: { Authorization: 'Bearer ' + this.access } });
         if (v.data?.tenant?.tenant_key !== this.config.tenant)

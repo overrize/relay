@@ -7,7 +7,7 @@
 | 配置 | 用途与约束 |
 | --- | --- |
 | 企业自建应用 App ID、App Secret | Secret 只进发布服务的环境变量，不能放员工客户端配置、仓库、聊天或主 agent 的项目文件 |
-| tenant_key | 真正的飞书租户 key；每次新认证后调用企业信息接口核对，不接受用公司名称代替 |
+| tenant_key | 首次只填 App ID／Secret，运行 setup 自动查询企业名称；确认后保存到两份配置。后续认证仍校验企业归属 |
 | 员工内部 ID + 本应用下的飞书 open_id | 内部 ID 用于记录归属；open_id 用于授予员工文档编辑、审计文档阅读权限 |
 | leader 的 open_id 列表 | 仅授予指定员工报告及审计的阅读权限，不自动推断组织架构 |
 | 每名员工独立的工作文档 folder token | 禁止两名员工复用报告文件夹；应由应用创建或由管理员确认是专用、受限目录 |
@@ -153,3 +153,16 @@ node --use-env-proxy --env-file=E:\RelaySecretary\publisher.env scripts/verify-s
 - Relay 新 TUI 接真实 kimi-k3 PM：执行中追问、需求变更取消旧 Worker、强杀重启恢复均通过；秘书捕获新目标，普通追问正文未进入工作账本。
 - 独立秘书使用 deepseek-flash 完成一次真实模型请求，随后经本地 HTTP 飞书契约服务器验证双端归并、日报、员工更正、周报、审计与重试恢复。该服务器不代表真实飞书租户。
 - 真实飞书验证脚本与 E 盘配置模板已准备；真实应用凭据由管理员稍后填入。租户授权、实际继承权限与员工账号编辑体验仍待真实联调。
+
+
+## 首次自动确认企业
+
+先填 publisher.json 的 appId 和 publisher.env 的 App Secret，无需手查 tenant_key。仅查询企业的命令不会创建账本、文档或保存配置：
+
+```powershell
+node --use-env-proxy --env-file=E:\RelaySecretary\publisher.env dist/worklog/cli.js setup --publish E:\RelaySecretary\publisher.json --client E:\RelaySecretary\client.json
+```
+
+程序显示 company.name、tenantKey 和 confirmationCode。确认企业正确后，以相同参数添加 `--confirm <显示的 confirmationCode>`；保存前重新查询，企业或应用有变化则拒绝旧确认。两个配置的 tenant 同步保存，其余字段和采集开关保持原样。不需要手填或保存 access_token。
+
+若返回 99991672，先开通应用身份权限 `tenant:tenant:readonly` 并按后台要求发布／审批生效，再重跑；凭据有效不代表企业信息权限已开通。
